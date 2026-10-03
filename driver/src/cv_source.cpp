@@ -72,8 +72,8 @@ void CvTouchSource::OnPose(int hand, const CvPose& p) {
         HandState& s = h.state;
         s.flags = kConnected;
         if (p.valid) {
-            // model -> head (grip) frame.
-            Pose grip = Compose(p.pose, h.cfg.model_from_head);
+            // pose-block frame -> head (grip) frame.
+            Pose grip = Compose(p.pose, HeadFromPoseBlock(h.cfg));
             V3 w = p.ang_vel;  // body frame per driver_cv; rotate into tracking space for SteamVR
             V3 w_world = Rot(p.pose.q, w);
             V3 v = p.vel + Cross(w_world, grip.p - p.pose.p);

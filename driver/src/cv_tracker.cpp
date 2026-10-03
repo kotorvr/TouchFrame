@@ -111,6 +111,10 @@ IVRPaths* Paths() {
     return paths;
 }
 
+Pose HeadFromPoseBlock(const ControllerConfig& cfg) {
+    return {cfg.model_from_head.q, cfg.model_from_head.p - cfg.model_from_imu.p};
+}
+
 std::string PoseQueueName(uint32_t device_id) {
     return std::string(kControllerPoseQueuePrefix) + std::to_string(int(device_id)) + kControllerPoseQueueSuffix;
 }

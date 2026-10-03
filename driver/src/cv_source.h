@@ -7,8 +7,8 @@
 // The source calls back once per XRService pose with that hand's state and the pose's age
 // (XRService clock now minus pose time), so the Provider can set poseTimeOffset from real data.
 //
-// Frames. XRService returns the pose of the LED-model frame. The emitted pose is the config's
-// "head" frame (model ∘ model_from_head), which for a Touch config we define as the OpenXR grip
+// Frames. XRService returns a pose with the LED model's axes at the IMU's origin. The emitted pose
+// is the config's "head" frame (cv::HeadFromPoseBlock), which for a Touch config we define as the OpenXR grip
 // pose, so TouchController's grip→raw offset applies unchanged. The pose is already in SteamVR's
 // tracking space: WorldSpace() is true, and the Provider must not apply the relay calibration.
 #pragma once

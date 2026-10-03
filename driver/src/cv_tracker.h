@@ -55,11 +55,17 @@ struct ControllerConfig {
 // replace device_serial_number / model_number / tracked_controller_role before re-emitting the
 // JSON. XRService accepts only "left_hand" and "right_hand" as roles (anything else becomes
 // left_hand), and it keeps some per-role state: two controllers with the same role corrupt each
-// other's pose history (docs/FRAME-TRACKER.md �9).
+// other's pose history (docs/FRAME-TRACKER.md §9).
 bool ParseControllerConfig(const std::string& text, ControllerConfig* out, std::string* err,
                            const std::string& serial_override = "",
                            const std::string& model_override = "",
                            const std::string& role_override = "");
+
+// XRService's pose block is NOT the LED-model frame: it has the model's axes but the IMU's origin
+// (measured against driver_cv's SteamVR pose, 2026-10-03: 0.85 mm / 0.32 deg residual; the
+// onboard IMU extrinsic driver_cv uses has identity rotation). The device pose SteamVR shows is
+//     flip(block) ∘ HeadFromPoseBlock(cfg).
+Pose HeadFromPoseBlock(const struct ControllerConfig& cfg);
 
 // One pose from XRService's pose block, plus the same pose in SteamVR's frame.
 struct CvPose {
@@ -68,7 +74,7 @@ struct CvPose {
     double t = 0;              // XRService clock seconds (same as the IMU)
     double recv_t = 0;         // NowSeconds() when we read it
     vrint::ControllerPoseBlock raw{};
-    Pose pose;                 // model frame in SteamVR tracking space (180° about X applied)
+    Pose pose;                 // pose-block frame (model axes, IMU origin) in SteamVR space (180° about X)
     V3 vel;                    // m/s, same rotation applied
     V3 ang_vel;                // as XRService reports it; driver_cv does not rotate it
 };

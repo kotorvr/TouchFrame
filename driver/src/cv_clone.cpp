@@ -439,7 +439,7 @@ private:
                     if (n == ref_chosen_ && real_ok && Len(w_world) > 0.5) {
                         // Which frame is the pose block's angular velocity in? Compare it with
                         // SteamVR's (world) angular velocity, as a body-frame and as a world vector.
-                        Q world_model = Compose(world_head, Inverse(cfg_.model_from_head)).q;
+                        Q world_model = Compose(world_head, Inverse(HeadFromPoseBlock(cfg_))).q;
                         V3 body = Rot(Conj(world_model), w_world);
                         V3 as_world = Rot(Q{0, 1, 0, 0}, w);
                         w_frame_body_.Add(Len(w - body) / Len(w_world));
@@ -499,11 +499,11 @@ private:
             err_ref_pos_.Add(Len(d) * 1e3, d * 1e3);
             err_ref_ang_.Add(AngleDeg(clone_raw.q, ref.q));
         }
-        // Against the real controller's SteamVR pose: the clone (model frame, SteamVR axes) should be
-        // world_head ∘ inverse(model_from_head). Log the residual and the raw relative transform.
+        // Against the real controller's SteamVR pose: the clone's block pose (SteamVR axes) should be
+        // world_head ∘ inverse(HeadFromPoseBlock). Log the residual and the raw relative transform.
         Pose steam;
         if (steam_hist_.At(p.t, &steam)) {
-            Pose expect = Compose(steam, Inverse(cfg_.model_from_head));
+            Pose expect = Compose(steam, Inverse(HeadFromPoseBlock(cfg_)));
             V3 d = p.pose.p - expect.p;
             err_steam_pos_.Add(Len(d) * 1e3, d * 1e3);
             err_steam_ang_.Add(AngleDeg(p.pose.q, expect.q));
