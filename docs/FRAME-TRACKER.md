@@ -53,9 +53,9 @@ point at), `run_frame.sh` (driver for the above).
 - The queues are **plain vrserver IVRBlockQueue objects addressed by string name**
   (`CVRBlockQueueManager`, `vrcommon/blockqueue.cpp`; shm files `/dev/shm/u1000-Shm_*` plus
   `BlockQueueHeader_<name>` / `BlockQueueHeaderMutex_<name>`). vrserver create path
-  `FUN_0035ff28(this, nameptr, blockSize, blockCount, flags, createFlag)` validates
-  `blockCount-1 < 0x80` and `blockSize >= 0x10`. This is the same interface any third-party driver
-  in vrserver already uses for its own queues.
+  `FUN_0035ff28(this, name, dataSize, headerSize, count, flags)` validates `1 <= count <= 128`,
+  `dataSize != 0` and `headerSize >= 0x10` (argument names corrected in §8). This is the same
+  interface any third-party driver in vrserver already uses for its own queues.
 - Connect→track log sequence (vrserver.txt then XRService log, 2026-10-02 23:26:46):
   `CCvControllerDriver Activate` → `Connected to controller data block queue:
   /xrservice/controller/data` → `… event …` → `… pose block queue: /xrservice/controller_1/pose`
@@ -89,10 +89,13 @@ point at), `run_frame.sh` (driver for the above).
   (`WriteConnectionOrDisconnectionInBQ`; callers `FUN_001e0570` connect / `FUN_001e0538`
   disconnect). The block carries `deviceId (u32)`, an event type (connect=1, disconnect=0), and two
   JSON strings copied with `strncpy(…, 0x2fff)` into the block: the **working ("default") config**
-  and the **onboard config**. Property keys written alongside:
-  `/controllerConfigData/deviceSerialNumber`, `/controllerDefaultConfigData/blockDataSize`,
-  `/controllerOnboardConfigData/blockDataSize`. Max JSON length 0x3000 each (`config string length
-  was too long` guard). The queue is created with blockSize `0x6010`, count `0x200`.
+  and the **onboard config**. Property keys written alongside, **on the block handle** via
+  `IVRPaths_002`: `/controllerConfigData/deviceSerialNumber`,
+  `/controllerDefaultConfigData/blockDataSize`, `/controllerOnboardConfigData/blockDataSize`. The
+  two `blockDataSize` values are **required**: XRService takes each JSON string's length from them
+  (§8). Max JSON length 0x3000 each (`config string length was too long` guard). The queue is
+  created with data size `0x6010`, header size `0x200`, block count 4 (corrected in §8; `0x200` is
+  the header size, not the count).
 - **INFERRED (this is the opening):** because IVRBlockQueue is a vrserver-process singleton keyed by
   string name, and our driver loads into the **same** vrserver process as driver_cv, our driver can
   call `GetGenericInterface("IVRBlockQueue_005")` and `Connect`/`Create` the exact same
@@ -144,19 +147,21 @@ default object captured from a real Frame controller (XRService log 2026-10-02 2
 - **CONFIRMED: over `/xrservice/controller/data`, not IVRDriverInput and not IVRIOBuffer.**
   driver_cv writes one IMU sample per block with `FUN_001d44d8` (acquire-write-block → fill →
   submit; strings `Failed to aquire write block`, `[LargeGapControllerImuAndPose] not
-  bQueueHasReaders …`). Queue created blockSize `0x30`, count `0x200`, in `FUN_001d9a40`.
+  bQueueHasReaders …`). Queue created data size `0x30`, header size `0x200`, count 4, in
+  `FUN_001d9a40`.
 - **CONFIRMED: source is radio, but the transport to XRService is generic.** driver_cv receives IMU
   from the Roy controller radio, but `FUN_001d44d8` just copies it into the data queue. XRService
   reads it in `FUN_00eb6f30` / warns `We are receiving IMU sample for controller with deviceId %d
   in the past`, `Controller IMU latency is suspiciously high … sync issue`, `Waiting for missing
   IMU samples to track a frame`.
-- **Sample block layout (CONFIRMED size 0x30; field offsets INFERRED from `FUN_001d44d8`/
-  `FUN_001d46c0`):**
+- **Sample block layout (CONFIRMED size and offsets from writer `FUN_001d44d8` and XRService
+  reader `0xf2a460`; corrected 2026-10-03, the earlier 0x14/0x20 offsets were wrong):**
   ```
   offset 0x00  uint32  deviceId          (= the config's deviceId)
   offset 0x08  double  timestamp_seconds (same clock as poses; see below)
-  offset 0x14  float×3 accel  (m/s^2)    ┐ copied as two memcpys (0xc + 0xc) + 1 u32 at 0x18
-  offset 0x20  float×3 gyro   (rad/s)    ┘ from a 0x18-byte source record
+  offset 0x10  float×3 accel  (m/s^2)    offsets CONFIRMED; accel/gyro order INFERRED
+  offset 0x1c  float×3 gyro   (rad/s)    (XRService negates the 0x10 vector on read)
+  offset 0x28  uint32  flags             INFERRED off-scale flags; 0x04 and 0x2c unused
   ```
   The caller `FUN_001d46c0` time-stamps with `param2 + (int64 at PTR_DAT_005a1950) *
   (double at PTR_DAT_005a1c78)` — a tick→seconds conversion shared with pose reads.
@@ -232,12 +237,13 @@ default object captured from a real Frame controller (XRService log 2026-10-02 2
   `shouldAutoRestartService`. A second XRIPCClient would collide with driver_cv's session. So we do
   **not** open a second XRIPC session.
 - **Poses come back on a block queue, which is the clean integration point (CONFIRMED).** XRService
-  writes 6DoF poses to `/xrservice/controller_<id>/pose` (blockSize `0x90`, count `0x200`, flag
-  reader=1, created in `FUN_001d9a40`). driver_cv reads them in `FUN_001d4760` (wait-latest block,
+  writes 6DoF poses to `/xrservice/controller_<id>/pose` (data size `0x90`, header `0x200`, count
+  4, flag `OwnerIsReader`, created by driver_cv in `FUN_001d9a40`; XRService connects). driver_cv
+  reads them in `FUN_001d4760` (WaitAndAcquireReadOnlyBlock, read type New, 100 ms timeout,
   `memcpy 0x90`, release) from its `readControllerPosesThread` (`FUN_001d9e60`), then transforms
-  grip↔IMU↔head and reports to OpenVR. The 0x90 pose block holds position + orientation
-  quaternion + linear/angular velocity + a validity/timestamp (`local_168 == -1.0` ⇒ invalid), at
-  the same tick→seconds clock as the IMU.
+  grip↔IMU↔head and reports to OpenVR. The 0x90 pose block holds deviceId, timestamp (`-1.0` ⇒
+  invalid), orientation quaternion, position, linear and angular velocity, at the same clock as
+  the IMU. Exact field offsets in §8.
 - **So the whole loop for an injected device is block-queue only:** we `Create`/`Connect` the three
   queues by name, write connect-event+config, stream IMU on `/data`, and **read our device's poses
   back on `/xrservice/controller_<ourId>/pose`**, which our driver_touchframe then reports as the
@@ -275,18 +281,19 @@ driver_touchframe already loads into vrserver and presents the OpenVR controller
 
 1. **Get the block-queue interface.** `VRDriverContext()->GetGenericInterface("IVRBlockQueue_005")`
    (the version string is present in both driver_cv and vrserver; confirm `_005` is current at
-   runtime, fall back to `_004`/`_003`). This needs a vendored `IVRBlockQueue` header — it is **not**
-   in the public `openvr_driver.h` (checked v1.10–v2.15). We reconstruct the vtable from driver_cv:
-   ordinals seen — create `*vtbl`, connect `*(vtbl+8)`, acquire-write `*(vtbl+0x18)`, submit-write
-   `*(vtbl+0x20)`, wait-read-latest `*(vtbl+0x28)`, release-read `*(vtbl+0x38)`, has-reader
-   `*(vtbl+0x40)`. (Reverse these offsets against the live lib before trusting them; §7.)
-2. **Create/connect the three queues by exact name:** `/xrservice/controller/event`
-   (blockSize 0x6010, count 0x200), `/xrservice/controller/data` (0x30, 0x200),
-   `/xrservice/controller_<id>/pose` (0x90, 0x200, reader flag). If driver_cv already created
-   `/controller/{event,data}` (a real Frame controller present), **connect**; else **create**. Use a
-   `deviceId` that does not collide with any Roy controller (they start at 1; pick e.g. 0x100+).
-3. **Write the connect event + config.** One `event` block: `deviceId`, type=connect(1), and the
-   two JSON strings (`default` = our Touch Plus config, `onboard` = same or minimal). Our driver
+   runtime). It is **not** in the public `openvr_driver.h`, but its C function table is published in
+   `openvr_capi.h`; the verified C++ declaration is `driver/src/blockqueue.h` (§8).
+2. **Create/connect the three queues by exact name** (all with header size 0x200, count 4):
+   `/xrservice/controller/event` (data 0x6010, flags 0), `/xrservice/controller/data` (0x30, 0),
+   and our own `/xrservice/controller_<id>/pose` (0x90, `OwnerIsReader`), created *before* the
+   connect event. For the shared event/data queues prefer **Connect**: driver_cv's first
+   controller *Creates* them and has no fallback to Connect, so if we create them first a real
+   Frame controller that activates later would fail to open them (§8). Use a `deviceId` that does
+   not collide with any Roy controller (they start at 1). Keep it small (e.g. 16–63): XRService
+   sizes a per-device table to `deviceId+1` entries.
+3. **Write the connect event + config.** One `event` block: `deviceId`, type=connect(1), a 64-bit
+   hardware id, and the two JSON strings at 0x10 (onboard) and 0x3010 (default), **plus the two
+   `blockDataSize` uint64 properties on the block handle** before releasing it (§8). Our driver
    must provide:
    - **LED model JSON** (`lighthouse_config.modelPoints` = per-LED xyz in meters in the controller
      frame, `modelNormals` = per-LED unit outward normals). Source: Meta's Touch Plus LED geometry.
@@ -299,7 +306,8 @@ driver_touchframe already loads into vrserver and presents the OpenVR controller
      `manufacturer`, `device_serial_number`. Optionally `cv.has_retro_reflectors:false`,
      `led_type:"unknown"`.
 4. **Stream IMU** on `/data` at 240 Hz: one 0x30 block per sample, `{deviceId, timestamp_s (CLOCK_
-   MONOTONIC seconds, same clock XRService uses), accel m/s² @0x14, gyro rad/s @0x20}`. Timestamp
+   MONOTONIC seconds, same clock XRService uses) @0x08, accel m/s² @0x10, gyro rad/s @0x1c,
+   flags @0x28}`. Timestamp
    fidelity vs the camera clock is the single most important correctness factor (XRService rejects
    past/late samples and warns on latency).
 5. **Drive the LEDs continuously on** over our nRF dongle (per `docs/PROTOCOL.md`
@@ -313,8 +321,8 @@ driver_touchframe already loads into vrserver and presents the OpenVR controller
 **What our driver must provide, summarized:**
 - *LED model JSON:* `lighthouse_config.modelPoints` (N×[x,y,z] m) + `modelNormals` (N×[nx,ny,nz]
   unit), controller frame. Plus `imu`/`head` extrinsics, `model_number`, role, serial.
-- *IMU:* 240 Hz, per-sample 0x30 block `{u32 deviceId, double t_sec(CLOCK_MONOTONIC), f32×3 accel,
-  f32×3 gyro}`, timestamps on XRService's monotonic-seconds clock.
+- *IMU:* 240 Hz, per-sample 0x30 block `{u32 deviceId @0, double t_sec @8, f32×3 accel @0x10,
+  f32×3 gyro @0x1c, u32 flags @0x28}`, timestamps on XRService's monotonic-seconds clock.
 - *LEDs:* continuous-on during capture (period/on-time set so the LED is lit across the controller-
   frame exposure); brightness ~ `led_nominal_brightness` default. Strobe sync is optional/later.
 
@@ -330,20 +338,153 @@ whether our LEDs are seen and PnP initializes, exactly as they did for the real 
 
 ## 7. Open items / to verify on device (UNKNOWN)
 
-- **IVRBlockQueue vtable ordinals** (step 1/6 above) — reconstructed from driver_cv call sites;
-  confirm acquire/submit/wait/release/create/connect ordinals against the live `libopenvr_api.so`
-  before writing blocks, and confirm `_005` is the loaded version.
-- **Exact event-block field layout** beyond deviceId/type + the two JSON strings (the
-  `/controllerConfigData/*` property writes suggest a small structured header before the strings).
-- **Pose block (0x90) exact field offsets/units** — position, quaternion, velocities, validity,
-  timestamp; map precisely by capturing a live pose block or finishing `FUN_001d4760`/`FUN_001d9e60`
-  analysis.
+- ~~IVRBlockQueue vtable ordinals~~ — **resolved statically, §8.** Still to do on device: log that
+  `GetGenericInterface("IVRBlockQueue_005")` returns non-null before the first call.
+- ~~Exact event-block field layout~~ — **resolved, §8** (deviceId, type, hardware id, two JSON
+  strings; lengths travel as block properties).
+- **Pose block (0x90)** — offsets resolved (§8); still UNKNOWN: the byte at 0x04, the 3-vector at
+  0x78, and the units/frames (confirm with a live capture).
 - **deviceId collision/room** — whether XRService caps concurrent controllers (`Too many
   controllers to record, max is 4` is a recorder cap, not necessarily a tracker cap) and whether an
-  out-of-range id is accepted.
+  out-of-range id is accepted. Seen so far: XRService's pose-queue handle table is a vector grown to
+  `deviceId+1` (XRService `0xeb69f0`), so large ids work but cost memory; ids are formatted as
+  signed decimal in the queue name.
 - **Exposure interaction** — whether continuous-on LEDs survive XRService's auto-exposure for
   controller frames, or whether we must pin a manual exposure/gain (the settings exist:
   `setControllerTrackingFrameExposureTimeInMsAndGain`, `ActiveExposureController`).
 - **Whether driver_cv must be present at all** — i.e. can our driver `Create` the queues when no Roy
   controller has ever connected, and will XRService's `DeckardCaptureSource` connect to queues it
-  did not create. (XRService connects lazily on controller events, so likely yes; verify.)
+  did not create. (XRService connects lazily on controller events, so likely yes; verify.) Note the
+  trade-off in §8: if we Create the shared event/data queues, a Frame controller that activates
+  later cannot open them, because driver_cv's first controller always Creates and never falls back
+  to Connect.
+
+---
+
+## 8. IVRBlockQueue interface (verified)
+
+Static verification of everything our driver will call, done 2026-10-03 against the Frame's
+`vrserver`, `driver_cv.so` and `XRService` (copies in `artifacts/frame/`). The declaration we
+compile against is `driver/src/blockqueue.h` (written from scratch; each slot cites its evidence).
+vrserver addresses below are **ELF vaddrs** (Ghidra = vaddr + 0x100000); driver_cv addresses
+follow the Ghidra convention above; XRService addresses are ELF vaddrs.
+
+### 8.1 Where the declaration comes from
+
+- **CONFIRMED: Valve publishes this interface, just not in `openvr_driver.h`.** `openvr_capi.h` and
+  `openvr_api.json` carry `VR_IVRBlockQueue_FnTable`, `EBlockQueueError`, `EBlockQueueReadType`,
+  `EBlockQueueCreationFlag` and `IVRBlockQueue_Version`: `_004` in v1.12–v1.16, `_005` from v1.23
+  through master (v2.15.6). The only `_004`→`_005` change is the extra `unFlags` argument to
+  `Create` plus the `OwnerIsReader` flag. Several open-source drivers declare the same C++ class
+  (e.g. Pimax-Native-SteamVR, PSVR2Toolkit, openvr_camera_sim), which matches.
+- **CONFIRMED: the Frame's vrserver implements exactly that order.** RTTI: `20CVRBlockQueueManager`
+  (typeinfo `0x5d0a38`, single-inherits `N2vr13IVRBlockQueueE`) has a 9-slot vtable at `0x5c35e8`.
+  There is **no virtual destructor** in the interface. Compatibility wrappers `CVRBlockQueue_004`
+  (vtable `0x5c0ec0`, 9 slots), `_003` (`0x5c0f48`, 8), `_002` (`0x5c0fc8`, 7), `_001` (`0x5c1040`,
+  6) are tail-call thunks into the `_005` object, and each thunk uses the first unused argument
+  register as scratch, which shows its argument count.
+
+### 8.2 IVRBlockQueue_005 slots (all CONFIRMED)
+
+| off | method | args after `this` | vrserver impl | evidence |
+|-----|--------|-------------------|---------------|----------|
+| 0x00 | `Create(u64* hQueue, const char* path, u32 dataSize, u32 headerSize, u32 count, u32 flags)` | x1 x2 w3 w4 w5 w6 | `0x260820` | `_004` thunk sets `w6=0` then jumps to slot 0; driver_cv call `(…, 0x30, 0x200, 4, 0)` |
+| 0x08 | `Connect(u64* hQueue, const char* path)` | x1 x2 | `0x261af8` | driver_cv `FUN_001d9a40`; XRService `0xeb69f0` |
+| 0x10 | `Destroy(u64 hQueue)` | x1 | `0x25fc08` | absent from `_003` thunks |
+| 0x18 | `AcquireWriteOnlyBlock(u64 hQueue, u64* hBlock, void** ppBuf)` | x1 x2 x3 | `0x25f5b0` | driver_cv `FUN_001d44d8`/`FUN_001dfe78`; XRService `0xeb36f0` |
+| 0x20 | `ReleaseWriteOnlyBlock(u64 hQueue, u64 hBlock)` | x1 x2 | `0x2611e0` | same writers |
+| 0x28 | `WaitAndAcquireReadOnlyBlock(u64 hQueue, u64* hBlock, void** ppBuf, EBlockQueueReadType, u32 timeoutMs)` | x1 x2 x3 w4 w5 | `0x25fa30` | driver_cv `FUN_001d4760` (New, 100 ms); XRService `0xf29b20`/`0xf29cf0` (Next, 1 ms) |
+| 0x30 | `AcquireReadOnlyBlock(u64 hQueue, u64* hBlock, void** ppBuf, EBlockQueueReadType)` | x1 x2 x3 w4 | `0x25f930` | thunks only |
+| 0x38 | `ReleaseReadOnlyBlock(u64 hQueue, u64 hBlock)` | x1 x2 | `0x25eec8` | same readers |
+| 0x40 | `QueueHasReader(u64 hQueue, bool* pbHasReaders)` | x1 x2 | `0x25ec28` | driver_cv `FUN_001d44d8`; XRService `0xeb36f0` |
+
+All methods return `EBlockQueueError` (32-bit, `w0`). Handles are 64-bit
+`PropertyContainerHandle_t`.
+
+- **Versions (CONFIRMED):** `_004` = same 9 slots, `Create` without `flags`. `_003` = `_004`
+  without `Destroy` (8 slots). `_002` additionally lacks `QueueHasReader`; `_001` additionally lacks
+  `WaitAndAcquireReadOnlyBlock`. vrserver registers `IVRBlockQueue_001`…`_005`; driver_cv and
+  XRService both request `_005`.
+- **Create rules (CONFIRMED, CBlockQueue init `0x25ff28`):** `1 <= count <= 128`, `dataSize != 0`,
+  `headerSize >= 16`, else `InvalidParam (5)`; `AlreadyInitialized (8)`; `InternalError (7)` when
+  the shared-memory setup fails; `OperationIsServerOnly (9)` outside vrserver.
+- **Error enum (CONFIRMED values in use, names from `openvr_capi.h`):** 0 None, 1
+  QueueAlreadyExists, 2 QueueNotFound, 3 BlockNotAvailable, 4 InvalidHandle, 5 InvalidParam, 6
+  ParamMismatch, 7 InternalError, 8 AlreadyInitialized, 9 OperationIsServerOnly, 10
+  TooManyConnections.
+- **Read types:** 0 Latest, 1 New, 2 Next (values CONFIRMED in use; semantics INFERRED from names:
+  Latest = newest, may repeat; New = newest only if unread; Next = FIFO).
+- **Creation flags:** `OwnerIsReader = 1` (CONFIRMED: the pose queue, whose creator reads).
+- **Who creates what (CONFIRMED, driver_cv `FUN_001d9a40` called with `first ^ 1`):** the first
+  controller driver instance *Creates* `/controller/{data,event}`; later ones *Connect*. Every
+  instance *Creates* its own `/controller_<id>/pose` with `OwnerIsReader`. XRService only ever
+  Connects. Creating a name that already exists fails (exact code INFERRED: QueueAlreadyExists).
+- **Writers gate on readers (CONFIRMED):** driver_cv writes IMU only while `QueueHasReader(data)`;
+  XRService writes a pose only while `QueueHasReader(pose)` is true.
+
+### 8.3 IVRPaths_002 (needed for the event block)
+
+- **CONFIRMED:** event-block metadata is attached to the **block handle** as properties through
+  `IVRPaths_002` (both driver_cv and XRService request `IVRPaths_002`). Slots: `ReadPathBatch(root,
+  PathRead_t*, n)` +0x00, `WritePathBatch(root, PathWrite_t*, n)` +0x08, `StringToHandle(u64*,
+  const char*)` +0x10, `HandleToString(u64, char*, u32, u32*)` +0x18, checked against vrserver's
+  `CVRPaths_001` thunks (vtable `0x5c0df8`). `PathWrite_t` is 0x38 bytes in `_002` (`bPostEvents`
+  @0x30, `bValueChanged` @0x31; driver_cv sets `bPostEvents=1`); `PathRead_t` is 0x28 bytes. Both
+  match `openvr_capi.h` master.
+
+### 8.4 Event block (`/xrservice/controller/event`, 0x6010 bytes)
+
+Writer driver_cv `FUN_001dfe78`, reader XRService `0xf29cf0` (consumer `0xf2d650`).
+
+| off | type | field | tag |
+|-----|------|-------|-----|
+| 0x00 | u32 | deviceId | CONFIRMED |
+| 0x04 | u32 | event type: 1 connect, 0 disconnect; configs parsed only for 1 | CONFIRMED |
+| 0x08 | u64 | controller hardware id (XRService logs `Controller %d's hardware ID is 0x%016lx`) | CONFIRMED |
+| 0x10 | char[0x3000] | JSON, length = block property `/controllerOnboardConfigData/blockDataSize` | CONFIRMED |
+| 0x3010 | char[0x3000] | JSON, length = block property `/controllerDefaultConfigData/blockDataSize` | CONFIRMED |
+
+- **The lengths are mandatory (CONFIRMED).** Between `AcquireWriteOnlyBlock` and
+  `ReleaseWriteOnlyBlock`, driver_cv writes both `blockDataSize` paths with `WritePathBatch(hBlock,
+  …)`, type `uint64` (tag 3, 8 bytes). XRService reads them with `ReadPathBatch(hBlock, …)` and
+  builds each string from exactly that many bytes; if a read fails or the tag is not 3 it uses
+  length 0. A block without these properties therefore delivers empty configs.
+- `/controllerConfigData/deviceSerialNumber` (string, tag 5) is also written by driver_cv when
+  known; XRService has no reference to it (optional).
+- driver_cv copies each JSON with `strncpy(…, 0x2fff)`; the `>0x3000` length check only logs.
+- Which JSON XRService treats as "default" vs "onboard" downstream is INFERRED from the property
+  names. Sending the same full Touch Plus JSON in both slots is the safe choice.
+
+### 8.5 IMU block (`/xrservice/controller/data`, 0x30 bytes)
+
+Layout in §2 (corrected): `u32 deviceId @0`, `f64 time @8`, `f32×3 @0x10`, `f32×3 @0x1c`,
+`u32 @0x28`. Offsets CONFIRMED from driver_cv's writer and XRService's reader (`0xf29b20` reads with
+Next, 1 ms, then `0xf2a460` decodes). Accel-then-gyro order and the flags meaning are INFERRED
+(public `vr::ImuSample_t` uses the same order and an off-scale flags word; XRService negates the
+first vector, as one does for accelerometer sign conventions).
+
+### 8.6 Pose block (`/xrservice/controller_<id>/pose`, 0x90 bytes)
+
+Writer XRService `0xeb36f0` (filled in `0xeb3880`), reader driver_cv `FUN_001d4760` →
+`FUN_001d9e60`.
+
+| off | type | field | tag |
+|-----|------|-------|-----|
+| 0x00 | u32 | deviceId | CONFIRMED |
+| 0x04 | u8 | flag byte copied from a tracker global; driver_cv ignores it | UNKNOWN |
+| 0x08 | f64 | timestamp, seconds on the IMU clock; `-1.0` = no valid pose | CONFIRMED |
+| 0x10 | f64×4 | orientation quaternion **w, x, y, z** | CONFIRMED (writer copies an x,y,z,w quaternion into w,x,y,z order; reader's quaternion product agrees) |
+| 0x30 | f64×3 | position | CONFIRMED offset; metres INFERRED |
+| 0x48 | f64×3 | linear velocity | CONFIRMED offset; m/s INFERRED |
+| 0x60 | f64×3 | angular velocity (NaN replaced by 0 by the writer) | CONFIRMED offset; rad/s, body frame INFERRED |
+| 0x78 | f64×3 | another 3-vector; driver_cv ignores it | UNKNOWN |
+
+- Invalid-pose writers (`0xeb2170`, `0xec0d30`, `0xec1640`) set only deviceId and `timestamp =
+  -1.0`; everything else in such a block is garbage.
+- driver_cv applies a fixed rotation to the pose whose quaternion is (x=1, y=0, z=0, w=0),
+  i.e. 180° about X, with zero translation (constant at driver_cv `0x4a4db0`), and rotates position
+  and linear velocity but not angular velocity. CONFIRMED arithmetic; INFERRED meaning:
+  XRService's tracking frame to SteamVR's (y-up) frame. Our driver must apply the same conversion.
+- XRService *Connects* to the pose queue when it starts tracking the device and writes only while
+  someone reads it, so our driver must `Create` it (`OwnerIsReader`) and keep a reader on it
+  **before** sending the connect event.
