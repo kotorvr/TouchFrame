@@ -88,4 +88,10 @@ Status: **Phase 0 under way (2026-10-03).** The section "Log" at the end is the 
   - Research and Frame probe done.
   - Quest OTA extracted; firmware confirmed plaintext.
   - Relay driver (`driver/`) builds natively on the Frame: `driver_touchframe.so`, aarch64, exports `HmdDriverFactory`.
-  - Not yet installed; the Frame is shared with the EchoQuestCombat tests.
+  - **Driver verified on the Frame with `tools/sim_sender.py`:**
+    - `vrpathreg adddriver` plus a SteamVR restart loads it ("Loaded server driver touchframe"). It stays inert until UDP packets arrive.
+    - On the first packet, TouchFrame_Left/Right are added and activated as devices 1 and 2.
+    - `vrcmd --pollposes` shows poses streaming, including the openxr_grip→raw offset (20.6° pitch).
+    - `vrcmd --pollcontrollers` shows sticks, trigger, grip, buttons, touches and battery 80%. SteamVR applied Valve's `{oculus}` legacy Touch bindings by itself.
+    - `vrcmd --spamhaptics`: 383 haptic packets came back to the sender.
+  - **Next:** the Quest-side bridge APK. It needs Android build-tools (aapt2/zipalign/apksigner); the NDK 27 and OpenXR loader in `C:\Android` are present.
