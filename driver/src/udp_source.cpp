@@ -68,8 +68,12 @@ void UdpSource::Loop() {
             have_peer_ = true;
             last_seq_ = pkt.seq - 1;
         }
-        // Drop reordered packets; a newer pose already went out.
-        if (int32_t(pkt.seq - last_seq_) <= 0) continue;
+        // Drop reordered packets; a newer pose already went out. A big jump back or a pause
+        // means the source restarted its count (bridge activity recreated): follow it.
+        int32_t ahead = int32_t(pkt.seq - last_seq_);
+        if (ahead <= 0 && ahead > -1000 && now - last_recv_ns_ < 500000000ull) continue;
+        if (ahead <= 0) Log("udp: source restarted (seq %u after %u)", pkt.seq, last_seq_);
+        last_recv_ns_ = now;
         last_seq_ = pkt.seq;
         cb_(pkt, now);
         if (now - last_heartbeat_ns_ > 1000000000ull) {
