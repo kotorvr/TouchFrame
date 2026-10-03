@@ -81,6 +81,20 @@ A verifying 4-byte MIC confirms the key, the IV, the counter and the capture at 
 last-ditch) `--session`-derived fallbacks. `decode` takes one packet with explicit `--counter`/`--iv`
 for iterating — the negotiation packet itself is `--counter 0 --iv <those 8 bytes>`.
 
+Once decrypted, input is **not** a single packed report (PROTOCOL.md Q4, #6): the controller
+exposes buttons/triggers/stick/touch as individual host-registers assembled from a 61-byte
+"deerfly" sample. `tools/pulsar_input.py` parses that sample/those registers into named fields and
+verifies the deerfly checksum offline — field *values* are decoded; a few *semantics* (which analog
+is which axis, button-bit labels, battery scale) stay inferred until confirmed against a live dump.
+
+## Host mode (dongle acts as host — needs the dongle; sequence is pinned)
+Pairing is fully specified (PROTOCOL.md Q2, #1): send `SetupX25519Keys` (0x12) to exchange public
+keys, derive the X25519 secret, then send `PairingData` (0x11) carrying `[4-byte base addr][16-byte
+link key]` CCM-wrapped under the first 16 bytes of the secret (`WriteAESKey` 0x14 is a stub — skip
+it). `tools/pulsar_host.py` builds and self-verifies those frames offline. Advertise host Pulsar
+version **`0x1701`** (on-air `01 17`) and never reject the controller (PROTOCOL.md Q6, #5). The
+radio transmit/slot timing is the remaining hardware-day work.
+
 ## 6. Gate B: do the Frame cameras see Touch Plus LEDs? (needs the Frame + a Touch Plus)
 This does **not** need the dongle — it reuses the relay. It is the one open question for 6DoF.
 ```bash
@@ -100,6 +114,8 @@ FRAME_HOST=steamos@<ip> tools/frame.sh gateb on left
 ```bash
 radio-fw/build.sh                 # firmware
 python tools/radio.py --help      # (fake-dongle tested)
-python tools/pulsar_crypto.py selftest
+python tools/pulsar_crypto.py selftest   # CCM decode (RFC 3610 + round-trip)
+python tools/pulsar_host.py selftest     # pairing-packet builder (X25519 + 0x11 round-trip)
+python tools/pulsar_input.py selftest    # input decoder (CRC-32 + remaps round-trip)
 cd driver && bash test/run.sh     # config parser vs real + generated configs
 ```

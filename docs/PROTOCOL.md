@@ -388,7 +388,7 @@ labelled button is set there, not here). All offsets are into the 61-byte buffer
 | off | size | → hreg | field (CONFIRMED packing / INFERRED meaning) |
 |---|---|---|---|
 | 0x00 | 4 | reg 2 (4B) | sample counter / timestamp (INFERRED) |
-| 0x04 | bits0..4 | reg 4 (bits0-3) + reg 0x2b (bit4) | touch / proximity flags (remap CONFIRMED, meaning INFERRED) |
+| 0x04 | bits0..4 | reg 4 (bits0-3) + reg 0x2b (bit4) | touch / proximity flags (remap mostly CONFIRMED; out2/out3 contested — see below; meaning INFERRED) |
 | 0x05..0x14 | u16×several | reg 8 (10B) | capacitive-touch raw channels (INFERRED) |
 | 0x0f..0x1a | u16×several | reg 0x21 (12B) | cap-touch raw channels (INFERRED) |
 | 0x1b..0x20 | u8/u16 | reg 0x20 (6B) | sensor channels (INFERRED) |
@@ -414,8 +414,12 @@ needs the deerfly firmware.
 out8=b.7, out9=c.3, out10=c.0, out11=c.1 (12 button bits). Which output bit is A/B/X/Y/menu/
 system/stick-click is set in deerfly (UNKNOWN here).
 
-**Flag remap (CONFIRMED math)** from deerfly `buf[0x04]`: reg4.out0=in.1, out1=in.2, out2=in.0,
-out3=in.3; reg 0x2b = in.4. (Meaning touch vs proximity is INFERRED.)
+**Flag remap** from deerfly `buf[0x04]`: `reg4.out0=in.1`, `out1=in.2`, and `reg 0x2b = in.4` are
+CONFIRMED (agree across two independent reads of `FUN_000173bc`). The `out2`/`out3` pair is
+**contested**: one read gives `out2=in.0, out3=in.3`, the other `out2=in.3, out3=in.0` — the latter
+ordering may actually be the parallel 10-bit edge write `FUN_0001f748(value,10)`, not the hreg-4
+write `FUN_0001f464(4,…)`. `tools/pulsar_input.py` exposes both orderings (`touch_flags_reg4` vs
+`touch_flags_edge10`) so one live capture settles it. (Meaning touch vs proximity is INFERRED.)
 
 **IMU is a separate path (CONFIRMED):** elk pushes IMU to **reg 0xb** (12B, `FUN_00014c1c @
 0x14c1c`) and **reg 0x16** (2B, `FUN_00014c38 @ 0x14c38`) from the elk-side ICM426xx/476xx
