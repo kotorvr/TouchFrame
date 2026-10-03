@@ -5,3 +5,6 @@ build/
 *.bin
 *.zip
 __pycache__/
+
+artifacts/work/
+*.decomp.c
