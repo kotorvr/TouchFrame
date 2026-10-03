@@ -1,0 +1,7 @@
+# Meta/Valve firmware, OTA images, extracted binaries and captures: never commit.
+artifacts/
+build/
+*.img
+*.bin
+*.zip
+__pycache__/
