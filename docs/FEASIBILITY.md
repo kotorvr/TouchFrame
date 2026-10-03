@@ -148,3 +148,8 @@ Status: **Phase 0 under way (2026-10-03).** The section "Log" at the end is the 
     - Two fixes came out of it:
       - (a) The driver dropped every packet after the bridge's activity was recreated in the same process (seq restarted at 1 from the same ip:port), so there was no input and no heartbeat. A big jump back or a 0.5 s gap now resyncs.
       - (b) Side effect of declaring optional hand tracking: controllers set down make the Quest switch to hands. The OpenXR profile goes `none` and the bridge reports `off` until they're picked up. The bridge now logs the profile changes.
+- **2026-10-03 (night): radio-fw sniffer ready for the dongle** (phase 2, before hardware).
+  - `radio-fw/`: bare-metal nRF52840 Dongle firmware (nrfx MDK + TinyUSB CDC). Raw RADIO RX into a 64-slot DMA ring, TIMER0 µs stamps at ADDRESS (PPI 26), RSSI, CRC status, channel hopping, and an RSSI sweep of 2400–2500 MHz. Links at 0x1000 so the stock MBR and USB bootloader stay. `build.sh` builds it, and `build.sh flash` reboots the dongle into DFU (GPREGRET 0xB1) and flashes it.
+  - `tools/radio.py`: ports / dfu / status / sweep / sniff, plus JSONL capture.
+  - Discovery preset confirmed in syncboss: logical address 7 = BASE1 `0xFACEB00C` + AP7 `0xAA` (`FUN_0001bb78`, `FUN_0001bb90`), 2402 MHz (`FUN_0001bcf0(2)`). The test path's PCNF1 is `0x030400FF` (MAXLEN 255, BALEN 4, big-endian).
+  - Verified without hardware: clean build with no warnings, vector table at 0x1000 with our RADIO/USBD/POWER/SysTick handlers, struct sizes asserted on both sides, the C COBS code transcribed and fuzzed against the Python side (20k frames), and every `radio.py` command run against a fake dongle. Not yet run on a dongle.

@@ -7,6 +7,7 @@ Work in progress. See [docs/FEASIBILITY.md](docs/FEASIBILITY.md) for findings, t
 ## Layout
 - `driver/`: SteamVR (OpenVR) driver `driver_touchframe`, built natively on the Frame (aarch64). It presents two `oculus_touch` controllers with Quest 3 render models, hand skeletons and haptics. Input comes from a pluggable source; today that's a UDP relay (`driver/src/protocol.h`).
 - `quest-bridge/`: the Quest-side relay app (native OpenXR). It streams the controllers to the Frame and plays haptics.
+- `radio-fw/`: firmware for an nRF52840 USB dongle, today a sniffer for the Touch Plus radio link (see [radio-fw/README.md](radio-fw/README.md)). `tools/radio.py` flashes and drives it.
 - `tools/install.sh`: one-command install/uninstall of both sides from a PC.
 - `tools/frame.sh`: build, install, restart, calibrate and log on the Frame over SSH.
 - `tools/quest.sh`: install, start/stop and status for the bridge on the Quest, with a keep-awake watchdog.
