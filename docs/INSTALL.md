@@ -78,7 +78,7 @@ status: session focused, target 192.168.0.195:28430, sent 3610 (72/s), L tracked
 ```
 
 - `driver waiting` or `lost`: the Frame isn't answering. Check that SteamVR is running and the driver is installed (`tools/frame.sh log`), and the IP.
-- `L off` / `R off`: the controllers are asleep. Press a button on each.
+- `L off` / `R off`: the controllers are asleep (press a button on each), or they were set down and the Quest switched to hand tracking (pick them up). The log shows `left/right hand profile: none` when that happens.
 - `session visible`/`idle` instead of `focused`: another app or a system dialog is in front on the Quest.
 
 The bridge recovers by itself from Wi-Fi drops, SteamVR restarts and a lost OpenXR session.

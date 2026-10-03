@@ -398,6 +398,17 @@ struct Bridge {
                 } else if (state == XR_SESSION_STATE_EXITING) {
                     ANativeActivity_finish(app->activity);
                 }
+            } else if (ev.type == XR_TYPE_EVENT_DATA_INTERACTION_PROFILE_CHANGED) {
+                // "none" while the runtime has switched to hand tracking (controllers set down).
+                for (int h = 0; h < 2; h++) {
+                    XrInteractionProfileState ip{XR_TYPE_INTERACTION_PROFILE_STATE};
+                    xrGetCurrentInteractionProfile(session, hand_path[h], &ip);
+                    char name[XR_MAX_PATH_LENGTH] = "none";
+                    uint32_t n = 0;
+                    if (ip.interactionProfile != XR_NULL_PATH)
+                        xrPathToString(instance, ip.interactionProfile, sizeof(name), &n, name);
+                    LOG("%s hand profile: %s", h ? "right" : "left", name);
+                }
             }
             ev = {XR_TYPE_EVENT_DATA_BUFFER};
         }

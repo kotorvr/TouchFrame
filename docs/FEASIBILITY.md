@@ -143,3 +143,8 @@ Status: **Phase 0 under way (2026-10-03).** The section "Log" at the end is the 
     - Two trackers on the same LEDs alternate ownership (`filterTrackedLedsForOtherControllers`). This only affects the clone, not distinct Touch Plus LEDs.
     - The shared queues exist only after a Frame controller has connected.
   - **Gate B is now the only 6DoF unknown.** The clone is disabled again on the Frame (`cv_clone_serial` = "").
+  - **Real-controller check:**
+    - With real Touch Plus, `tf_skeldump watch` showed curl following the hands: index 0→1 with the trigger, middle/ring/pinky ~0.05→1 with grip, thumb ~0.4–0.6 while touching a surface, both hands independently.
+    - Two fixes came out of it:
+      - (a) The driver dropped every packet after the bridge's activity was recreated in the same process (seq restarted at 1 from the same ip:port), so there was no input and no heartbeat. A big jump back or a 0.5 s gap now resyncs.
+      - (b) Side effect of declaring optional hand tracking: controllers set down make the Quest switch to hands. The OpenXR profile goes `none` and the bridge reports `off` until they're picked up. The bridge now logs the profile changes.
