@@ -8,14 +8,20 @@ the air, so a sniffer cannot recover it and this tool cannot "crack" anything. I
 *your own* link once you supply that key — e.g. the headset default from
 `/data/misc/pulsar_aes_key.bin`, or a key you dumped from your own device.
 
-The 13-byte CCM nonce packing from the Pulsar fields (session nonce, beacon timestamp, per-packet
-counter, direction) is not yet pinned from the firmware (docs/PROTOCOL.md open item). So this tries
-several candidate layouts and reports which one makes the 4-byte MIC verify — a correct MIC is a
-1-in-4-billion coincidence, so a single verifying packet confirms both the key and the layout.
+The 13-byte CCM nonce is the nRF hardware-CCM layout (docs/PROTOCOL.md Q3/Q4), confirmed from the
+firmware: a 5-byte little-endian packet counter (39-bit counter + direction in bit 39) followed by
+the 8-byte IV. The IV is a RANDOM per-session value, not derived from the session nonce or beacon
+timestamp: syncboss `FUN_00047604` fills 8 bytes at CCM-config +0x88 from the hardware RNG
+(`FUN_000185d8`), encrypts the negotiation packet with counter 0 via the CCM helper `FUN_0001b1a4`,
+then copies that IV to +0x99 to reuse for the whole session. So a sniffer sees the session IV once,
+in the clear, in the negotiation packet.
 
-The connection-negotiation packet is the easy case (docs/PROTOCOL.md Q3): its nonce is counter 0
-plus an 8-byte IV sent in the clear in that packet. Decode it directly with `--counter 0 --iv
-<those 8 bytes>`. Steady-state packets use a per-packet counter and a session IV; use `scan`.
+Decode therefore needs that 8-byte IV plus the per-packet counter. The negotiation packet is the
+easy case: counter 0 with the IV from that packet — `--counter 0 --iv <those 8 bytes>`. For
+steady-state packets, pass the same session IV and let `scan` sweep the counter; a correct 4-byte
+MIC is a 1-in-4-billion coincidence, so a single verifying packet confirms the IV, counter and key.
+The old `session<<48|timestamp` IV guesses are kept only as a last-ditch fallback (the firmware
+contradicts them) for the case where no negotiation packet was captured.
 
   pulsar_crypto.py selftest
   pulsar_crypto.py decode --key <32 hex> --packet <hex payload incl. 4-byte MIC> \\
@@ -89,22 +95,28 @@ def nonce_from_fields(counter=0, direction=0, iv=b"\x00" * 8):
 
 
 def candidate_nonces(counter, direction, iv, session, timestamp):
-    """Plausible IV derivations to try. 'iv' (if given) overrides; else build from
-    session nonce (beacon bytes 6-7) and 48-bit beacon timestamp (bytes 8-13)."""
+    """Nonce layouts to try, firmware-grounded first.
+
+    The confirmed layout (syncboss FUN_00047604 / CCM helper FUN_0001b1a4) is a per-session
+    random 8-byte IV with a per-packet counter. If that IV is known (captured from the
+    negotiation packet, in the clear), pass it as 'iv' — that is the only layout that should
+    verify. The session<<48|timestamp derivations below are firmware-contradicted and are
+    emitted only as a last-ditch fallback for captures with no negotiation packet."""
     out = []
     if iv is not None:
-        out.append(("explicit-iv", nonce_from_fields(counter, direction, iv)))
+        # Confirmed layout: random session IV + per-packet counter. Try the caller's
+        # direction first, then the other (TX vs RX share the IV, differ in bit 39).
+        out.append(("session-iv", nonce_from_fields(counter, direction, iv)))
+        out.append(("session-iv dir-flip", nonce_from_fields(counter, direction ^ 1, iv)))
         return out
     sess = session or 0
     ts = timestamp or 0
-    # elk-app 0x2409c builds a 64-bit value (session<<48)|timestamp; try it as IV (both endians)
+    # FALLBACK ONLY (firmware contradicts these): no IV captured, guess a derived one.
     combined = ((sess & 0xFFFF) << 48) | (ts & ((1 << 48) - 1))
-    out.append(("iv=sess<<48|ts LE", nonce_from_fields(counter, direction, combined.to_bytes(8, "little"))))
-    out.append(("iv=sess<<48|ts BE", nonce_from_fields(counter, direction, combined.to_bytes(8, "big"))))
-    # that 64-bit value as the packet counter instead, zero IV
-    out.append(("ctr=sess<<48|ts", nonce_from_fields(combined, direction, b"\x00" * 8)))
-    # counter alone, zero IV
-    out.append(("ctr-only", nonce_from_fields(counter, direction, b"\x00" * 8)))
+    out.append(("fallback iv=sess<<48|ts LE", nonce_from_fields(counter, direction, combined.to_bytes(8, "little"))))
+    out.append(("fallback iv=sess<<48|ts BE", nonce_from_fields(counter, direction, combined.to_bytes(8, "big"))))
+    out.append(("fallback ctr=sess<<48|ts", nonce_from_fields(combined, direction, b"\x00" * 8)))
+    out.append(("fallback ctr-only", nonce_from_fields(counter, direction, b"\x00" * 8)))
     return out
 
 
@@ -151,6 +163,7 @@ def do_decode(args):
 
 def do_scan(args):
     key = h(args.key)
+    iv = h(args.iv) if args.iv else None
     rows = []
     with open(args.capture) as f:
         for line in f:
@@ -169,7 +182,7 @@ def do_scan(args):
                 continue
             for direction in (0, 1):
                 for counter in range(args.max_counter + 1):
-                    for name, nonce in candidate_nonces(counter, direction, None, args.session, r.get("t_us")):
+                    for name, nonce in candidate_nonces(counter, direction, iv, args.session, r.get("t_us")):
                         pt, ok = ccm_decrypt(key, nonce, body)
                         if ok:
                             print(f"VERIFIED t={r.get('t_us')} mhz={r.get('mhz')} dir={direction} ctr={counter} "
@@ -194,6 +207,8 @@ def main():
     s = sub.add_parser("scan")
     s.add_argument("--key", required=True)
     s.add_argument("--capture", required=True)
+    s.add_argument("--iv", help="8-byte session IV from the negotiation packet, hex "
+                               "(confirmed layout: sweeps the per-packet counter with this IV)")
     s.add_argument("--session", type=lambda x: int(x, 16))
     s.add_argument("--max-counter", type=int, default=8)
     s.add_argument("--limit", type=int, default=0)
