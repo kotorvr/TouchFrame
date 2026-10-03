@@ -10,6 +10,7 @@
 
 #include <openvr_driver.h>
 
+#include "cv_clone.h"
 #include "log.h"
 #include "protocol.h"
 #include "skeleton.h"
@@ -271,10 +272,13 @@ public:
         auto port = uint16_t(VRSettings()->GetInt32(kSection, "port"));
         source_ = std::make_unique<UdpSource>(port, [this](const StatePacket& pkt, uint64_t now) { OnState(pkt, now); });
         if (!source_->Start()) return VRInitError_Driver_Failed;
+        cv_clone_ = CvClone::CreateFromSettings();  // camera-tracker test; off unless cv_clone_serial is set
         return VRInitError_None;
     }
 
     void Cleanup() override {
+        if (cv_clone_) cv_clone_->Stop();
+        cv_clone_.reset();
         if (source_) source_->Stop();
         source_.reset();
         VR_CLEANUP_SERVER_DRIVER_CONTEXT();
@@ -346,6 +350,7 @@ private:
     std::unique_ptr<TouchController> hands_[2];
     std::atomic<bool> added_[2] = {false, false};
     std::unique_ptr<ITouchSource> source_;
+    std::unique_ptr<CvClone> cv_clone_;
     std::atomic<uint64_t> last_packet_ns_{0};
     double latency_s_ = 0.015;
     uint64_t last_settings_check_ns_ = 0;

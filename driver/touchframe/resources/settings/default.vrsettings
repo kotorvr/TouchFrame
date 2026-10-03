@@ -11,6 +11,14 @@
 		"calib_qz": 0.0,
 		"calib_tx": 0.0,
 		"calib_ty": 0.0,
-		"calib_tz": 0.0
+		"calib_tz": 0.0,
+		"cv_clone_serial": "",
+		"cv_clone_config": "/home/steamos/touchframe-cv/clone_config.txt",
+		"cv_clone_device_id": 40,
+		"cv_clone_ref_device_id": 0,
+		"cv_clone_imu": "synth",
+		"cv_clone_accel_sign": 1.0,
+		"cv_clone_probe": true,
+		"cv_clone_csv": ""
 	}
 }
