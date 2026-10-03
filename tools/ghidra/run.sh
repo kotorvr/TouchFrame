@@ -21,7 +21,8 @@ mkdir -p "$PROJ"
 NAME="$1"; VEC="$2"; FUNCS="${3:-}"
 IMG="$WORK/$NAME.bin"
 # base = vector - 0x100 for dAeH images, 0 for raw syncboss
-BASE=$(python -c "import json;print(hex(json.load(open(r'$WORK/images.json'))['$NAME']['base']))")
+IMGJSON_WIN=$(cygpath -w "$WORK/images.json")
+BASE=$(python -c "import json,sys;print(hex(json.load(open(sys.argv[1]))['$NAME']['base']))" "$IMGJSON_WIN")
 
 SETUP_ARGS=("$VEC")
 [ -n "$FUNCS" ] && SETUP_ARGS+=("$FUNCS")
