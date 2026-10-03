@@ -88,18 +88,60 @@ rougher.
   `pulsar_cl_*.c`, `pulsar_tl_*.c`); the device and host sides mirror each other.
 - **CRC-24, poly `0x00108421`, init `0x00FFFFFF`** — CONFIRMED as literal constants:
   `syncboss 0x52034`/`0x520a8`, `elk-app 0x316fc`/`0x31770`.
-- Packet: 1-byte preamble, access address, 8-bit LENGTH, payload, 3-byte CRC. The LL sets
-  `PCNF0` LFLEN=8, S0LEN=0, S1LEN=0 (seen in the TX/PER test path `syncboss FUN_00018058
-  @ 0x18058`, which also uses the 0x55 preamble pattern). Whether the connected-link PCNF0
-  adds an S0/S1 byte is **INFERRED=no** but not yet pinned to the live path — UNKNOWN.
+- Packet on air: 8-bit preamble, 5-byte address (4-byte base + 1-byte prefix), [S0],
+  8-bit LENGTH, payload, 3-byte CRC. Two `PCNF0` variants exist, chosen per link
+  (all CONFIRMED, see "Radio configuration per link" below): **connected link has a 1-byte
+  S0 (always `0x04`)**, discovery/pairing and the 2402 DM beacon have **no S0**. The
+  `syncboss FUN_00018058` TX/PER test path (LFLEN=8, S0=0) is not the live path.
 
-**Access addresses (CONFIRMED constants):**
-- **Discovery: `0xAA` prefix + base `0xFACEB00C`**, 2402 MHz. Constant present in
-  `syncboss 0x1e2c4, 0x204d8, 0x208d8, 0x20a5c` and `elk-spl 0x7fc0, 0x8168` (discovery
-  lives in the SPL/DM side and the host, not in elk-app). Matches prior public research.
-- **Pairing on 2426 MHz** (INFERRED, prior work; consistent with 2426 being excluded from
-  the data-channel set below). After the SPL switches to the connected link, the per-device
-  access address comes from `device_id_0` / the pairing-provisioned base (INFERRED).
+### Radio configuration per link (CONFIRMED)
+
+One PHY init sets everything: host `pulsar_phy.c` init `syncboss FUN_0001b61c @ 0x1b61c`,
+device `elk-app` inline init at `0x25662..0x256b2`, controller DM/SPL `elk-spl FUN_000080c8`.
+They take an nrf-HAL-style packet-config struct `{lflen, s0len, s1len, s1incl, cilen, plen,
+crcinc, termlen, maxlen, statlen, balen, big_endian, whiteen}`.
+
+| register | value | evidence |
+|---|---|---|
+| `MODE` | 1 = Nrf_2Mbit | `0x1b61c` (`+0x510 = 1`), elk-app `0x25688` |
+| `MODECNF0` | 1 (fast ramp-up, 40 µs; device arms TXEN 0x28 µs early) | `+0x650 = 1`, elk-app `0x2565c`, `0x23fd4` |
+| `PCNF0` connected | LFLEN=8, **S0LEN=1**, S1LEN=0, S1INCL=1 (RAM-only pad byte, nothing on air), PLEN=8-bit | host `0x1b61c` with `init.s0=1` from `FUN_0001e150`; device struct `{8,1,0,1,..}` elk-app `0x2566e` |
+| `PCNF0` discovery / pairing / DM beacon | LFLEN=8, **S0LEN=0**, S1LEN=0, PLEN=8-bit | host DM init `FUN_00020440` (`s0=0`); runtime toggle `syncboss FUN_0001bfbc(1)`; device DM event `elk-app FUN_00023d6c` writes `s0len=0` |
+| `PCNF1` | BALEN=4, ENDIAN=big, STATLEN=0, WHITEEN=0; MAXLEN host-connected **59** (`0x13b` literal at `syncboss 0x1e1e6`), device-connected **130** (`0x82`, elk-app `0x25674`), DM/pairing **255** | `+0x518 = maxlen \| 0x1040000` |
+| `CRCCNF` | 3 = 24-bit, **SKIPADDR=0 (address is included in the CRC)** | host `0x1b61c`, device `0x2569c`; the device also re-checks the CRC in software over bit-swapped base bytes, prefix, S0, LENGTH, payload (`elk-app FUN_00024164`) |
+| `CRCPOLY` / `CRCINIT` | `0x108421` / `0xFFFFFF` | as above |
+| whitening | off (`WHITEEN=0`) | `PCNF1` value above |
+| `SHORTS` | `0x113` (READY_START, END_DISABLE, ADDRESS_RSSISTART, DISABLED_RSSISTOP) | both images |
+
+Logical-address use: `BASE0` and `BASE1` are always written with the **same** 32-bit value
+(`syncboss FUN_0001bb78`, elk-app `0x256aa`), except the host connected link which puts
+`0xFACEB00C` in `BASE0` (for AP0) and the network address in `BASE1` (`FUN_0001bb60`). TX is
+always logical address 7 on the host (`FUN_0001bb90` writes AP7 + `TXADDRESS=7`); the
+device TXes on logical 7 too (`elk-app FUN_00028ad0`). Uplink RX prefixes are set by
+`syncboss FUN_0001bbb8` (AP1..AP6 from a list, AP0 separately).
+
+**Access addresses (CONFIRMED):**
+- **Discovery: prefix `0xAA` + base `0xFACEB00C`, 2402 MHz, S0=0.** Host listens
+  (`syncboss FUN_000207c8`, `FUN_000208dc`); the controller SPL advertises to the same
+  address (`elk-spl 0x7f60`: base, `FUN_00007e9c` = TX/RX prefix 0xAA, freq 2).
+- **Pairing ("DM link"): prefix `0xAA` + base = the controller's 64-bit device ID low word,
+  2426 MHz, S0=0, MAXLEN 255.** The device ID is the controller's **FICR `DEVICEID[0..1]`**
+  (`elk-spl FUN_00006e4c` reads `0x10000060`), stored at DM state `+0x28` and used as base at
+  `elk-spl 0x8008..0x8016` (freq `0x1a`). Host side: `syncboss FUN_00020cc4(id_lo, id_hi)`
+  selects the target, `FUN_000204f0` sets `BASE = id_lo`, prefix 0xAA, freq `0x1a`.
+- **Connected link: base = the host's 4-byte "network address"**, provisioned by Android
+  (`pulsar_host_init` console arg "4-byte network address"; `libsyncboss` persists it in
+  `/persist/pulsar/pulsar_host_address.bin`) and handed to the controller in pairing. Host
+  init chain `FUN_00019e4c -> FUN_0001d300 (pulsar_cl_host.c) -> FUN_0001e5dc
+  (pulsar_ll_host.c, stores it at LL+0x50) -> FUN_0001e150` (PHY setup). Device copy at
+  elk-app LL `+0x1e4`. It is **not derivable** from anything on air (UNKNOWN per headset).
+  - **Host TX prefix `0xF0`** (`FUN_0001e150` -> `FUN_0001bb90(0xf0)`); device RX = AP1
+    `0xF0` (`elk-app 0x25794`).
+  - **Device TX prefix = slot + 1, i.e. `0x01..0x05`** (`syncboss FUN_0001ab84` returns
+    `slot+1`, `slot < PULSAR_NUM_DEVICE_SLOTS + PULSAR_NUM_AUXILIARY_DEVICE_SLOTS = 5`;
+    elk-app `FUN_00028ad0` sets AP7 = `slot+1`). Host RX = AP1..AP5 = `0x01..0x05` on
+    `BASE1`, plus AP0 = `0xAA`/`0xFACEB00C` enabled only during DM beacons
+    (`FUN_0001bc9c(1)`) so it can hear advertising controllers.
 
 **Channel list + hopping (CONFIRMED):**
 - `PULSAR_NUM_CHANNELS = 37`. `pulsar_ll_channels.c` logical-channel -> frequency lookup is
@@ -110,20 +152,84 @@ rougher.
 - Host distributes an active-channel bitmap and runs **adaptive FHSS** with a frequency
   blocklist: `adaptive_fhss.c`, `pulsar_host_get_ch_map` ("channel map distributed by the
   Host"), `"channel map: %05X%08X, active channels: %d"` (`syncboss FUN_00006dd8 @ 0x6dd8`),
-  host blocklist via `vendor.syncbosshal.pulsar_blocklist`.
+  host blocklist via `vendor.syncbosshal.pulsar_blocklist`. A map needs >= 8 channels
+  (`syncboss FUN_0001aa30`, elk-app beacon parse).
 
-**Timing / who-transmits-first / ack (INFERRED, slot-based TDMA):**
-- The **host transmits beacons**; devices receive in scheduled slots and reply. Device LL:
-  `beacons_since_last_rx`, `PULSAR_DEVICE_MISSED_BEACONS_BEFORE_DC`, `beacon_time_handler`,
-  `"Missed RX window {%lu,%lu,%lu}"`. Host CL: `pulsar_cl_host.c` `prepare_beacon_handler`,
-  counters `beacons_tx/sent/skipped`, `idle_beacons`, `dm_beacons`.
-- Slots: `PULSAR_NUM_DEVICE_SLOTS` + `PULSAR_NUM_AUXILIARY_DEVICE_SLOTS`
-  (`ll_slot_config.c`, `endpoint_allocator.c`, `connection_tracker.c`). Beacon timestamp is
-  `LL_BITS_IN_BEACON_TIMESTAMP` wide. Exact slot length in µs and the ack scheme are
-  **UNKNOWN** (continue at `pulsar_cl_host.c` / `pulsar_worker.c` in syncboss).
-- A 1 µs sync timer (`pulsar_sync_timer.c`, `"Timer precision must be 1 us"`) and a
-  time translator (`time_translator.c`) align host and device clocks; this same clock
-  drives the camera-sync LED strobe (Q4).
+**Hop rule = BLE Channel Selection Algorithm #1 over 37 logical channels (CONFIRMED both
+sides: host `syncboss FUN_0001aaf4`, device `elk-app FUN_00023d6c`):**
+- `hop = (netaddr & 0xFF) % 11 + 5` (range 5..15). Host `FUN_0001e150` (`0xba2e8ba3`
+  reciprocal = /11), device `elk-app 0x245c6` (`udiv` by 11, `+5`).
+- Per beacon period: `unmapped = (unmapped + hop * n) % 37` (n = periods advanced, normally
+  1). If `unmapped` is not in the map, `idx = used[unmapped % num_used]` where `used[]` is the
+  ascending list of enabled logical channels; else `idx = unmapped`. `FREQUENCY =
+  table[idx]` (`FUN_0001ac24`). Initial state at host LL start: map = all 37, `unmapped = 0`
+  (`FUN_0001a85c`).
+- The beacon carries the map and the current `unmapped` value (layout below), so a sniffer
+  can lock on from any single beacon once it knows `netaddr`.
+- **DM beacons:** while the host is scanning for advertising controllers
+  (`pulsar_ll_dm_scan.c`, `FUN_0001f3f8/0x1f53c/0x1f65c`), some beacon periods are spent on
+  **2402 MHz instead of the hop channel**, with S0 off (`FUN_0001bfbc(1)`) and AP0 RX enabled
+  (CONFIRMED in `FUN_0001dbf8`). The hop counter still advances. When the DM-scan state is
+  active the host also adds one extra 2000 µs period and one extra hop step before the next
+  beacon (`iVar4 = 4000` branch of `FUN_0001dbf8`) — INFERRED reading; a follower should
+  simply re-sync from byte 5 of every beacon. Spacing between DM scans is pseudo-random (xorshift16
+  seeded with `netaddr & 0xFFFF`, `(r % 20) + 5` periods; `FUN_0001f65c`, `FUN_0001e5dc`) —
+  INFERRED. The beacon announces it: payload byte 0 bits 1..2 = periods until the DM beacon
+  (device sets its DM event at `counter + ((b0 & 7) >> 1)`, elk-app `FUN_00024164`).
+
+**Timing (CONFIRMED unless noted):**
+- **Beacon interval 2000 µs (500 Hz).** Host advances its beacon clock by 2000 per beacon
+  (`FUN_0001dbf8`, `LL+0x5e4 += 2000`); device expects the next beacon at
+  `last_anchor + (missed + 1) * 2000` (`elk-app FUN_00023e54`, and `/ 0x7d0` at `0x23f20`).
+  Device anchor = TIMER capture at ADDRESS − 20 µs (`elk-app FUN_00024164`).
+- **Device RX window:** centred on the expected beacon, base length 252 µs, widened by
+  `elapsed × 40 ppm + 6 µs` per side (`(n+1)·80000/1e6 + 6`), capped at 920 µs
+  (`FUN_00023e54`). Disconnect after `PULSAR_DEVICE_MISSED_BEACONS_BEFORE_DC` misses.
+- **Uplink slots:** device in slot `s` (0..4) transmits at `anchor + 350 + off[s]` µs with
+  `off = {0, 225, 525, 825, 1125}` (table `elk-app 0x32504`, `+0x15e` in `FUN_00028ad0`);
+  so slot starts are 350 / 575 / 875 / 1175 / 1475 µs after the beacon, the last one ending
+  well before the next beacon. Which time base `anchor` refers to (this beacon) is INFERRED.
+- **Ack scheme:** the host has no immediate per-packet ack. Each received uplink sets bit
+  `slot` in an rx mask (`mark_rx_mask`, `syncboss FUN_0001cdcc`) which is sent in the
+  **next beacon** (payload byte 15) and then cleared (`pulsar_cl_host.c` prepare_beacon
+  `FUN_0001cf30`). CONFIRMED that the bitmap is sent; its use by the device for
+  retransmission is INFERRED.
+
+**Beacon (host -> all, prefix `0xF0`, S0 = `0x04`) payload layout (CONFIRMED; builder
+`syncboss FUN_0001dbf8` into `LL+0x5e8`, parser `elk-app FUN_00024164`):**
+
+| payload byte | content |
+|---|---|
+| 0 | bit0 reserved (UNKNOWN), bits1..2 = periods until DM beacon (0 = none), bits3..7 = channel map bits 0..4 |
+| 1..4 | channel map bits 5..36 (37-bit map, LSB first; byte 4 bits3..7 = map bits 32..36) |
+| 5 | current `unmapped` channel (0..36) |
+| 6..7 | 16-bit value from host init right after the AES key = the **session nonce** (INFERRED name; CONFIRMED plumbing `FUN_00019e4c -> FUN_0001e5dc +0x54`). The device puts it in the top 16 bits of its 64-bit CCM packet counter (`elk-app 0x240cc`). |
+| 8..13 | 48-bit beacon timestamp, µs on the sync clock, little-endian (`LL_BITS_IN_BEACON_TIMESTAMP` = 48) |
+| 14 | CL: `1 << slot` of the device addressed by downlink data in this beacon, else 0 (INFERRED meaning) |
+| 15 | CL: **rx/ack bitmap** of slots heard since the last beacon |
+| 16.. | CL data, <= 34 bytes (`CL_HOST_MAX_PAYLOAD_LEN`); a 36-byte connection-negotiation variant exists |
+
+LENGTH is 14..50 (`"Beacon length too large"`, assert `<= 0x32`). The beacon header is
+built and parsed in clear (no CCM call in either path) — INFERRED plaintext; uplink and CL
+data are CCM-encrypted (Q3). Uplink packets also carry S0 = `0x04`, LENGTH <= 126
+(`LL_DEV_MAX_PAYLOAD_LEN`, elk-app `0x24046`).
+
+**Discovery advertisement (controller -> 2402, S0 off, LENGTH = 32; CONFIRMED layout from
+`elk-spl FUN_000080c8` + `0x7f70`, host parse `syncboss FUN_000208dc`):**
+`[0] type = 2`, `[1..4]` 32-bit info word (`0x01, 0x17, hw, hw` at build time; content
+INFERRED version/hw), `[5..12]` 64-bit **device ID (FICR DEVICEID)**, `[13..16]` 32-bit word
+(UNKNOWN), `[17..30]` 14 bytes (UNKNOWN, from `elk-spl FUN_00003418`), `[31]` 1 byte. The host
+also accepts a type-1 variant with the ID at `[6..13]`.
+
+**Pairing link (2426) framing (INFERRED):** host-polled ping-pong: host TX
+(`FUN_000204f0` / `FUN_00020628`), then RX window ~900..2000 µs (`FUN_00020738`,
+`FUN_0001be1c(900, 2000)`), up to 666 (`0x29a`) misses before giving up (`FUN_00020a70`).
+Payload `[ctrl][seq][data...]`, ctrl bit0 / bit7 are flags, `seq` is checked by
+`FUN_0001a6fc`.
+
+**Clock:** a 1 µs sync timer (`pulsar_sync_timer.c`, `"Timer precision must be 1 us"`) and a
+time translator (`time_translator.c`) align host and device clocks via the beacon timestamp;
+this same clock drives the camera-sync LED strobe (Q4).
 
 ---
 
@@ -192,7 +298,8 @@ over SPI (`input_mcu_thread.c`, `elk_buttons.c`).
   Scales/timestamp units **UNKNOWN** (in the IMU config JSON, Q5).
 - **Battery:** `GetBatteryStatus 0x2F` (prior work); host
   `syncboss_internal_input_get_battery_voltage` / `set_battery_percentage`.
-- Report rate: **UNKNOWN** numerically (streaming cadence set by beacon slot timing).
+- Report rate: at most one uplink per slot per beacon = **500 Hz per controller**
+  (INFERRED from the 2000 µs beacon interval, Q1); actual streaming cadence UNKNOWN.
 
 **Host -> controller commands (CONFIRMED names):**
 - **Haptics:** `syncboss_input_set_haptic`, `set_multi_haptics`, `send_haptic_syncbuffer`,
@@ -246,6 +353,34 @@ over SPI (`input_mcu_thread.c`, `elk_buttons.c`).
 
 ---
 
+## Sniffer recipes (`radio-fw`, `sniffer_config_t`)
+
+Common to all three: `mode = 1` (Nrf_2Mbit), `balen = 4`, `big_endian = true`, `lflen = 8`,
+`s1len = 0`, `statlen = 0`, `crc_len = 3`, `crc_poly = 0x108421`, `crc_init = 0xFFFFFF`,
+`crc_skip_addr = false`, whitening off, 8-bit preamble. Program `base`/`prefix` with the
+same register values the firmware uses (no bit swapping: both ends are nRF52 radios).
+
+| link | frequency | base | prefix | s0len | maxlen | hop |
+|---|---|---|---|---|---|---|
+| 1. discovery (adverts) | 2 | `0xFACEB00C` | `0xAA` | 0 | 255 | none |
+| 2. pairing | 26 | controller `DEVICEID[0]` = advert bytes 5..8 read as LE u32 | `0xAA` | 0 | 255 | none |
+| 3a. connected, host beacons + downlink | per hop | host `netaddr` | `0xF0` | 1 | 255 (>= 130) | CSA#1, 2000 µs |
+| 3b. connected, uplink | per hop | host `netaddr` | `0x01..0x05` (slot+1) | 1 | 255 | CSA#1, 2000 µs |
+| 3c. connected, DM beacon (fixed rendezvous) | 2 | host `netaddr` | `0xF0` | 0 | 255 | none |
+
+Notes for the connected link:
+- `netaddr` is the one thing a sniffer cannot get from the air without luck (UNKNOWN per
+  headset; stored in `/persist/pulsar/pulsar_host_address.bin`). Because the CRC covers the
+  address, any candidate address can be verified offline against a captured packet.
+- To see both directions at once the sniffer needs several logical addresses (AP for `0xF0`
+  plus `0x01..0x05`, all on the same base); the current `sniffer_config_t` has one prefix.
+- With a full map the 37-step CSA#1 sequence is fixed per `netaddr` (37 is prime, so every
+  channel is visited once per 74 ms); a static `hop_list` of 37 entries at 2 ms dwell works
+  only if started in phase. Better: park on 3c or any one channel, catch a beacon, then
+  follow using payload byte 5 (`unmapped`), bytes 0..4 (map) and `hop`.
+
+---
+
 ## Reproduce
 
 ```sh
@@ -269,9 +404,17 @@ All scripts read the flattened images and `images.json` from the gitignored
 ## Open items (priority for the next pass)
 1. `PairingData` (0x11) decrypted payload layout + AES-key KDF from the X25519 secret
    (elk-spl `FUN_0000934c @ 0x934c`). Closes the last Gate A UNKNOWN.
-2. Connected-link PCNF0/1 (S0/S1 presence) and per-device access-address derivation.
-3. Slot length (µs), beacon cadence, ack scheme (`pulsar_cl_host.c`, `pulsar_worker.c`).
-4. CCM 13-byte nonce byte order (`FUN_0001b1a4 @ 0x1b1a4`).
+2. ~~Connected-link PCNF0/1 and access-address derivation~~ — closed (Q1 "Radio
+   configuration per link"). Remaining: the host `netaddr` value itself (per headset, not on
+   air) — get it from a live capture (address search) or the headset's
+   `/persist/pulsar/pulsar_host_address.bin`; how the Android side generates it (UNKNOWN).
+3. ~~Slot length, beacon cadence, hop rule, ack scheme~~ — closed (Q1 "Timing"). Remaining
+   for a live capture: confirm uplink slot anchor (350 µs + offset after the beacon start),
+   DM-beacon cadence and the 4000 µs branch, beacon payload byte 0 bit 0 and byte 14
+   meaning, advert words at bytes 1..4 / 13..30, pairing-link framing.
+4. CCM 13-byte nonce byte order (`FUN_0001b1a4 @ 0x1b1a4`). Lead: device builds a 64-bit
+   counter `session_nonce << 48 | beacon_timestamp + n·2000` (elk-app `0x2409c..0x240d6`,
+   then `FUN_000239fc`).
 5. Host Pulsar version value the controller accepts.
 6. HID report descriptor bytes (dump one live, or decode `PULSAR_PKT_ID(hid_report_descriptor)`
    response builder on the controller).
