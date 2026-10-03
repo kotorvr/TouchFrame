@@ -1,6 +1,10 @@
 # Frame tracker: can Valve's camera tracker 6DoF-track a foreign LED controller?
 
-**Short answer: yes, very probably, and without patching XRService or touching the Roy radio.**
+**Short answer: yes, and the driver half is now proven on device (§9, 2026-10-03):** a clone of a
+Frame controller injected by driver_touchframe was LED-tracked by XRService, 2.3 mm / 0.64° median
+from the real controller. No XRService patch, no Roy radio.
+Remaining risk is Gate B, i.e. whether Touch Plus LEDs blob, plus one constraint: one tracked
+controller per hand, so the same-hand Frame controller must be off (§9.3).
 Controllers reach Valve's camera tracker (XRService) through three named OpenVR **block queues**
 (shared-memory ring buffers owned by vrserver). Any driver loaded into vrserver can obtain the
 block-queue interface and open those queues by name. A third-party driver that writes the same
@@ -173,7 +177,10 @@ default object captured from a real Frame controller (XRService log 2026-10-02 2
   line 11, `roy_dongle_driver`; device-tree `imu_sync_clk`) and `Controller <sn> timesync
   converged`. **For an injected device we must put our Touch Plus IMU on the same clock** (convert
   our radio timestamps to XRService's `ST::getTimestampNow()` = `oc::now_seconds()`, which is
-  `clock(4)` i.e. CLOCK_MONOTONIC seconds, read at `0x322070`).
+  `clock_gettime(4)`, i.e. **CLOCK_MONOTONIC_RAW** seconds, libArcturusPerception `0x322070`:
+  `mov w0,#4; bl clock_gettime`). **Corrected 2026-10-03, CONFIRMED on device (§9):** a real
+  controller's IMU block read live was 5.2 ms old on CLOCK_MONOTONIC_RAW and −214 ms "old" on
+  CLOCK_MONOTONIC. The two clocks drift apart by ~0.1 s per hour of uptime.
 - **No alternate IVRDriverInput/IVRIOBuffer path:** driver_cv does request `IVRDriverInput_005`
   (used for the HMD/skeletal/`CHandAnimEvaluator`), but the camera tracker never reads controller
   IMU from it — only from the data block queue. There is no `/proc/<id>/imu` IVRIOBuffer path in
@@ -306,7 +313,7 @@ driver_touchframe already loads into vrserver and presents the OpenVR controller
      `manufacturer`, `device_serial_number`. Optionally `cv.has_retro_reflectors:false`,
      `led_type:"unknown"`.
 4. **Stream IMU** on `/data` at 240 Hz: one 0x30 block per sample, `{deviceId, timestamp_s (CLOCK_
-   MONOTONIC seconds, same clock XRService uses) @0x08, accel m/s² @0x10, gyro rad/s @0x1c,
+   MONOTONIC_RAW seconds, same clock XRService uses) @0x08, accel m/s² @0x10, gyro rad/s @0x1c,
    flags @0x28}`. Timestamp
    fidelity vs the camera clock is the single most important correctness factor (XRService rejects
    past/late samples and warns on latency).
@@ -322,7 +329,7 @@ driver_touchframe already loads into vrserver and presents the OpenVR controller
 - *LED model JSON:* `lighthouse_config.modelPoints` (N×[x,y,z] m) + `modelNormals` (N×[nx,ny,nz]
   unit), controller frame. Plus `imu`/`head` extrinsics, `model_number`, role, serial.
 - *IMU:* 240 Hz, per-sample 0x30 block `{u32 deviceId @0, double t_sec @8, f32×3 accel @0x10,
-  f32×3 gyro @0x1c, u32 flags @0x28}`, timestamps on XRService's monotonic-seconds clock.
+  f32×3 gyro @0x1c, u32 flags @0x28}`, timestamps on XRService's clock (CLOCK_MONOTONIC_RAW s).
 - *LEDs:* continuous-on during capture (period/on-time set so the LED is lit across the controller-
   frame exposure); brightness ~ `led_nominal_brightness` default. Strobe sync is optional/later.
 
@@ -338,13 +345,16 @@ whether our LEDs are seen and PnP initializes, exactly as they did for the real 
 
 ## 7. Open items / to verify on device (UNKNOWN)
 
-- ~~IVRBlockQueue vtable ordinals~~ — **resolved statically, §8.** Still to do on device: log that
-  `GetGenericInterface("IVRBlockQueue_005")` returns non-null before the first call.
+- ~~IVRBlockQueue vtable ordinals~~ — **resolved statically (§8) and CONFIRMED on device (§9):**
+  `GetGenericInterface` returns `IVRBlockQueue_005` and `IVRPaths_002`, and every slot we call works.
 - ~~Exact event-block field layout~~ — **resolved, §8** (deviceId, type, hardware id, two JSON
   strings; lengths travel as block properties).
-- **Pose block (0x90)** — offsets resolved (§8); still UNKNOWN: the byte at 0x04, the 3-vector at
-  0x78, and the units/frames (confirm with a live capture).
-- **deviceId collision/room** — whether XRService caps concurrent controllers (`Too many
+- **Pose block (0x90)** — offsets resolved (§8); units and frames CONFIRMED live (§9.4): metres,
+  model axes at the IMU origin, body-frame angular velocity. Still UNKNOWN: the byte at 0x04 and the
+  3-vector at 0x78.
+- ~~Concurrent controllers~~ — **CONFIRMED (§9.3): XRService tracks one controller per hand
+  role** (two tracker slots). A third device shares a slot and corrupts that controller's tracking.
+- **deviceId room** — id 40 works (§9). Whether XRService caps concurrent controllers (`Too many
   controllers to record, max is 4` is a recorder cap, not necessarily a tracker cap) and whether an
   out-of-range id is accepted. Seen so far: XRService's pose-queue handle table is a vector grown to
   `deviceId+1` (XRService `0xeb69f0`), so large ids work but cost memory; ids are formatted as
@@ -352,6 +362,10 @@ whether our LEDs are seen and PnP initializes, exactly as they did for the real 
 - **Exposure interaction** — whether continuous-on LEDs survive XRService's auto-exposure for
   controller frames, or whether we must pin a manual exposure/gain (the settings exist:
   `setControllerTrackingFrameExposureTimeInMsAndGain`, `ActiveExposureController`).
+- **Partly answered (§9.1): the shared queues exist only while a Frame controller is connected**
+  (`Connect` returns 2 QueueNotFound before that; they vanished, handle error 4, when SteamVR shut
+  down). Open: whether driver_cv destroys them when the last Frame controller disconnects
+  while vrserver keeps running. That matters for a Touch-only setup.
 - **Whether driver_cv must be present at all** — i.e. can our driver `Create` the queues when no Roy
   controller has ever connected, and will XRService's `DeckardCaptureSource` connect to queues it
   did not create. (XRService connects lazily on controller events, so likely yes; verify.) Note the
@@ -485,6 +499,132 @@ Writer XRService `0xeb36f0` (filled in `0xeb3880`), reader driver_cv `FUN_001d47
   i.e. 180° about X, with zero translation (constant at driver_cv `0x4a4db0`), and rotates position
   and linear velocity but not angular velocity. CONFIRMED arithmetic; INFERRED meaning:
   XRService's tracking frame to SteamVR's (y-up) frame. Our driver must apply the same conversion.
+- **Frames, CONFIRMED live (§9.4):** the block pose has the LED model's *axes* at the *IMU's
+  origin*. SteamVR's raw device pose = flip(block) ∘ {model_from_head rotation, head.position −
+  imu.position} (`cv::HeadFromPoseBlock`), residual 0.85 mm / 0.32°, world offset identity. Angular
+  velocity at 0x60 is body-frame. Position is in metres.
 - XRService *Connects* to the pose queue when it starts tracking the device and writes only while
   someone reads it, so our driver must `Create` it (`OwnerIsReader`) and keep a reader on it
   **before** sending the connect event.
+
+---
+
+## 9. On-device validation: a cloned Frame controller injected through the block queues (2026-10-03)
+
+**Verdict: the route works end to end.** driver_touchframe registered a second device with
+XRService through the `/xrservice/controller/{event,data}` queues. The device was a clone of the
+user's real right Frame controller (`483c39e041f4`) under deviceId 40, with that controller's own
+config and an IMU stream synthesized from its SteamVR pose. XRService started a tracker for it,
+matched LED blobs to its model (`[ContrLedsStats]` for the clone's tracker) and wrote valid 6DoF
+poses into our pose queue. Those poses matched XRService's own pose for the real controller to
+**2.3 mm median / 0.64° median**.
+
+Code: `driver/src/cv_tracker.{h,cpp}` (generic injection), `driver/src/cv_clone.{h,cpp}` (this
+test), `driver/src/cv_source.{h,cpp}` (step 2, an ITouchSource for future feeds). All of it is off
+unless `driver_touchframe.cv_clone_serial` is set.
+
+### 9.1 What was confirmed live
+
+- `GetGenericInterface("IVRBlockQueue_005")` and `("IVRPaths_002")` return non-null. Every slot in
+  `blockqueue.h` that we call works: Create, Connect, Destroy, Acquire/ReleaseWriteOnlyBlock,
+  WaitAndAcquireReadOnlyBlock, AcquireReadOnlyBlock, ReleaseReadOnlyBlock, QueueHasReader, plus
+  IVRPaths StringToHandle/WritePathBatch.
+- Our pose queue `/xrservice/controller_40/pose` (0x90, 0x200, 4, OwnerIsReader) is created at
+  driver init. `Connect` to the shared queues returns **2 (QueueNotFound)** until a Frame
+  controller connects. After that, Connect succeeds and XRService is already reading the event
+  queue. On SteamVR shutdown the shared handles go invalid (error 4) once driver_cv tears down;
+  we then destroy our pose queue.
+- One connect event (deviceId, type 1, hardware id `0x5446…0028`, the same 2.9 KB JSON in both
+  slots, both `blockDataSize` u64 properties written on the block) produced, within 1 ms:
+  `Received controller Connection event for device 40` → `Received controller configuration for
+  device 40` (the full JSON echoed back) → `Now we will start tracking controller 40` →
+  `Connecting to the controller pose block queue at path /xrservice/controller_40/pose` →
+  `initializing controller 1, serial number: tfclone_483c39e041f4`.
+- XRService writes one pose block per IMU sample: 240 blocks/s, `timestamp = -1` until tracked.
+  Pose latency (our read time minus block time) is **2.9 ms median**.
+- **Clock: CLOCK_MONOTONIC_RAW** (corrects §2). The real controller's IMU blocks, read live, were
+  5–14 ms old on MONOTONIC_RAW and −214 ms "old" on CLOCK_MONOTONIC.
+- **IMU block semantics** (§8.5 INFERRED → CONFIRMED): 0x10 is accelerometer **specific force**
+  (+g up at rest, m/s²); 0x1c is gyro in rad/s; both are in the config's `imu` frame; flags are 0
+  in normal use. Our synthesized IMU vs the real controller's samples over 29 s: gyro error 0.33
+  rad/s mean, no bias, **0 ms best-fit lag**; accel bias ~0.3 m/s², mean |error| 2.7 m/s²
+  (dominated by the differentiated SteamVR velocity). XRService's first-sample log line prints the
+  values exactly as written.
+
+### 9.2 Runs
+
+| Run | Clone role | Other controllers on | Result |
+|---|---|---|---|
+| 1 | right_hand | right (real), left (idle) | Clone got its own tracker but never a valid pose: 0 LED stats, 102 `shock` + 51 `Inflated covariance` logs, and **10 573 `[SimplePoseHistory] New pose timestamp … must be greater` errors** interleaving the real controller's and our timestamps. |
+| 2 | left_hand | right (real), left (real, streaming) | No tracker created for the clone (left slot taken). "Valid" clone poses were the left controller's (~300 mm off), and our IMU corrupted the real left controller's filter: **112 rebootstraps**, 71 shocks. |
+| 3 | left_hand | right (real) only, left switched off | **Clean.** Own tracker (`initializing controller 1, serial number: tfclone_…`), first LED frame tried at +0.3 s, LEDs matched at +8 s (`[ContrLedsStats 1]`, up to 9 LEDs, reprojection 0.07–0.8 px). 0 shocks, 0 inflations, 0 rebootstraps, 0 SimplePoseHistory errors. Real controller unaffected. |
+
+Run 3 accuracy (clone CSV, 1 017 valid clone poses = 4.2 s in two segments of 3.3 s and 0.9 s):
+
+| Comparison | Position | Angle |
+|---|---|---|
+| clone block vs XRService's own block for the real controller (same frame) | median 2.3 mm, mean 9.2, p90 26.4, max 33.1 | median 0.64°, p90 0.82° |
+| clone → SteamVR (`HeadFromPoseBlock`) vs the real controller's SteamVR pose | median 2.1 mm, mean 9.5, p90 26.8 | median 0.64° |
+
+The tails are probably the reference drifting rather than the clone: whenever the clone holds the
+LEDs, the real tracker has none (§9.3) and runs on IMU alone. The constant ~0.6° matches the real
+controller using its refined `controllerFromImuHistory/483c39e041f4.json` while the clone starts
+from defaults (`History file … tfclone_….json does not exist`).
+
+### 9.3 Constraints learned
+
+- **One tracked controller per hand.** XRService accepts only `left_hand`/`right_hand`, and has
+  two controller-tracking slots. A device whose role matches a live controller's shares that
+  controller's per-role state (`SimplePoseHistory`, the filter) and wrecks it (runs 1 and 2).
+  **For Touch Plus: the Frame controller of the same hand must be off** (or never connected)
+  while its Touch Plus is camera-tracked. The two cannot run side by side.
+- **A device connected while its slot is held does not get the slot when it frees up.** After the
+  left controller disconnected in run 2, the clone stayed untracked until it was announced again.
+  A real feed should re-send its connect event when the competing controller disconnects. Today
+  CvTracker re-announces only after an XRService restart or when no pose block arrives at all.
+- **LED ownership (`filterTrackedLedsForOtherControllers`, default true).** With two trackers on
+  the same physical LEDs, observations go to one tracker at a time, never both
+  (run-3 timeline: real 49:36–49:41 → clone 49:45–49:46 → real 49:51–50:03 → clone 50:10–50:11
+  → real 50:17–…). The clone acquires only after the real tracker loses lock, then gives the LEDs
+  back. This is an artifact of cloning; distinct Touch Plus LEDs won't collide.
+- **The shared queues need a Frame controller to have connected since SteamVR started.** With
+  no Frame controller, a Touch-only setup has no queues to connect to (see §7).
+- `shock`/`Inflated covariance` in runs 1–2 came from the slot collision, not from synthetic-IMU
+  spikes. Run 3 had none with the same synthesis.
+
+### 9.4 Pose-block frame (CONFIRMED from run-1 data)
+
+Fitting XRService's block pose for the real controller against driver_cv's SteamVR pose for it
+(817 samples):
+- with "block = LED model frame": 37.9 mm, 0.32°;
+- with "block = IMU frame": 1.4 mm, 0.83°;
+- with **model axes at the IMU origin: 0.85 mm, 0.32°**. The world offset is identity (±0.3 mm).
+
+So SteamVR pose = flip(block) ∘ `{model_from_head.q, head.position − imu.position}`. driver_cv's
+onboard IMU extrinsic has identity rotation, which is why only the origin moves. Angular velocity
+at 0x60 is body-frame: relative error 0.00 as body frame vs 1.14 as world frame. Implemented as
+`cv::HeadFromPoseBlock`; CvTouchSource rotates ω into world for SteamVR.
+
+### 9.5 Reproducing
+
+1. Put a controller config on the Frame, e.g. the XRService log excerpt with its
+   `{"default":…,"onboard":…}` JSON. Never commit it.
+   `~/touchframe-cv/clone_config.txt` is the default path (`cv_clone_config`).
+2. With SteamVR stopped, set `driver_touchframe.cv_clone_serial` (substring of the real
+   controller's SteamVR serial) and optionally `cv_clone_role` (opposite hand), `cv_clone_csv`
+   (240 Hz log: steam/imu/rimu/ref/clone rows) in `~/.config/openvr/config/steamvr.vrsettings`.
+   Then start SteamVR.
+3. Switch the other-hand Frame controller off. Wear the headset; move the cloned controller.
+4. `grep cvclone ~/.local/share/Steam/logs/vrserver.txt` shows the 2 s reports (clone vs real
+   error, IMU comparison); the XRService log shows `[ContrLedsStats N]` for the clone's slot.
+
+### 9.6 Next
+
+- Gate B is unchanged and still the real question: do Touch Plus LEDs (driven always-on by our
+  radio) produce blobs XRService matches to a Touch Plus LED model? Everything on the
+  driver side of that is now proven.
+- Touch Plus LED model JSON: positions/normals in metres plus `imu`/`head` extrinsics, in the same
+  format as `clone_config.txt`. `head` should be the OpenXR grip frame.
+- Feed CvTouchSource from the radio (`PushImu` at 240 Hz on `cv::NowSeconds()`, `PushInputs`),
+  wire it into the Provider without the relay calibration (poses are already in SteamVR space),
+  and re-announce on competing-controller disconnects.

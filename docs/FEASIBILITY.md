@@ -14,7 +14,7 @@ Status: **Phase 0 under way (2026-10-03).** The section "Log" at the end is the 
 |---|---|---|
 | SteamVR side (bindings, models, haptics) | **Easy, built** | Third-party aarch64 OpenVR drivers load on the Frame. SteamVR there already ships the Touch input schema and `oculus_quest_plus_controller_*` render models. Games fall back to Touch bindings. |
 | Radio: buttons, IMU, haptics without a Quest | **Likely** | Touch Plus and Quest radio firmware are plaintext ARM images inside the Quest OTA, so the protocol can be read statically. A Nordic nRF52840 USB dongle on the Frame plays the "Quest". |
-| 6DoF from the Frame's cameras | **Uncertain (research)** | Valve's closed XRService owns the cameras. Touch Plus has only ~8 IR LEDs, which strobe only on host beacons. Needs a camera hook plus LED sync. |
+| 6DoF from the Frame's cameras | **Driver route proven; LED blobs (Gate B) open** | No camera hook needed: driver_touchframe injects a controller into Valve's XRService tracker through vrserver block queues. A cloned Frame controller tracked at 2.3 mm / 0.64° median (docs/FRAME-TRACKER.md §9). Still open: whether Touch Plus LEDs, kept always on by our radio, produce blobs XRService matches. Constraint: one tracked controller per hand. |
 
 ## Hardware facts
 
@@ -122,3 +122,24 @@ Status: **Phase 0 under way (2026-10-03).** The section "Log" at the end is the 
     - `tf_skeldump ref` checks the result against SteamVR's own reference poses: open hand exact, fist within 3.3° (one bone). `tf_skeldump watch` showed live curl following sim input on the TouchFrame devices.
     - The tool must be an overlay app: background apps get no action input.
     - Fixed an activation race: input was updated before the component handles existed.
+- **2026-10-03 (evening): camera-tracker injection works on device** (docs/FRAME-TRACKER.md §9).
+  - New in `driver/src`:
+    - `cv_tracker`: block-queue injection into XRService.
+    - `cv_clone`: validation harness, off unless `cv_clone_serial` is set.
+    - `cv_source`: step-2 `CvTouchSource` for a future radio feed; not wired into the Provider yet.
+  - **Clone test, run 3:**
+    - Setup: right Frame controller cloned as deviceId 40, role left_hand, left Frame controller off. The IMU was synthesized at 240 Hz from the real controller's SteamVR pose.
+    - XRService created its own tracker for the clone and matched up to 9 LEDs to it (reprojection 0.07–0.8 px).
+    - Valid poses came back on our queue with **2.9 ms latency**.
+    - Over 1 017 valid poses: **2.3 mm median (p90 26 mm), 0.64° median** vs XRService's own pose for the real controller.
+    - Same numbers against the real controller's SteamVR pose (2.1 mm median).
+  - **Measured facts:**
+    - The XRService clock is **CLOCK_MONOTONIC_RAW**; it was 214 ms off CLOCK_MONOTONIC after 2 h of uptime.
+    - IMU block = specific force (m/s²) + gyro (rad/s) in the config's imu frame. The synthesized IMU matched the real one with 0 ms lag; gyro error 0.33 rad/s mean.
+    - The pose block has model axes at the IMU origin. With `HeadFromPoseBlock`, it matches driver_cv's SteamVR pose to 0.85 mm / 0.32°.
+    - Pose angular velocity is body-frame.
+  - **Constraints found:**
+    - XRService has one tracking slot per hand. A same-role second device corrupts the real controller: 10 573 SimplePoseHistory errors in run 1, 112 rebootstraps in run 2.
+    - Two trackers on the same LEDs alternate ownership (`filterTrackedLedsForOtherControllers`). This only affects the clone, not distinct Touch Plus LEDs.
+    - The shared queues exist only after a Frame controller has connected.
+  - **Gate B is now the only 6DoF unknown.** The clone is disabled again on the Frame (`cv_clone_serial` = "").
