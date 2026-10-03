@@ -72,6 +72,11 @@ void UdpSource::Loop() {
         if (int32_t(pkt.seq - last_seq_) <= 0) continue;
         last_seq_ = pkt.seq;
         cb_(pkt, now);
+        if (now - last_heartbeat_ns_ > 1000000000ull) {
+            last_heartbeat_ns_ = now;
+            HeartbeatPacket hb{kHeartbeatMagic, pkt.seq, pkt.source_time_ns};
+            sendto(fd_, &hb, sizeof(hb), 0, reinterpret_cast<const sockaddr*>(&peer_), sizeof(peer_));
+        }
     }
 }
 

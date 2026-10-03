@@ -7,7 +7,7 @@ if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE RelWithDebInfo)
 endif()
 
-add_library(driver_touchframe SHARED src/driver.cpp src/udp_source.cpp)
+add_library(driver_touchframe SHARED src/driver.cpp src/udp_source.cpp src/skeleton.cpp)
 target_include_directories(driver_touchframe PRIVATE src vendor)
 target_compile_options(driver_touchframe PRIVATE -Wall -Wextra -Wno-unused-parameter)
 target_link_libraries(driver_touchframe PRIVATE pthread)
@@ -26,5 +26,14 @@ target_include_directories(tf_calibrate PRIVATE vendor)
 target_link_directories(tf_calibrate PRIVATE /opt/steamvr/bin/linuxarm64)
 target_link_libraries(tf_calibrate PRIVATE openvr_api)
 set_target_properties(tf_calibrate PROPERTIES
+  BUILD_RPATH /opt/steamvr/bin/linuxarm64
+  RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/touchframe/bin/linuxarm64)
+
+# Skeleton check tool: compares the driver's hand poses with SteamVR's reference poses.
+add_executable(tf_skeldump src/skeldump.cpp src/skeleton.cpp)
+target_include_directories(tf_skeldump PRIVATE src vendor)
+target_link_directories(tf_skeldump PRIVATE /opt/steamvr/bin/linuxarm64)
+target_link_libraries(tf_skeldump PRIVATE openvr_api)
+set_target_properties(tf_skeldump PROPERTIES
   BUILD_RPATH /opt/steamvr/bin/linuxarm64
   RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/touchframe/bin/linuxarm64)

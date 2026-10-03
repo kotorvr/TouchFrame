@@ -40,6 +40,7 @@ private:
     std::atomic<bool> have_peer_{false};
     sockaddr_in peer_{};
     uint32_t last_seq_ = 0;
+    uint64_t last_heartbeat_ns_ = 0;
 };
 
 uint64_t MonotonicNs();

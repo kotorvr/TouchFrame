@@ -109,6 +109,24 @@
         65
       ]
     },
+    "/input/skeleton/left": {
+      "type": "skeleton",
+      "side": "left",
+      "skeleton": "/skeleton/hand/left",
+      "binding_image_point": [
+        11,
+        150
+      ]
+    },
+    "/input/skeleton/right": {
+      "type": "skeleton",
+      "side": "right",
+      "skeleton": "/skeleton/hand/right",
+      "binding_image_point": [
+        11,
+        150
+      ]
+    },
     "/output/haptic": {
       "type": "vibration",
       "binding_image_point": [

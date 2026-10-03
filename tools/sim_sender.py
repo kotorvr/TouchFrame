@@ -14,6 +14,7 @@ import time
 
 STATE_MAGIC = 0x31524654
 HAPTIC_MAGIC = 0x31484654
+HEARTBEAT_MAGIC = 0x31424654
 HAND = struct.Struct("<BBH4f3f4f3f3f")
 HEADER = struct.Struct("<IIQ")
 assert HAND.size == 72 and HEADER.size + 2 * HAND.size == 160
@@ -48,6 +49,7 @@ def main():
     s.setblocking(False)
     t0 = time.monotonic()
     seq = 0
+    heartbeats = 0
     while (t := time.monotonic() - t0) < a.seconds:
         seq += 1
         pkt = HEADER.pack(STATE_MAGIC, seq, time.monotonic_ns()) + hand_state(0, t) + hand_state(1, t)
@@ -58,10 +60,15 @@ def main():
                 if len(d) == 20 and struct.unpack_from("<I", d)[0] == HAPTIC_MAGIC:
                     _, hand, amp, freq, dur = struct.unpack("<IB3xfff", d)
                     print(f"haptic hand={hand} amp={amp:.2f} freq={freq:.0f} dur={dur:.3f}")
+                elif len(d) == 16 and struct.unpack_from("<I", d)[0] == HEARTBEAT_MAGIC:
+                    _, _, sent_ns = struct.unpack("<IIQ", d)
+                    heartbeats += 1
+                    if heartbeats == 1:
+                        print(f"driver linked, rtt {(time.monotonic_ns() - sent_ns) / 1e6:.1f} ms")
         except BlockingIOError:
             pass
         time.sleep(1 / a.hz)
-    print(f"sent {seq} packets")
+    print(f"sent {seq} packets, {heartbeats} driver heartbeats")
 
 
 if __name__ == "__main__":

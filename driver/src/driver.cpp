@@ -12,6 +12,7 @@
 
 #include "log.h"
 #include "protocol.h"
+#include "skeleton.h"
 #include "source.h"
 
 using namespace vr;
@@ -19,6 +20,8 @@ using namespace vr;
 namespace tf {
 
 static const char* kSection = "driver_touchframe";
+
+static_assert(sizeof(Bone) == sizeof(VRBoneTransform_t), "Bone layout");
 
 struct Quat { double w, x, y, z; };
 struct Vec3 { double x, y, z; };
@@ -51,7 +54,7 @@ static Vec3 Rotate(Quat q, Vec3 v) {
 
 class TouchController : public ITrackedDeviceServerDriver {
 public:
-    explicit TouchController(int hand) : hand_(hand) {
+    TouchController(int hand, const CurlAnimation* anim) : hand_(hand), anim_(anim), poser_(hand) {
         // The source reports the OpenXR grip pose. SteamVR wants the raw controller pose that
         // the oculus_quest_plus render model components are relative to, so the device pose is
         // grip * inverse(openxr_grip component_local) (values from the Frame's render model json).
@@ -66,7 +69,6 @@ public:
     const char* Serial() const { return hand_ == 0 ? "TouchFrame_Left" : "TouchFrame_Right"; }
 
     EVRInitError Activate(uint32_t id) override {
-        id_ = id;
         auto* p = VRProperties();
         PropertyContainerHandle_t c = p->TrackedDeviceToPropertyContainer(id);
         bool left = hand_ == 0;
@@ -112,7 +114,15 @@ public:
         in->CreateBooleanComponent(c, "/input/grip/click", &h_grip_click_);
         in->CreateBooleanComponent(c, "/input/thumbrest/touch", &h_thumbrest_touch_);
         in->CreateHapticComponent(c, "/output/haptic", &h_haptic_);
+        if (anim_) {
+            EVRInputError e = in->CreateSkeletonComponent(
+                c, left ? "/input/skeleton/left" : "/input/skeleton/right",
+                left ? "/skeleton/hand/left" : "/skeleton/hand/right", "/pose/raw",
+                VRSkeletalTracking_Estimated, nullptr, 0, &h_skeleton_);
+            if (e != VRInputError_None) Log("CreateSkeletonComponent %s failed: %d", Serial(), int(e));
+        }
         container_ = c;
+        id_ = id;  // last: the UDP thread starts updating once the handles exist
         Log("controller %s activated as device %u", Serial(), id);
         return VRInitError_None;
     }
@@ -188,6 +198,7 @@ public:
         in->UpdateBooleanComponent(h_grip_touch_, (b & kBtnGripTouch) || s.grip > 0.05f, -age_s);
         in->UpdateBooleanComponent(h_grip_click_, s.grip > 0.9f, -age_s);
         in->UpdateBooleanComponent(h_thumbrest_touch_, b & kBtnThumbrestTouch, -age_s);
+        if (h_skeleton_ != k_ulInvalidInputComponentHandle) UpdateSkeleton(s);
 
         if (s.battery <= 100 && s.battery != last_battery_) {
             if (last_battery_ > 100) VRProperties()->SetBoolProperty(container_, Prop_DeviceProvidesBatteryStatus_Bool, true);
@@ -210,8 +221,24 @@ public:
     }
 
 private:
+    // Finger curl from buttons/touches (skeleton.cpp), both motion ranges.
+    void UpdateSkeleton(const HandState& s) {
+        uint64_t now = MonotonicNs();
+        poser_.Update(*anim_, s, last_skeleton_ns_ ? (now - last_skeleton_ns_) * 1e-9 : 0.0);
+        last_skeleton_ns_ = now;
+        auto* in = VRDriverInput();
+        in->UpdateSkeletonComponent(h_skeleton_, VRSkeletalMotionRange_WithController,
+                                    reinterpret_cast<const VRBoneTransform_t*>(poser_.WithController()), kBoneCount);
+        in->UpdateSkeletonComponent(h_skeleton_, VRSkeletalMotionRange_WithoutController,
+                                    reinterpret_cast<const VRBoneTransform_t*>(poser_.WithoutController()), kBoneCount);
+    }
+
     int hand_;
-    uint32_t id_ = k_unTrackedDeviceIndexInvalid;
+    const CurlAnimation* anim_;  // null: no skeleton
+    HandPoser poser_;
+    VRInputComponentHandle_t h_skeleton_ = k_ulInvalidInputComponentHandle;
+    uint64_t last_skeleton_ns_ = 0;
+    std::atomic<uint32_t> id_{k_unTrackedDeviceIndexInvalid};
     PropertyContainerHandle_t container_ = k_ulInvalidPropertyContainer;
     std::mutex mu_;
     DriverPose_t pose_{};
@@ -234,7 +261,11 @@ public:
             Log("disabled by %s.enable", kSection);
             return VRInitError_Driver_Unknown;
         }
-        for (int h = 0; h < 2; h++) hands_[h] = std::make_unique<TouchController>(h);
+        std::string err;
+        bool skeleton = VRSettings()->GetBool(kSection, "skeleton") && anim_.Load("", &err);
+        Log(skeleton ? "skeleton: finger curl from %s" : "skeleton: off (%s)",
+            skeleton ? anim_.Path().c_str() : err.empty() ? "driver_touchframe.skeleton=false" : err.c_str());
+        for (int h = 0; h < 2; h++) hands_[h] = std::make_unique<TouchController>(h, skeleton ? &anim_ : nullptr);
         calib_version_ = VRSettings()->GetInt32(kSection, "calib_version");
         LoadCalibration();
         auto port = uint16_t(VRSettings()->GetInt32(kSection, "port"));
@@ -311,6 +342,7 @@ private:
         }
     }
 
+    CurlAnimation anim_;
     std::unique_ptr<TouchController> hands_[2];
     std::atomic<bool> added_[2] = {false, false};
     std::unique_ptr<ITouchSource> source_;

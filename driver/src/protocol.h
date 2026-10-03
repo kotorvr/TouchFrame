@@ -9,6 +9,7 @@ namespace tf {
 constexpr uint16_t kDefaultPort = 28430;
 constexpr uint32_t kStateMagic = 0x31524654;   // "TFR1"
 constexpr uint32_t kHapticMagic = 0x31484654;  // "TFH1"
+constexpr uint32_t kHeartbeatMagic = 0x31424654;  // "TFB1"
 
 enum HandFlags : uint8_t {
     kConnected = 1 << 0,
@@ -59,10 +60,18 @@ struct HapticPacket {
     float frequency;      // Hz, 0 = default
     float duration_s;
 };
+// Driver -> source about once a second: echoes the newest StatePacket so the source knows
+// it's linked and can measure the round trip on its own clock.
+struct HeartbeatPacket {
+    uint32_t magic;       // kHeartbeatMagic
+    uint32_t seq;         // StatePacket.seq echoed
+    uint64_t source_time_ns;  // StatePacket.source_time_ns echoed
+};
 #pragma pack(pop)
 
 static_assert(sizeof(HandState) == 72, "HandState layout");
 static_assert(sizeof(StatePacket) == 160, "StatePacket layout");
 static_assert(sizeof(HapticPacket) == 20, "HapticPacket layout");
+static_assert(sizeof(HeartbeatPacket) == 16, "HeartbeatPacket layout");
 
 }  // namespace tf

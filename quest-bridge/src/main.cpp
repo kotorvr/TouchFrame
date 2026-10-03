@@ -5,7 +5,13 @@
 //
 // Target: `adb shell setprop debug.touchframe.target 192.168.0.195:28430`
 // (read at start and every 2 s, so it can change while running).
+//
+// Runs unattended: the driver's heartbeat says whether the Frame is listening, a status line
+// goes to logcat every 5 s (`adb logcat -s TouchBridge`), socket errors (Wi-Fi drops) are
+// retried, and a lost OpenXR session is rebuilt. Keeping the unworn headset awake is
+// tools/quest.sh's job (the prox_close broadcast needs the shell user).
 #include <android/log.h>
+#include <android/window.h>
 #include <android_native_app_glue.h>
 #include <arpa/inet.h>
 #include <EGL/egl.h>
@@ -18,6 +24,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <errno.h>
 
 #include <cmath>
 #include <cstdlib>
@@ -54,14 +61,24 @@ struct Net {
     std::string target_str;
     uint64_t last_check = 0;
 
+    uint64_t sent = 0, send_errors = 0, haptics = 0, heartbeats = 0;
+    int last_errno = 0;
+    uint64_t last_heartbeat = 0;
+    float rtt_ms = 0;
+    bool linked = false;
+
     void Init() {
+        if (fd >= 0) close(fd);
         fd = socket(AF_INET, SOCK_DGRAM, 0);
+        if (fd < 0) { LOG("socket: %s", strerror(errno)); return; }
         fcntl(fd, F_SETFL, O_NONBLOCK);
+        int one = 1;
+        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
         sockaddr_in a{};
         a.sin_family = AF_INET;
         a.sin_port = htons(tf::kDefaultPort);  // haptics come back to this port
         a.sin_addr.s_addr = htonl(INADDR_ANY);
-        bind(fd, reinterpret_cast<sockaddr*>(&a), sizeof(a));
+        if (bind(fd, reinterpret_cast<sockaddr*>(&a), sizeof(a)) < 0) LOG("bind: %s", strerror(errno));
     }
 
     void RefreshTarget() {
@@ -85,14 +102,62 @@ struct Net {
     }
 
     void Send(const tf::StatePacket& p) {
-        if (have_target) sendto(fd, &p, sizeof(p), 0, reinterpret_cast<sockaddr*>(&target), sizeof(target));
+        if (!have_target) return;
+        if (fd < 0) Init();
+        if (sendto(fd, &p, sizeof(p), 0, reinterpret_cast<sockaddr*>(&target), sizeof(target)) < 0) {
+            // ENETUNREACH etc. while Wi-Fi is down: keep trying, log each new error once.
+            if (errno != last_errno) LOG("send to %s: %s", target_str.c_str(), strerror(errno));
+            last_errno = errno;
+            send_errors++;
+            if (errno == EBADF || errno == ENOTSOCK) Init();
+            return;
+        }
+        if (last_errno) LOG("send to %s ok again", target_str.c_str());
+        last_errno = 0;
+        sent++;
     }
 
-    bool RecvHaptic(tf::HapticPacket& h) {
-        ssize_t n = recv(fd, &h, sizeof(h), 0);
-        return n == sizeof(h) && h.magic == tf::kHapticMagic && h.hand < 2;
+    // Drains the socket: heartbeats update the link state, haptics go to on_haptic.
+    template <class F>
+    void Receive(F on_haptic) {
+        uint8_t buf[64];
+        ssize_t n;
+        while (fd >= 0 && (n = recv(fd, buf, sizeof(buf), 0)) >= 4) {
+            uint32_t magic;
+            memcpy(&magic, buf, 4);
+            if (n == sizeof(tf::HapticPacket) && magic == tf::kHapticMagic) {
+                tf::HapticPacket h;
+                memcpy(&h, buf, sizeof(h));
+                if (h.hand < 2) { haptics++; on_haptic(h); }
+            } else if (n == sizeof(tf::HeartbeatPacket) && magic == tf::kHeartbeatMagic) {
+                tf::HeartbeatPacket hb;
+                memcpy(&hb, buf, sizeof(hb));
+                last_heartbeat = NowNs();
+                rtt_ms = float(last_heartbeat - hb.source_time_ns) / 1e6f;
+                heartbeats++;
+                if (!linked) LOG("driver linked: %s, rtt %.1f ms", target_str.c_str(), rtt_ms);
+                linked = true;
+            }
+        }
+        if (linked && NowNs() - last_heartbeat > 3000000000ull) {
+            linked = false;
+            LOG("driver not answering for 3 s (Frame asleep, SteamVR restarting, Wi-Fi?); still sending");
+        }
     }
 };
+
+const char* StateName(XrSessionState s) {
+    static const char* names[] = {"unknown", "idle", "ready", "synchronized", "visible",
+                                  "focused", "stopping", "loss_pending", "exiting"};
+    return unsigned(s) < 9 ? names[s] : "?";
+}
+
+const char* HandStatus(uint8_t f) {
+    if (!(f & tf::kConnected)) return "off";
+    if ((f & tf::kPositionTracked) && (f & tf::kOrientationTracked)) return "tracked";
+    if (f & tf::kOrientationValid) return "rot-only";
+    return "lost";
+}
 
 struct Bridge {
     android_app* app = nullptr;
@@ -118,6 +183,10 @@ struct Bridge {
 
     Net net;
     uint32_t seq = 0;
+    bool loader_ready = false;
+    bool session_lost = false;
+    uint8_t last_flags[2] = {0, 0};
+    uint64_t last_status = 0, sent_at_status = 0;
 
     bool InitEgl() {
         egl_display = eglGetDisplay(EGL_DEFAULT_DISPLAY);
@@ -152,12 +221,15 @@ struct Bridge {
     }
 
     bool InitXr() {
-        PFN_xrInitializeLoaderKHR init_loader = nullptr;
-        xrGetInstanceProcAddr(XR_NULL_HANDLE, "xrInitializeLoaderKHR", (PFN_xrVoidFunction*)&init_loader);
-        XrLoaderInitInfoAndroidKHR li{XR_TYPE_LOADER_INIT_INFO_ANDROID_KHR};
-        li.applicationVM = app->activity->vm;
-        li.applicationContext = app->activity->clazz;
-        CHECK(init_loader((XrLoaderInitInfoBaseHeaderKHR*)&li));
+        if (!loader_ready) {
+            PFN_xrInitializeLoaderKHR init_loader = nullptr;
+            xrGetInstanceProcAddr(XR_NULL_HANDLE, "xrInitializeLoaderKHR", (PFN_xrVoidFunction*)&init_loader);
+            XrLoaderInitInfoAndroidKHR li{XR_TYPE_LOADER_INIT_INFO_ANDROID_KHR};
+            li.applicationVM = app->activity->vm;
+            li.applicationContext = app->activity->clazz;
+            CHECK(init_loader((XrLoaderInitInfoBaseHeaderKHR*)&li));
+            loader_ready = true;
+        }
 
         const char* exts[] = {XR_KHR_OPENGL_ES_ENABLE_EXTENSION_NAME, XR_KHR_ANDROID_CREATE_INSTANCE_EXTENSION_NAME};
         XrInstanceCreateInfoAndroidKHR aci{XR_TYPE_INSTANCE_CREATE_INFO_ANDROID_KHR};
@@ -180,7 +252,7 @@ struct Bridge {
         XrGraphicsRequirementsOpenGLESKHR req{XR_TYPE_GRAPHICS_REQUIREMENTS_OPENGL_ES_KHR};
         CHECK(gles_req(instance, system, &req));
 
-        if (!InitEgl()) { LOG("EGL init failed"); return false; }
+        if (egl_context == EGL_NO_CONTEXT && !InitEgl()) { LOG("EGL init failed"); return false; }
         XrGraphicsBindingOpenGLESAndroidKHR gb{XR_TYPE_GRAPHICS_BINDING_OPENGL_ES_ANDROID_KHR};
         gb.display = egl_display;
         gb.config = egl_config;
@@ -261,9 +333,50 @@ struct Bridge {
             sp.poseInActionSpace.orientation.w = 1;
             CHECK(xrCreateActionSpace(session, &sp, &grip_space[h]));
         }
-        net.Init();
+        if (net.fd < 0) net.Init();
         LOG("OpenXR ready (space type %d)", rs.referenceSpaceType);
         return true;
+    }
+
+    // Destroying the instance destroys the session, spaces and actions with it.
+    void DestroyXr() {
+        if (instance != XR_NULL_HANDLE) xrDestroyInstance(instance);
+        instance = XR_NULL_HANDLE;
+        session = XR_NULL_HANDLE;
+        space = grip_space[0] = grip_space[1] = XR_NULL_HANDLE;
+        set = XR_NULL_HANDLE;
+        system = XR_NULL_SYSTEM_ID;
+        state = XR_SESSION_STATE_UNKNOWN;
+        running = false;
+        session_lost = false;
+    }
+
+    void Status() {
+        uint64_t now = NowNs();
+        if (last_status && now - last_status < 5000000000ull) return;
+        float rate = last_status ? float(net.sent - sent_at_status) * 1e9f / float(now - last_status) : 0.f;
+        last_status = now;
+        sent_at_status = net.sent;
+        char link[64];
+        if (net.linked) snprintf(link, sizeof(link), "linked rtt %.1f ms", net.rtt_ms);
+        else snprintf(link, sizeof(link), "%s", net.heartbeats ? "lost" : "waiting");
+        LOG("status: session %s, target %s, sent %llu (%.0f/s), L %s, R %s, driver %s, haptics %llu, send errors %llu",
+            instance == XR_NULL_HANDLE ? "none" : StateName(state),
+            net.have_target ? net.target_str.c_str() : "unset", (unsigned long long)net.sent, rate,
+            HandStatus(last_flags[0]), HandStatus(last_flags[1]), link,
+            (unsigned long long)net.haptics, (unsigned long long)net.send_errors);
+    }
+
+    void ApplyHaptic(const tf::HapticPacket& hp) {
+        if (state != XR_SESSION_STATE_FOCUSED) return;
+        XrHapticVibration vib{XR_TYPE_HAPTIC_VIBRATION};
+        vib.amplitude = hp.amplitude;
+        vib.frequency = hp.frequency > 0 ? hp.frequency : XR_FREQUENCY_UNSPECIFIED;
+        vib.duration = hp.duration_s > 0 ? XrDuration(hp.duration_s * 1e9) : XR_MIN_HAPTIC_DURATION;
+        XrHapticActionInfo hi{XR_TYPE_HAPTIC_ACTION_INFO};
+        hi.action = a_haptic;
+        hi.subactionPath = hand_path[hp.hand];
+        xrApplyHapticFeedback(session, &hi, reinterpret_cast<XrHapticBaseHeader*>(&vib));
     }
 
     void PollEvents() {
@@ -280,7 +393,9 @@ struct Bridge {
                 } else if (state == XR_SESSION_STATE_STOPPING) {
                     xrEndSession(session);
                     running = false;
-                } else if (state == XR_SESSION_STATE_EXITING || state == XR_SESSION_STATE_LOSS_PENDING) {
+                } else if (state == XR_SESSION_STATE_LOSS_PENDING) {
+                    session_lost = true;  // rebuilt from the main loop
+                } else if (state == XR_SESSION_STATE_EXITING) {
                     ANativeActivity_finish(app->activity);
                 }
             }
@@ -369,20 +484,9 @@ struct Bridge {
             if (GetBool(a_trigger_touch, h)) b |= tf::kBtnTriggerTouch;
             if (s.grip > 0.05f) b |= tf::kBtnGripTouch;
             s.buttons = b;
+            last_flags[h] = s.flags;
         }
         net.Send(pkt);
-
-        tf::HapticPacket hp;
-        while (net.RecvHaptic(hp)) {
-            XrHapticVibration vib{XR_TYPE_HAPTIC_VIBRATION};
-            vib.amplitude = hp.amplitude;
-            vib.frequency = hp.frequency > 0 ? hp.frequency : XR_FREQUENCY_UNSPECIFIED;
-            vib.duration = hp.duration_s > 0 ? XrDuration(hp.duration_s * 1e9) : XR_MIN_HAPTIC_DURATION;
-            XrHapticActionInfo hi{XR_TYPE_HAPTIC_ACTION_INFO};
-            hi.action = a_haptic;
-            hi.subactionPath = hand_path[hp.hand];
-            xrApplyHapticFeedback(session, &hi, reinterpret_cast<XrHapticBaseHeader*>(&vib));
-        }
     }
 
     void Frame() {
@@ -391,7 +495,6 @@ struct Bridge {
         if (XR_FAILED(xrWaitFrame(session, &wi, &fs))) return;
         XrFrameBeginInfo bi{XR_TYPE_FRAME_BEGIN_INFO};
         xrBeginFrame(session, &bi);
-        net.RefreshTarget();
         if (state == XR_SESSION_STATE_FOCUSED) Sample(fs.predictedDisplayTime);
         // No layers: nothing to show; the headset is on a shelf.
         XrFrameEndInfo ei{XR_TYPE_FRAME_END_INFO};
@@ -416,11 +519,9 @@ void android_main(android_app* app) {
     app->onAppCmd = OnCmd;
     JNIEnv* env;
     app->activity->vm->AttachCurrentThread(&env, nullptr);
+    ANativeActivity_setWindowFlags(app->activity, AWINDOW_FLAG_KEEP_SCREEN_ON, 0);
 
-    if (!b.InitXr()) {
-        LOG("init failed");
-        ANativeActivity_finish(app->activity);
-    }
+    uint64_t next_init = 0;
     while (!app->destroyRequested) {
         int events;
         android_poll_source* src;
@@ -430,9 +531,26 @@ void android_main(android_app* app) {
             if (app->destroyRequested) break;
             timeout = 0;
         }
+        if (b.session_lost) {
+            LOG("session lost; rebuilding OpenXR in 2 s");
+            b.DestroyXr();
+            next_init = NowNs() + 2000000000ull;
+        }
+        // (Re)start OpenXR: at launch, after a session loss, or until the runtime is up.
+        if (b.instance == XR_NULL_HANDLE && NowNs() >= next_init) {
+            if (!b.InitXr()) {
+                LOG("OpenXR init failed; retrying in 2 s");
+                b.DestroyXr();
+                next_init = NowNs() + 2000000000ull;
+            }
+        }
+        b.net.RefreshTarget();
+        b.net.Receive([&](const tf::HapticPacket& h) { b.ApplyHaptic(h); });
+        b.Status();
         if (b.instance == XR_NULL_HANDLE) continue;
         b.PollEvents();
         if (b.running) b.Frame();
     }
+    b.DestroyXr();
     app->activity->vm->DetachCurrentThread();
 }

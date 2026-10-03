@@ -81,7 +81,7 @@ Status: **Phase 0 under way (2026-10-03).** The section "Log" at the end is the 
    - Phase-sweep the LED beacons until Touch Plus LEDs appear in the LED frames.
    - **Gate B:** if no blobs appear, 6DoF is a NO-GO; ship 3DoF plus Frame hand tracking for position.
 4. **Tracker.** Port the Monado constellation tracker; fuse the IMU; optionally the Frame's hand-tracking wrist pose.
-5. **Polish.** Pairing UI, battery, skeleton input, auto-start, install docs.
+5. **Polish.** Pairing UI, battery, skeleton input, auto-start, install docs. Relay versions of skeleton input, auto-start and install docs are done (log, 2026-10-03; [INSTALL.md](INSTALL.md)).
 
 ## Log
 - **2026-10-03:**
@@ -101,3 +101,24 @@ Status: **Phase 0 under way (2026-10-03).** The section "Log" at the end is the 
   - **Next:** calibration to align the Quest stage space with the Frame world; battery passthrough.
   - (Build note: the Quest-side bridge APK needs Android build-tools (aapt2/zipalign/apksigner); the NDK 27 and OpenXR loader in `C:\Android` are present.)
   - Calibration tool `tf_calibrate` built (yaw + translation from rotation deltas plus least squares; the driver reloads `calib_*` live). First real run (right Touch + Frame controller held together, 25 s): 746 samples, yaw 86.2°, translation (1.217, -1.290, 0.349) m, grip offset 65 mm, **RMS 7.6 mm**. The driver reloaded it live. The Frame only tracks its own controllers while worn; in standby it turns their LEDs off.
+- **Relay polish** (everyday use; guide in [INSTALL.md](INSTALL.md)):
+  - **One-command install:**
+    - `tools/install.sh [frame|quest]` and `tools/install.sh uninstall`.
+    - `tools/quest.sh install|start|stop|status|log`.
+    - `FRAME_HOST=local` runs `frame.sh` on the Frame itself.
+  - **Unworn Quest stays awake.**
+    - Cause, from `dumpsys vrpowermanager`: `prox_close` is sticky (virtual proximity CLOSE), but an `automation_disable` broadcast or a standby/wake cycle clears it. The real sensor then reads "unworn" and the headset sleeps at once.
+    - Fix: a shell-user watchdog (`tools/quest-watchdog.sh`, started detached by `quest.sh start`) checks every 10 s. It wakes the headset, re-asserts `prox_close` only when it's not CLOSE, and relaunches a dead bridge only while the Horizon home is in front.
+    - Tested: after `automation_disable` the headset went to STANDBY and was awake again with CLOSE about 10 s later. The bridge kept running and re-linked by itself. A force-stopped bridge came back within 10 s.
+  - **Bridge:**
+    - The manifest declares optional hand tracking, so Horizon's "controllers required" launch check no longer blocks the bridge while the shelf controllers sleep.
+    - Status line in logcat every 5 s.
+    - Send errors are retried and a lost OpenXR session is rebuilt.
+    - The driver now sends a 1 Hz heartbeat (`HeartbeatPacket`, echoes seq + source time). The bridge shows "driver linked" and the RTT (about 14 ms over Wi-Fi).
+  - **Hand skeleton:**
+    - `/input/skeleton/left|right`, `VRSkeletalTracking_Estimated`, both motion ranges.
+    - Finger curl comes from trigger and its touch sensor (index), grip (middle/ring/pinky) and the thumb touch sensors.
+    - Poses come from SteamVR's `resources/anims/hand_right_closeanim.glb`, read at runtime (no Valve data in the repo), converted to OpenVR bone space and mirrored for the left hand.
+    - `tf_skeldump ref` checks the result against SteamVR's own reference poses: open hand exact, fist within 3.3° (one bone). `tf_skeldump watch` showed live curl following sim input on the TouchFrame devices.
+    - The tool must be an overlay app: background apps get no action input.
+    - Fixed an activation race: input was updated before the component handles existed.
