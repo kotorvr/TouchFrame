@@ -100,4 +100,4 @@ Status: **Phase 0 under way (2026-10-03).** The section "Log" at the end is the 
     - `vrcmd` on the Frame showed live Touch poses and touches (X, trigger).
   - **Next:** calibration to align the Quest stage space with the Frame world; battery passthrough.
   - (Build note: the Quest-side bridge APK needs Android build-tools (aapt2/zipalign/apksigner); the NDK 27 and OpenXR loader in `C:\Android` are present.)
-  - Calibration tool `tf_calibrate` built (yaw + translation from rotation deltas plus least squares; the driver reloads `calib_*` live). Not yet run with real controllers.
+  - Calibration tool `tf_calibrate` built (yaw + translation from rotation deltas plus least squares; the driver reloads `calib_*` live). First real run (right Touch + Frame controller held together, 25 s): 746 samples, yaw 86.2°, translation (1.217, -1.290, 0.349) m, grip offset 65 mm, **RMS 7.6 mm**. The driver reloaded it live. The Frame only tracks its own controllers while worn; in standby it turns their LEDs off.

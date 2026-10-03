@@ -11,6 +11,7 @@
 // the driver reloads it live (calib_version).
 #include <openvr.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -118,16 +119,17 @@ int main(int argc, char** argv) {
     }
     vr::IVRSettings* settings = vr::VRSettings();
 
-    uint32_t touch = vr::k_unTrackedDeviceIndexInvalid, frame = vr::k_unTrackedDeviceIndexInvalid;
+    uint32_t touch = vr::k_unTrackedDeviceIndexInvalid;
+    std::vector<uint32_t> frames;
     for (uint32_t i = 0; i < vr::k_unMaxTrackedDeviceCount; i++) {
         if (sys->GetTrackedDeviceClass(i) != vr::TrackedDeviceClass_Controller) continue;
         std::string serial = StrProp(sys, i, vr::Prop_SerialNumber_String);
         std::string type = StrProp(sys, i, vr::Prop_ControllerType_String);
         printf("controller %u: serial=%s type=%s\n", i, serial.c_str(), type.c_str());
         if (serial == touch_serial) touch = i;
-        else if (serial.rfind("TouchFrame_", 0) != 0 && frame == vr::k_unTrackedDeviceIndexInvalid) frame = i;
+        else if (serial.rfind("TouchFrame_", 0) != 0) frames.push_back(i);
     }
-    if (touch == vr::k_unTrackedDeviceIndexInvalid || frame == vr::k_unTrackedDeviceIndexInvalid) {
+    if (touch == vr::k_unTrackedDeviceIndexInvalid || frames.empty()) {
         fprintf(stderr, "need %s and a Frame controller connected\n", touch_serial.c_str());
         vr::VR_Shutdown();
         return 1;
@@ -142,24 +144,82 @@ int main(int argc, char** argv) {
     cur.q = n < 1e-6 ? Q{1, 0, 0, 0} : Q{cur.q.w / n, cur.q.x / n, cur.q.y / n, cur.q.z / n};
     Pose cur_inv = Inverse(cur);
 
-    printf("Hold %s Touch and Frame controller %u together; rotate and move them slowly for %.0f s...\n",
-           hand.c_str(), frame, seconds);
-    std::vector<Pose> R, F;
+    printf("Hold the %s Touch and one Frame controller together; rotate and move them slowly for %.0f s...\n",
+           hand.c_str(), seconds);
+    fflush(stdout);
+    // Sample every Frame controller; afterwards keep the one whose rotation speed follows the Touch.
+    std::vector<Pose> Rall;
+    std::vector<double> touch_speed;
+    std::vector<std::vector<Pose>> Fall(frames.size());
+    std::vector<std::vector<double>> fspeed(frames.size());
+    std::vector<std::vector<char>> fok(frames.size());
+    int touch_bad = 0, total = 0;
     auto t0 = std::chrono::steady_clock::now();
-    while (std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() < seconds) {
+    double next_report = 5;
+    for (;;) {
+        double el = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        if (el >= seconds) break;
         vr::TrackedDevicePose_t poses[vr::k_unMaxTrackedDeviceCount];
         sys->GetDeviceToAbsoluteTrackingPose(vr::TrackingUniverseRawAndUncalibrated, 0, poses, vr::k_unMaxTrackedDeviceCount);
         const auto& pt = poses[touch];
-        const auto& pf = poses[frame];
-        if (pt.bPoseIsValid && pf.bPoseIsValid && pt.eTrackingResult == vr::TrackingResult_Running_OK &&
-            pf.eTrackingResult == vr::TrackingResult_Running_OK &&
-            Len({pt.vAngularVelocity.v[0], pt.vAngularVelocity.v[1], pt.vAngularVelocity.v[2]}) < 2.0) {
-            R.push_back(Compose(cur_inv, FromMatrix(pt.mDeviceToAbsoluteTracking)));
-            F.push_back(FromMatrix(pf.mDeviceToAbsoluteTracking));
+        total++;
+        if (pt.bPoseIsValid && pt.eTrackingResult == vr::TrackingResult_Running_OK) {
+            Rall.push_back(Compose(cur_inv, FromMatrix(pt.mDeviceToAbsoluteTracking)));
+            touch_speed.push_back(Len({pt.vAngularVelocity.v[0], pt.vAngularVelocity.v[1], pt.vAngularVelocity.v[2]}));
+            for (size_t k = 0; k < frames.size(); k++) {
+                const auto& pf = poses[frames[k]];
+                Fall[k].push_back(FromMatrix(pf.mDeviceToAbsoluteTracking));
+                fspeed[k].push_back(Len({pf.vAngularVelocity.v[0], pf.vAngularVelocity.v[1], pf.vAngularVelocity.v[2]}));
+                fok[k].push_back(pf.bPoseIsValid && pf.eTrackingResult == vr::TrackingResult_Running_OK);
+            }
+        } else {
+            touch_bad++;
+        }
+        if (el >= next_report) {
+            next_report += 5;
+            printf("  %.0fs: Touch tracked %d/%d", el, total - touch_bad, total);
+            for (size_t k = 0; k < frames.size(); k++) {
+                int n = 0;
+                for (char b : fok[k]) n += b;
+                printf(", Frame controller %u tracked %d", frames[k], n);
+            }
+            printf("\n");
+            fflush(stdout);
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(16));
     }
-    printf("%zu samples\n", R.size());
+    // Pick the Frame controller whose angular speed correlates best with the Touch's.
+    int best = -1;
+    double best_corr = -2;
+    for (size_t k = 0; k < frames.size(); k++) {
+        double sa = 0, sb = 0, saa = 0, sbb = 0, sab = 0;
+        int cnt = 0;
+        for (size_t i = 0; i < touch_speed.size(); i++) {
+            if (!fok[k][i]) continue;
+            double a = touch_speed[i], b = fspeed[k][i];
+            sa += a; sb += b; saa += a * a; sbb += b * b; sab += a * b; cnt++;
+        }
+        if (cnt < 100) continue;
+        double cov = sab / cnt - sa / cnt * sb / cnt;
+        double va = saa / cnt - sa / cnt * sa / cnt, vb = sbb / cnt - sb / cnt * sb / cnt;
+        double corr = cov / std::sqrt(std::max(va * vb, 1e-12));
+        printf("Frame controller %u: %d samples, speed correlation %.2f\n", frames[k], cnt, corr);
+        if (corr > best_corr) { best_corr = corr; best = int(k); }
+    }
+    std::vector<Pose> R, F;
+    if (best >= 0) {
+        for (size_t i = 0; i < Rall.size(); i++) {
+            if (!fok[best][i] || touch_speed[i] > 2.0) continue;
+            R.push_back(Rall[i]);
+            F.push_back(Fall[best][i]);
+        }
+    }
+    printf("%zu samples (Touch untracked in %d of %d polls)\n", R.size(), touch_bad, total);
+    if (best >= 0 && best_corr < 0.5) {
+        fprintf(stderr, "no Frame controller moved with the Touch (best correlation %.2f)\n", best_corr);
+        vr::VR_Shutdown();
+        return 1;
+    }
     if (R.size() < 200) {
         fprintf(stderr, "too few tracked samples; keep both controllers in view of their trackers\n");
         vr::VR_Shutdown();
