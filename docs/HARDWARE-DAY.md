@@ -44,6 +44,14 @@ python tools/radio.py sniff --freq 26 --base <deviceID_low_u32> --prefix 0xAA --
 `<deviceID_low_u32>` = advert bytes 5–8 as a little-endian u32 (PROTOCOL.md Q1 pairing row).
 `pulsar_analyze.py pair.jsonl` for the ping-pong framing.
 
+The exchange is two commands (PROTOCOL.md Q2, confirmed from firmware): `SetupX25519Keys` (0x12,
+the 32-byte public keys cross) then `PairingData` (0x11) — a 32-byte payload of `[0..7]` clear CCM
+IV + `[8..31]` 24-byte ciphertext/MIC, which the host encrypts under the **first 16 bytes of the
+X25519 shared secret** and which decrypts to `[0..3]` the connected-link base address + `[4..19]`
+the 16-byte link AES key. So the sniffer sees the IV and ciphertext but not the key (the X25519
+private half stays on the devices). For the dongle to act as host it picks the key and sends 0x11;
+`WriteAESKey` (0x14) is a no-op stub and need not be sent.
+
 ## 4. Connected link
 The base is the host **network address** (netaddr), not visible on air. Get it one of two ways:
 - Read `/persist/pulsar/pulsar_host_address.bin` off the Quest (adb) — the 4 bytes are the netaddr.
@@ -61,11 +69,17 @@ controllers (`addr` 2+) and shows the 2 ms beacon cadence and uplink slots.
 ## 5. Decode a connected packet (optional, offline, needs the key)
 The AES key never crosses the air. With the headset's `/data/misc/pulsar_aes_key.bin` (or the
 documented default) in hand:
+
+The CCM nonce is a per-packet counter + an **8-byte random session IV** (PROTOCOL.md Q4, confirmed
+from firmware). That IV is sent in the clear, once, in the connection-negotiation packet — its
+first 8 payload bytes. Grab those, then let `scan` sweep the counter against the fixed IV:
 ```bash
-python tools/pulsar_crypto.py scan --key <32 hex> --capture conn.jsonl --session <beacon bytes 6-7>
+python tools/pulsar_crypto.py scan --key <32 hex> --capture conn.jsonl --iv <8 bytes from negotiation>
 ```
-A verifying 4-byte MIC confirms the key, the nonce layout and the capture at once. `decode` takes
-one packet with explicit counter/IV for iterating.
+A verifying 4-byte MIC confirms the key, the IV, the counter and the capture at once. If you did
+*not* capture the negotiation packet, run `scan` without `--iv` to try the (firmware-contradicted,
+last-ditch) `--session`-derived fallbacks. `decode` takes one packet with explicit `--counter`/`--iv`
+for iterating — the negotiation packet itself is `--counter 0 --iv <those 8 bytes>`.
 
 ## 6. Gate B: do the Frame cameras see Touch Plus LEDs? (needs the Frame + a Touch Plus)
 This does **not** need the dongle — it reuses the relay. It is the one open question for 6DoF.
