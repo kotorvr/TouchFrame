@@ -8,3 +8,4 @@ __pycache__/
 
 artifacts/work/
 *.decomp.c
+radio-fw/third_party/
