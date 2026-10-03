@@ -40,7 +40,8 @@ static bool ReadFrame(const json::Value* f, Pose* out) {
 }
 
 bool ParseControllerConfig(const std::string& text, ControllerConfig* out, std::string* err,
-                           const std::string& serial_override, const std::string& model_override) {
+                           const std::string& serial_override, const std::string& model_override,
+                           const std::string& role_override) {
     json::Value root;
     bool found = json::FindObject(text, &root, [](const json::Value& v) {
         if (v.Get("lighthouse_config")) return true;
@@ -54,6 +55,7 @@ bool ParseControllerConfig(const std::string& text, ControllerConfig* out, std::
     json::Value cfg = root.Get("lighthouse_config") ? root : *root.Get("default");
     if (!serial_override.empty()) cfg.Set("device_serial_number", json::Value::Str(serial_override));
     if (!model_override.empty()) cfg.Set("model_number", json::Value::Str(model_override));
+    if (!role_override.empty()) cfg.Set("tracked_controller_role", json::Value::Str(role_override));
 
     const json::Value* lh = cfg.Get("lighthouse_config");
     const json::Value* pts = lh->Get("modelPoints");
@@ -75,6 +77,8 @@ bool ParseControllerConfig(const std::string& text, ControllerConfig* out, std::
     out->serial = s && s->type == json::Value::String ? s->str : "";
     const json::Value* m = cfg.Get("model_number");
     out->model_number = m && m->type == json::Value::String ? m->str : "";
+    const json::Value* r = cfg.Get("tracked_controller_role");
+    out->role = r && r->type == json::Value::String ? r->str : "";
     out->json.clear();
     json::Emit(cfg, &out->json);
     if (out->json.size() >= kControllerConfigMax) {

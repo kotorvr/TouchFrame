@@ -165,6 +165,7 @@ public:
         accel_sign_ = GetFloatSetting("cv_clone_accel_sign", 1.0f);
         mirror_imu_ = GetStringSetting("cv_clone_imu") == "mirror";
         std::string csv = GetStringSetting("cv_clone_csv");
+        std::string role = GetStringSetting("cv_clone_role");
         if (device_id_ < 16 || device_id_ > 63) {
             Log("cvclone: cv_clone_device_id %u out of range 16..63", device_id_);
             return false;
@@ -188,14 +189,15 @@ public:
             }
             clone_serial = "tfclone_" + probe.serial;
         }
-        if (!ParseControllerConfig(ss.str(), &cfg_, &err, clone_serial)) {
+        if (!ParseControllerConfig(ss.str(), &cfg_, &err, clone_serial, "", role)) {
             Log("cvclone: %s: %s", path.c_str(), err.c_str());
             return false;
         }
         imu_from_head_ = Compose(Inverse(cfg_.model_from_imu), cfg_.model_from_head);
         head_from_imu_ = Inverse(imu_from_head_);
-        Log("cvclone: config %s: serial %s, model %s, %d LEDs, %zu bytes; clone device id %u, imu %s, probe %d",
-            path.c_str(), cfg_.serial.c_str(), cfg_.model_number.c_str(), cfg_.led_count, cfg_.json.size(), device_id_,
+        Log("cvclone: config %s: serial %s, model %s, role %s, %d LEDs, %zu bytes; clone device id %u, imu %s, probe %d",
+            path.c_str(), cfg_.serial.c_str(), cfg_.model_number.c_str(), cfg_.role.c_str(), cfg_.led_count,
+            cfg_.json.size(), device_id_,
             mirror_imu_ ? "mirror" : "synth", int(probe_));
         if (!csv.empty()) {
             csv_ = fopen(csv.c_str(), "w");
@@ -288,7 +290,7 @@ private:
                             world_head.p.y, world_head.p.z, world_head.q.w, world_head.q.x, world_head.q.y,
                             world_head.q.z, int(rp.eTrackingResult));
             }
-            if (probe_) ProbeRead(now, Len(w_world), real_ok);
+            if (probe_) ProbeRead(now, Len(w_world), real_ok, world_head, w_world);
 
             float accel[3], gyro[3];
             bool have = false;
@@ -379,7 +381,7 @@ private:
         }
     }
 
-    void ProbeRead(double now, double steam_w, bool real_ok) {
+    void ProbeRead(double now, double steam_w, bool real_ok, const Pose& world_head, V3 w_world) {
         auto* bq = BlockQueue();
         // Latest IMU block (any writer).
         if (probe_data_q_) {
@@ -434,6 +436,15 @@ private:
                     V3 w{b.angularVelocity[0], b.angularVelocity[1], b.angularVelocity[2]};
                     if (real_ok) ref_corr_[n].Add(steam_w, Len(w));
                     std::lock_guard<std::mutex> lk(mu_);
+                    if (n == ref_chosen_ && real_ok && Len(w_world) > 0.5) {
+                        // Which frame is the pose block's angular velocity in? Compare it with
+                        // SteamVR's (world) angular velocity, as a body-frame and as a world vector.
+                        Q world_model = Compose(world_head, Inverse(cfg_.model_from_head)).q;
+                        V3 body = Rot(Conj(world_model), w_world);
+                        V3 as_world = Rot(Q{0, 1, 0, 0}, w);
+                        w_frame_body_.Add(Len(w - body) / Len(w_world));
+                        w_frame_world_.Add(Len(as_world - w_world) / Len(w_world));
+                    }
                     if (n == ref_chosen_) {
                         ref_hist_.Add(b.timestamp, {Normalized(Q{b.qw, b.qx, b.qy, b.qz}),
                                                     {b.position[0], b.position[1], b.position[2]}});
@@ -520,6 +531,9 @@ private:
                 err_steam_pos_.mean(), err_steam_pos_.rms(), err_steam_ang_.mean(), rp.x, rp.y, rp.z, rps.x, rps.y,
                 rps.z, rr.x, rr.y, rr.z, rrs.x, rrs.y, rrs.z);
         }
+        if (w_frame_body_.n)
+            Log("cvclone: XRService angular velocity vs SteamVR: relative error as body frame %.2f, as world frame %.2f (n=%d)",
+                w_frame_body_.mean(), w_frame_world_.mean(), w_frame_body_.n);
         if (gyro_check_.n) Log("cvclone: synth gyro |fd - reported| mean %.3f rad/s", gyro_check_.mean());
         if (probe_) {
             for (auto& kv : real_imu_) {
@@ -542,7 +556,7 @@ private:
         if (csv_) fflush(csv_);
         clone_n_ = clone_valid_ = 0;
         clone_latency_ = err_ref_pos_ = err_ref_ang_ = err_steam_pos_ = err_steam_ang_ = rel_pos_ = rel_rot_ =
-            gyro_check_ = Acc{};
+            gyro_check_ = w_frame_body_ = w_frame_world_ = Acc{};
         for (auto& kv : imu_age_) kv.second = Acc{};
     }
 
@@ -586,6 +600,7 @@ private:
     FILE* csv_ = nullptr;
     PoseHistory steam_hist_, ref_hist_;
     int clone_n_ = 0, clone_valid_ = 0;
+    Acc w_frame_body_, w_frame_world_;  // loop thread
     Acc clone_latency_, err_ref_pos_, err_ref_ang_, err_steam_pos_, err_steam_ang_, rel_pos_, rel_rot_, gyro_check_;
     std::map<uint32_t, Acc> imu_age_;
     V3 last_synth_[2];

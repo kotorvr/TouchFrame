@@ -16,6 +16,7 @@
 		"cv_clone_config": "/home/steamos/touchframe-cv/clone_config.txt",
 		"cv_clone_device_id": 40,
 		"cv_clone_ref_device_id": 0,
+		"cv_clone_role": "",
 		"cv_clone_imu": "synth",
 		"cv_clone_accel_sign": 1.0,
 		"cv_clone_probe": true,

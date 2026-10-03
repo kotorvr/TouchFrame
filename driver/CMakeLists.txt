@@ -8,7 +8,7 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 
 add_library(driver_touchframe SHARED src/driver.cpp src/udp_source.cpp src/skeleton.cpp
-  src/cv_tracker.cpp src/cv_clone.cpp)
+  src/cv_tracker.cpp src/cv_clone.cpp src/cv_source.cpp)
 target_include_directories(driver_touchframe PRIVATE src vendor)
 target_compile_options(driver_touchframe PRIVATE -Wall -Wextra -Wno-unused-parameter)
 target_link_libraries(driver_touchframe PRIVATE pthread)

@@ -44,6 +44,7 @@ struct ControllerConfig {
     std::string json;          // the config object to send (compact JSON)
     std::string serial;        // device_serial_number
     std::string model_number;
+    std::string role;          // tracked_controller_role
     Pose model_from_imu;       // "imu" extrinsics (model = lighthouse_config / LED frame)
     Pose model_from_head;      // "head" extrinsics (the frame SteamVR reports for the device)
     int led_count = 0;
@@ -51,10 +52,14 @@ struct ControllerConfig {
 
 // Accepts a bare config object, an XRService log excerpt with {"default":{...},"onboard":{...}},
 // or any text containing one; uses the object that has lighthouse_config. Optional overrides
-// replace device_serial_number / model_number before re-emitting the JSON.
+// replace device_serial_number / model_number / tracked_controller_role before re-emitting the
+// JSON. XRService accepts only "left_hand" and "right_hand" as roles (anything else becomes
+// left_hand), and it keeps some per-role state: two controllers with the same role corrupt each
+// other's pose history (docs/FRAME-TRACKER.md §9).
 bool ParseControllerConfig(const std::string& text, ControllerConfig* out, std::string* err,
                            const std::string& serial_override = "",
-                           const std::string& model_override = "");
+                           const std::string& model_override = "",
+                           const std::string& role_override = "");
 
 // One pose from XRService's pose block, plus the same pose in SteamVR's frame.
 struct CvPose {
