@@ -44,12 +44,18 @@ LEDs: green = USB is up, blue blinks with captured packets.
 python tools/radio.py sweep --rounds 50              # peak RSSI per MHz: where is the link active?
 python tools/radio.py sniff --preset discovery       # 2402 MHz, 0xAA + 0xFACEB00C, CRC-24 on
 python tools/radio.py sniff --preset discovery --no-crc --out disc.jsonl
-python tools/radio.py sniff --freq 26 --no-crc       # pairing channel (address is a guess)
-python tools/radio.py sniff --base 0x... --prefix 0x.. --hop data --dwell-ms 20
+python tools/radio.py sniff --freq 26 --base 0x<deviceid_lo> --out pair.jsonl   # pairing
+python tools/radio.py sniff --connected 0x<netaddr> --out conn.jsonl            # follow the link
 ```
-- Each line shows time, MHz, RSSI, CRC (`ok`/`BAD`, or `---` when CRC is off), length, and the raw
-  bytes as stored by the radio: `[LENGTH][payload]`. With `--no-crc` the payload is followed by the 3 CRC bytes.
-- `--out` appends JSON lines `{t_us, mhz, rssi, crc_ok, data}` for offline analysis.
+- The radio can watch several access addresses at once (host **and** controllers): `--connected`
+  sets host AP1=`0xF0` and controller slots AP2..AP6=`0x01..0x05`, so one capture has both sides.
+- `--connected` also **follows the channel hop**: it locks onto the 500 Hz beacon and retunes with
+  the link using the known hop rule (CSA #1, `src/pulsar_hop.c`), so you capture the whole
+  conversation, not one channel. The status line shows `follow: N beacons, M blind, LOCKED`.
+  `--no-follow` parks on one channel; `--with-adverts` also keeps logical address 0.
+- Each line shows time, MHz, the matched logical address (`a1` host, `a2`.. controllers), RSSI, CRC
+  (`ok`/`BAD`, or `---` when off), length, and the raw bytes `[S0][LENGTH][payload]`.
+- `--out` appends JSON lines `{t_us, mhz, rssi, crc_ok, addr, data}` for `tools/pulsar_analyze.py`.
 - `dropped` in the status lines means the PC didn't keep up with the dongle's 64-packet ring.
 
 ## First session with real hardware

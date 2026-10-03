@@ -16,6 +16,7 @@ PYTHON ?= python
 SRC_C = \
   src/main.c \
   src/sniffer.c \
+  src/pulsar_hop.c \
   src/usb_descriptors.c \
   $(TP)/nrfx/mdk/system_nrf52840.c \
   $(TP)/tinyusb/src/tusb.c \

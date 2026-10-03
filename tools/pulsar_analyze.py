@@ -108,6 +108,16 @@ def main():
         print(f"  {mhz} MHz {len(ps):7d}  {statistics.median(p['rssi'] for p in ps):5.0f} dBm  "
               f"{100 * sum(p['crc_ok'] for p in ps) / len(ps):5.1f}%")
 
+    if any("addr" in p for p in pkts):
+        print("\nper logical address (1 = host 0xF0, 2+ = controller slots):")
+        by_a = collections.defaultdict(list)
+        for p in pkts:
+            by_a[p.get("addr")].append(p)
+        for a in sorted(by_a, key=lambda x: (x is None, x)):
+            ps = by_a[a]
+            print(f"  a{a} {len(ps):7d}  {statistics.median(p['rssi'] for p in ps):5.0f} dBm  "
+                  f"{100 * sum(p['crc_ok'] for p in ps) / len(ps):5.1f}%")
+
     deltas = [b["t"] - a["t"] for a, b in zip(pkts, pkts[1:])]
     if deltas:
         print(f"\ninter-arrival (µs, {args.resolution_us} µs buckets), most common:")

@@ -33,25 +33,30 @@ BOOT_VIDPID = (0x1915, 0x521F)   # Nordic open USB bootloader on the PCA10059
 CMD_CONFIG, CMD_STOP, CMD_STATUS, CMD_SWEEP, CMD_DFU = 0x01, 0x02, 0x03, 0x04, 0x05
 EVT_PACKET, EVT_STATUS, EVT_SWEEP, EVT_TEXT = 0x81, 0x82, 0x83, 0x84
 
-CONFIG_FMT = "<BBBIBBBBBBBBBIIHB40s"   # link_config_t
-STATUS_FMT = "<BBIII"                  # link_status_t header, then link_config_t
-PACKET_FMT = "<IBbBB"                  # link_packet_t
-CONFIG_FIELDS = ("mode frequency prefix base balen big_endian lflen s0len s1len statlen maxlen "
-                 "crc_len crc_skip_addr crc_poly crc_init hop_dwell_ms hop_count hop_list").split()
-LINK_VERSION = 1
+CONFIG_FMT = "<BBII8sBBBBBBBBBBIIHB40sBB"  # link_config_t
+STATUS_FMT = "<BBIIIIIB"                    # link_status_t header, then link_config_t
+PACKET_FMT = "<IBbBBB"                      # link_packet_t
+LINK_VERSION = 2
 
-# docs/PROTOCOL.md Q1: Nrf_2Mbit, whitening off, LFLEN 8, no S0/S1, CRC-24 0x108421 / 0xFFFFFF.
-# Discovery address and endianness CONFIRMED in syncboss (logical address 7: BASE1 0xFACEB00C,
-# AP7 0xAA, PCNF1 ENDIAN=big, BALEN=4, 2402 MHz).
-PULSAR = dict(mode=1, prefix=0xAA, base=0xFACEB00C, balen=4, big_endian=1, lflen=8, s0len=0,
-              s1len=0, statlen=0, maxlen=255, crc_len=3, crc_skip_addr=0, crc_poly=0x108421,
-              crc_init=0xFFFFFF)
+# docs/PROTOCOL.md Q1: Nrf_2Mbit, whitening off, CRC-24 0x108421 / 0xFFFFFF, BALEN 4, big-endian.
+# Discovery/pairing/DM-beacon have no S0 byte; the connected link has a 1-byte S0 (0x04).
+# base0/prefix[0] = logical address 0; base1/prefix[1..7] = logical addresses 1..7 (rx_mask selects).
+def config(base0=0xFACEB00C, base1=0, prefix=(0xAA, 0, 0, 0, 0, 0, 0, 0), rx_mask=0x01, frequency=2,
+           s0len=0, follow=0, follow_rx=1, **kw):
+    c = dict(mode=1, frequency=frequency, base0=base0, base1=base1, prefix=tuple(prefix)[:8] + (0,) * 8,
+             rx_mask=rx_mask, balen=4, big_endian=1, lflen=8, s0len=s0len, s1len=0, statlen=0, maxlen=255,
+             crc_len=3, crc_skip_addr=0, crc_poly=0x108421, crc_init=0xFFFFFF, hop_dwell_ms=0, hop_count=0,
+             hop_list=[], follow=follow, follow_rx=follow_rx)
+    c.update(kw)
+    c["prefix"] = tuple(c["prefix"])[:8]
+    return c
+
 DATA_CHANNELS = [4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 28, 30, 32, 34, 36, 38, 40, 42, 44, 46,
                  48, 50, 52, 54, 56, 58, 60, 62, 64, 66, 68, 70, 72, 74, 76, 78]
 PRESETS = {
-    "discovery": dict(PULSAR, frequency=2),
-    # Pairing on 2426 is INFERRED and its address is UNKNOWN; this tries the discovery address.
-    "pairing": dict(PULSAR, frequency=26),
+    "discovery": config(frequency=2),  # controller adverts + host DM beacons, logical addr 0
+    # Pairing on 2426: base = the controller's device-id low word (advert bytes 5-8), prefix 0xAA.
+    "pairing": config(frequency=26),
 }
 
 
@@ -129,22 +134,34 @@ class Dongle:
         return parse_status(self.wait_for(EVT_STATUS))
 
 
+CONFIG_SCALARS = ("mode frequency base0 base1").split()
+CONFIG_TAIL = ("rx_mask balen big_endian lflen s0len s1len statlen maxlen crc_len crc_skip_addr "
+               "crc_poly crc_init hop_dwell_ms hop_count").split()
+
+
 def parse_status(body):
     n = struct.calcsize(STATUS_FMT)
-    version, running, now_us, received, dropped = struct.unpack_from(STATUS_FMT, body)
-    cfg = dict(zip(CONFIG_FIELDS, struct.unpack_from(CONFIG_FMT, body, n)))
-    cfg["hop_list"] = list(cfg["hop_list"][:cfg["hop_count"]])
+    version, running, now_us, received, dropped, fbeacons, fblind, flocked = struct.unpack_from(STATUS_FMT, body)
+    v = struct.unpack_from(CONFIG_FMT, body, n)
+    cfg = dict(zip(CONFIG_SCALARS, v[:4]))
+    cfg["prefix"] = list(v[4])
+    cfg.update(zip(CONFIG_TAIL, v[5:19]))
+    cfg["hop_list"] = list(v[19][: cfg["hop_count"]])
+    cfg["follow"], cfg["follow_rx"] = v[20], v[21]
     if version != LINK_VERSION:
         print(f"warning: firmware link version {version}, tool expects {LINK_VERSION}", file=sys.stderr)
-    return dict(running=bool(running), now_us=now_us, received=received, dropped=dropped, config=cfg)
+    return dict(running=bool(running), now_us=now_us, received=received, dropped=dropped,
+                follow=dict(beacons=fbeacons, blind=fblind, locked=bool(flocked)), config=cfg)
 
 
 def pack_config(c):
     hops = list(c.get("hop_list", []))
-    return struct.pack(CONFIG_FMT, c["mode"], c["frequency"], c["prefix"], c["base"], c["balen"],
-                       c["big_endian"], c["lflen"], c["s0len"], c["s1len"], c["statlen"], c["maxlen"],
-                       c["crc_len"], c["crc_skip_addr"], c["crc_poly"], c["crc_init"],
-                       c.get("hop_dwell_ms", 0), len(hops), bytes(hops).ljust(40, b"\0"))
+    prefix = bytes(tuple(c["prefix"])[:8]).ljust(8, b"\0")
+    return struct.pack(CONFIG_FMT, c["mode"], c["frequency"], c["base0"], c["base1"], prefix,
+                       c["rx_mask"], c["balen"], c["big_endian"], c["lflen"], c["s0len"], c["s1len"],
+                       c["statlen"], c["maxlen"], c["crc_len"], c["crc_skip_addr"], c["crc_poly"],
+                       c["crc_init"], c.get("hop_dwell_ms", 0), len(hops), bytes(hops).ljust(40, b"\0"),
+                       c["follow"], c["follow_rx"])
 
 
 # ---------------------------------------------------------------- ports
@@ -218,19 +235,41 @@ def cmd_sweep(args):
 
 
 def sniff_config(args):
-    c = dict(PRESETS[args.preset] if args.preset else PULSAR)
-    for key in ("frequency", "prefix", "base", "balen", "maxlen", "mode", "statlen"):
+    if args.connected is not None:
+        # Host on AP1=0xF0 (logical 1), controller slots on AP2..AP6 = 0x01..0x05 (logical 2..6),
+        # AP0=0xAA on BASE0 for discovery/DM adverts. base1 = the host network address.
+        c = config(base0=0xFACEB00C, base1=args.connected, frequency=4, s0len=1,
+                   prefix=(0xAA, 0xF0, 0x01, 0x02, 0x03, 0x04, 0x05, 0x00),
+                   rx_mask=0x7F if args.with_adverts else 0x7E,  # bits 1..6, optionally +bit0
+                   follow=0 if args.no_follow else 1, follow_rx=1)
+    else:
+        c = dict(PRESETS[args.preset] if args.preset else PRESETS["discovery"])
+    if args.base0 is not None:
+        c["base0"] = args.base0
+    if args.base1 is not None:
+        c["base1"] = args.base1
+    if args.base is not None:  # single-address alias -> logical address 0
+        c["base0"] = args.base
+    if args.prefix is not None:
+        pre = [int(x, 0) for x in str(args.prefix).split(",")]
+        c["prefix"] = (pre + [0] * 8)[:8]
+    if args.rx_mask is not None:
+        c["rx_mask"] = args.rx_mask
+    if args.s0:
+        c["s0len"] = 1
+    for key in ("frequency", "balen", "maxlen", "mode", "statlen", "follow_rx"):
         v = getattr(args, key)
         if v is not None:
             c[key] = v
-    if "frequency" not in c:
-        c["frequency"] = 2
+    if args.follow:
+        c["follow"] = 1
     if args.little_endian:
         c["big_endian"] = 0
     if args.crc_skip_addr:
         c["crc_skip_addr"] = 1
     if args.no_crc:
         c["crc_len"] = 0
+        c["follow"] = 0  # follow needs CRC to tell beacons apart
         if args.statlen is None:
             c["statlen"] = 3  # keep the CRC bytes in the capture
     if args.hop:
@@ -257,7 +296,7 @@ def cmd_sniff(args):
         for t, body in d.frames(timeout=1e9, idle=True):
             now = time.monotonic()
             if t == EVT_PACKET:
-                ts, freq, rssi, crc_ok, length = struct.unpack_from(PACKET_FMT, body)
+                ts, freq, rssi, crc_ok, rxmatch, length = struct.unpack_from(PACKET_FMT, body)
                 data = body[struct.calcsize(PACKET_FMT):][:length]
                 count += 1
                 good += crc_ok
@@ -267,15 +306,17 @@ def cmd_sniff(args):
                 rel_ms = ((ts - t0) & 0xFFFFFFFF) / 1000
                 if not args.quiet:
                     flag = ("ok " if crc_ok else "BAD") if cfg["crc_len"] else "---"
-                    print(f"{rel_ms:12.3f} ms {2400 + freq} {rssi:4d} dBm {flag} {length:3d} {data.hex()}")
+                    print(f"{rel_ms:12.3f} ms {2400 + freq} a{rxmatch} {rssi:4d} dBm {flag} {length:3d} {data.hex()}")
                 if out:
                     out.write(json.dumps(dict(t_us=ts, mhz=2400 + freq, rssi=rssi, crc_ok=crc_ok,
-                                              data=data.hex())) + "\n")
+                                              addr=rxmatch, data=data.hex())) + "\n")
             elif t == EVT_TEXT:
                 print("dongle:", body.decode(errors="replace"), file=sys.stderr)
             elif t == EVT_STATUS:
                 st = parse_status(body)
-                print(f"[{count} packets, {good} CRC ok, dongle dropped {st['dropped']}]", file=sys.stderr)
+                f = st["follow"]
+                tail = f", follow: {f['beacons']} beacons, {f['blind']} blind, {'LOCKED' if f['locked'] else 'unlocked'}" if cfg.get("follow") else ""
+                print(f"[{count} packets, {good} CRC ok, dropped {st['dropped']}{tail}]", file=sys.stderr)
             if now - last_status > 5:
                 d.send(CMD_STATUS)
                 last_status = now
@@ -310,9 +351,20 @@ def main():
     p.set_defaults(fn=cmd_sweep)
     p = sub.add_parser("sniff")
     p.add_argument("--preset", choices=sorted(PRESETS))
+    p.add_argument("--connected", type=int0, metavar="NETADDR",
+                   help="follow the connected link with host network address NETADDR (hears host + "
+                        "controllers, follows the channel hop). Get NETADDR from the Quest or by address search.")
+    p.add_argument("--no-follow", action="store_true", help="with --connected, stay on one channel")
+    p.add_argument("--with-adverts", action="store_true", help="with --connected, also receive logical address 0")
     p.add_argument("--frequency", "--freq", type=int, help="MHz above 2400")
-    p.add_argument("--prefix", type=int0)
-    p.add_argument("--base", type=int0)
+    p.add_argument("--prefix", help="AP0[,AP1,...] access-address prefixes, e.g. 0xAA or 0xAA,0xF0,0x01")
+    p.add_argument("--base", type=int0, help="base address for logical address 0 (alias for --base0)")
+    p.add_argument("--base0", type=int0)
+    p.add_argument("--base1", type=int0, help="base for logical addresses 1..7")
+    p.add_argument("--rx-mask", type=int0, help="RXADDRESSES bitmask (bit n = logical address n)")
+    p.add_argument("--s0", action="store_true", help="expect a 1-byte S0 (the connected link has one)")
+    p.add_argument("--follow", action="store_true", help="follow the channel hop from beacons")
+    p.add_argument("--follow-rx", type=int, help="logical address the beacons arrive on (default 1)")
     p.add_argument("--balen", type=int)
     p.add_argument("--maxlen", type=int)
     p.add_argument("--statlen", type=int)

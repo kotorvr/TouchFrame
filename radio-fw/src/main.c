@@ -94,8 +94,12 @@ static void config_to_link(const sniffer_config_t* c, link_config_t* l) {
     memset(l, 0, sizeof(*l));
     l->mode = c->mode;
     l->frequency = c->frequency;
-    l->prefix = c->prefix;
-    l->base = c->base;
+    memcpy(l->prefix, c->prefix, sizeof(l->prefix));
+    l->base0 = c->base0;
+    l->base1 = c->base1;
+    l->rx_mask = c->rx_mask;
+    l->follow = c->follow;
+    l->follow_rx = c->follow_rx;
     l->balen = c->balen;
     l->big_endian = c->big_endian;
     l->lflen = c->lflen;
@@ -116,8 +120,12 @@ static void link_to_config(const link_config_t* l, sniffer_config_t* c) {
     memset(c, 0, sizeof(*c));
     c->mode = l->mode;
     c->frequency = l->frequency;
-    c->prefix = l->prefix;
-    c->base = l->base;
+    memcpy(c->prefix, l->prefix, sizeof(c->prefix));
+    c->base0 = l->base0;
+    c->base1 = l->base1;
+    c->rx_mask = l->rx_mask;
+    c->follow = l->follow != 0;
+    c->follow_rx = l->follow_rx;
     c->balen = l->balen;
     c->big_endian = l->big_endian != 0;
     c->lflen = l->lflen;
@@ -141,6 +149,10 @@ static void send_status(void) {
     s.now_us = sniffer_now_us();
     s.received = sniffer_received();
     s.dropped = sniffer_dropped();
+    sniffer_follow_stats_t fs = sniffer_follow_stats();
+    s.follow_beacons = fs.beacons;
+    s.follow_blind = fs.blind_hops;
+    s.follow_locked = fs.locked;
     config_to_link(sniffer_config(), &s.config);
     send_frame(EVT_STATUS, &s, sizeof(s), NULL, 0);
 }
@@ -253,7 +265,8 @@ int main(void) {
         // (overflow shows up as `dropped`).
         if (tud_cdc_connected()) {
             while (tud_cdc_write_available() >= sizeof(tx_enc) && sniffer_pop(&pkt)) {
-                link_packet_t h = {pkt.timestamp_us, pkt.frequency, pkt.rssi, pkt.crc_ok, pkt.length};
+                link_packet_t h = {pkt.timestamp_us, pkt.frequency, pkt.rssi, pkt.crc_ok, pkt.rxmatch,
+                                   pkt.length};
                 send_frame(EVT_PACKET, &h, sizeof(h), pkt.data, pkt.length);
                 if ((++blink & 15) == 0) led(LED_BLUE, (blink >> 4) & 1);
             }

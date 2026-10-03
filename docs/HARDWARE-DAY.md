@@ -45,13 +45,18 @@ python tools/radio.py sniff --freq 26 --base <deviceID_low_u32> --prefix 0xAA --
 `pulsar_analyze.py pair.jsonl` for the ping-pong framing.
 
 ## 4. Connected link
-The base is the host **network address**, not visible on air. Two ways in:
-- **Park on 2402** and catch the periodic DM beacons (`--preset discovery`, they use S0=0). Beacon
-  byte 5 = current channel, bytes 0–4 = channel map, bytes 8–13 = timestamp (PROTOCOL.md beacon
-  table). This alone shows cadence and hop state.
-- **Follow the hop** once the netaddr is known: `--base <netaddr> --prefix 0xF0 --hop data`. To find
-  the netaddr, read `/persist/pulsar/pulsar_host_address.bin` off the Quest (adb), or brute-force
-  the low byte: the CRC covers the address, so `pulsar_analyze.py` CRC-ok rate confirms a guess.
+The base is the host **network address** (netaddr), not visible on air. Get it one of two ways:
+- Read `/persist/pulsar/pulsar_host_address.bin` off the Quest (adb) — the 4 bytes are the netaddr.
+- **Address search:** the CRC covers the address, so a wrong base yields all-`BAD`. Park on 2402 for
+  the DM beacons, or step a candidate base and watch the CRC-ok rate in `pulsar_analyze.py`.
+
+Then follow the link (hears host + controllers, retunes with the hop):
+```bash
+python tools/radio.py sniff --connected 0x<netaddr> --out conn.jsonl
+```
+Watch the status line: `follow: N beacons … LOCKED` means it's tracking the hop. `--no-follow`
+parks on one channel if you'd rather. `pulsar_analyze.py conn.jsonl` splits host (`addr` 1) from
+controllers (`addr` 2+) and shows the 2 ms beacon cadence and uplink slots.
 
 ## 5. Decode a connected packet (optional, offline, needs the key)
 The AES key never crosses the air. With the headset's `/data/misc/pulsar_aes_key.bin` (or the
