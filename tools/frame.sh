@@ -4,6 +4,8 @@
 #   tools/frame.sh install     register the built driver with SteamVR (vrpathreg)
 #   tools/frame.sh uninstall   unregister it
 #   tools/frame.sh restart     restart SteamVR (interrupts whatever is running in VR)
+#   tools/frame.sh calibrate [left|right] [seconds]
+#                              align the relay space: hold that Touch + a Frame controller together
 #   tools/frame.sh log         TouchFrame lines from vrserver.txt
 #   tools/frame.sh shell CMD   run a command
 set -euo pipefail
@@ -24,10 +26,12 @@ case "${1:-}" in
     "${SSH[@]}" "$VRPATHREG removedriver $DRIVER_DIR; $VRPATHREG show | grep -A3 -i external" ;;
   restart)
     "${SSH[@]}" 'XDG_RUNTIME_DIR=/run/user/$(id -u) systemctl --user restart steamvr.service' ;;
+  calibrate)
+    "${SSH[@]}" "XDG_RUNTIME_DIR=/run/user/\$(id -u) $DRIVER_DIR/bin/linuxarm64/tf_calibrate ${2:-right} ${3:-20}" ;;
   log)
     "${SSH[@]}" 'grep -E "touchframe|TouchFrame" ~/.local/share/Steam/logs/vrserver.txt | tail -${N:-40}' ;;
   shell)
     shift; "${SSH[@]}" "$@" ;;
   *)
-    sed -n '2,9p' "$0"; exit 1 ;;
+    sed -n '2,11p' "$0"; exit 1 ;;
 esac

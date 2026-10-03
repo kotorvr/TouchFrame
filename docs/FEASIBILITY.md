@@ -99,4 +99,5 @@ Status: **Phase 0 under way (2026-10-03).** The section "Log" at the end is the 
     - Its stream reaches the Frame driver.
     - `vrcmd` on the Frame showed live Touch poses and touches (X, trigger).
   - **Next:** calibration to align the Quest stage space with the Frame world; battery passthrough.
-  - **Historical:** the Quest-side bridge APK. It needs Android build-tools (aapt2/zipalign/apksigner); the NDK 27 and OpenXR loader in `C:\Android` are present.
+  - (Build note: the Quest-side bridge APK needs Android build-tools (aapt2/zipalign/apksigner); the NDK 27 and OpenXR loader in `C:\Android` are present.)
+  - Calibration tool `tf_calibrate` built (yaw + translation from rotation deltas plus least squares; the driver reloads `calib_*` live). Not yet run with real controllers.

@@ -87,7 +87,8 @@ public:
         // Win the hand roles over idle Frame controllers while Touch Plus is in use.
         p->SetInt32Property(c, Prop_ControllerHandSelectionPriority_Int32,
                             VRSettings()->GetInt32(kSection, "hand_priority"));
-        p->SetBoolProperty(c, Prop_DeviceProvidesBatteryStatus_Bool, true);
+        // Battery is advertised once a source reports it (the OpenXR relay can't).
+        p->SetBoolProperty(c, Prop_DeviceProvidesBatteryStatus_Bool, false);
         p->SetBoolProperty(c, Prop_WillDriftInYaw_Bool, false);
 
         auto* in = VRDriverInput();
@@ -189,6 +190,7 @@ public:
         in->UpdateBooleanComponent(h_thumbrest_touch_, b & kBtnThumbrestTouch, -age_s);
 
         if (s.battery <= 100 && s.battery != last_battery_) {
+            if (last_battery_ > 100) VRProperties()->SetBoolProperty(container_, Prop_DeviceProvidesBatteryStatus_Bool, true);
             last_battery_ = s.battery;
             VRProperties()->SetFloatProperty(container_, Prop_DeviceBatteryPercentage_Float, s.battery / 100.0f);
         }
@@ -233,6 +235,7 @@ public:
             return VRInitError_Driver_Unknown;
         }
         for (int h = 0; h < 2; h++) hands_[h] = std::make_unique<TouchController>(h);
+        calib_version_ = VRSettings()->GetInt32(kSection, "calib_version");
         LoadCalibration();
         auto port = uint16_t(VRSettings()->GetInt32(kSection, "port"));
         source_ = std::make_unique<UdpSource>(port, [this](const StatePacket& pkt, uint64_t now) { OnState(pkt, now); });
@@ -259,8 +262,17 @@ public:
                 }
             }
         }
-        // A source that went quiet (Quest asleep, Wi-Fi drop) should not leave frozen hands.
+        // tools: tf_calibrate writes new calib_* values and bumps calib_version; pick them up live.
         uint64_t now = MonotonicNs();
+        if (now - last_settings_check_ns_ > 1000000000ull) {
+            last_settings_check_ns_ = now;
+            int32_t v = VRSettings()->GetInt32(kSection, "calib_version");
+            if (v != calib_version_) {
+                calib_version_ = v;
+                LoadCalibration();
+            }
+        }
+        // A source that went quiet (Quest asleep, Wi-Fi drop) should not leave frozen hands.
         uint64_t last = last_packet_ns_.load();
         if (last && now - last > 250000000ull) {
             for (int h = 0; h < 2; h++) if (added_[h]) hands_[h]->MarkStale();
@@ -304,6 +316,8 @@ private:
     std::unique_ptr<ITouchSource> source_;
     std::atomic<uint64_t> last_packet_ns_{0};
     double latency_s_ = 0.015;
+    uint64_t last_settings_check_ns_ = 0;
+    int32_t calib_version_ = 0;
 };
 
 }  // namespace tf

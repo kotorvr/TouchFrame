@@ -19,3 +19,12 @@ set_target_properties(driver_touchframe PROPERTIES PREFIX ""
 # Stage the driver folder (manifest + resources) next to the binary.
 add_custom_command(TARGET driver_touchframe POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E copy_directory ${CMAKE_SOURCE_DIR}/touchframe ${CMAKE_BINARY_DIR}/touchframe)
+
+# Calibration tool (an OpenVR client) links SteamVR's own libopenvr_api.so on the Frame.
+add_executable(tf_calibrate src/calibrate.cpp)
+target_include_directories(tf_calibrate PRIVATE vendor)
+target_link_directories(tf_calibrate PRIVATE /opt/steamvr/bin/linuxarm64)
+target_link_libraries(tf_calibrate PRIVATE openvr_api)
+set_target_properties(tf_calibrate PROPERTIES
+  BUILD_RPATH /opt/steamvr/bin/linuxarm64
+  RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/touchframe/bin/linuxarm64)

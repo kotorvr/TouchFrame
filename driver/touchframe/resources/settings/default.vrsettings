@@ -3,6 +3,7 @@
 		"enable": true,
 		"port": 28430,
 		"hand_priority": 100,
+		"calib_version": 0,
 		"calib_qw": 1.0,
 		"calib_qx": 0.0,
 		"calib_qy": 0.0,
