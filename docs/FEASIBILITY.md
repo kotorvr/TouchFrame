@@ -94,4 +94,9 @@ Status: **Phase 0 under way (2026-10-03).** The section "Log" at the end is the 
     - `vrcmd --pollposes` shows poses streaming, including the openxr_grip→raw offset (20.6° pitch).
     - `vrcmd --pollcontrollers` shows sticks, trigger, grip, buttons, touches and battery 80%. SteamVR applied Valve's `{oculus}` legacy Touch bindings by itself.
     - `vrcmd --spamhaptics`: 383 haptic packets came back to the sender.
-  - **Next:** the Quest-side bridge APK. It needs Android build-tools (aapt2/zipalign/apksigner); the NDK 27 and OpenXR loader in `C:\Android` are present.
+  - **Relay works end to end with real Quest 3 controllers:**
+    - `quest-bridge` (`tools/build_bridge.py`) runs on the Quest and reaches a FOCUSED OpenXR session in STAGE space, unworn after the `prox_close` broadcast.
+    - Its stream reaches the Frame driver.
+    - `vrcmd` on the Frame showed live Touch poses and touches (X, trigger).
+  - **Next:** calibration to align the Quest stage space with the Frame world; battery passthrough.
+  - **Historical:** the Quest-side bridge APK. It needs Android build-tools (aapt2/zipalign/apksigner); the NDK 27 and OpenXR loader in `C:\Android` are present.
