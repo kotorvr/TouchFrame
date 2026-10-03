@@ -49,12 +49,13 @@ residual risk (INFERRED, not UNKNOWN-blocking) is whether the controller validat
 that is a value we can match, not a secret. **No fallback reflash of the controller MCU is
 required by Gate A.**
 
-Residual UNKNOWN to close before trusting pairing end-to-end: the exact byte layout of
-the `PairingData` (0x11) payload the controller decrypts and what it stores (base address
-+ AES key + which fields), and whether the AES key is derived from the ECDH secret or sent
-under it. Addresses to continue: controller ECDH at `elk-spl FUN_0000934c @ 0x934c`
-(calls Curve25519 scalarmult), pairing-state reset `FUN_000039bc @ 0x39bc`, pairing packet
-dispatch references `device_pairing_packet_handlers.c` from code near `elk-spl 0x3b0c`.
+~~Residual UNKNOWN to close before trusting pairing end-to-end: the exact byte layout of
+the `PairingData` (0x11) payload the controller decrypts and what it stores, and whether
+the AES key is derived from the ECDH secret or sent under it.~~ **Closed** (Q2 "Pairing
+data layout + key derivation" below, CONFIRMED both sides): the 16-byte link AES key is
+**host-chosen and sent encrypted**, not derived; the ECDH shared secret is only the CCM
+wrapping key (its first 16 bytes). Decrypted `PairingData` = `[4-byte connected-link base
+address][16-byte AES link key]`.
 
 ---
 
@@ -216,8 +217,9 @@ data are CCM-encrypted (Q3). Uplink packets also carry S0 = `0x04`, LENGTH <= 12
 
 **Discovery advertisement (controller -> 2402, S0 off, LENGTH = 32; CONFIRMED layout from
 `elk-spl FUN_000080c8` + `0x7f70`, host parse `syncboss FUN_000208dc`):**
-`[0] type = 2`, `[1..4]` 32-bit info word (`0x01, 0x17, hw, hw` at build time; content
-INFERRED version/hw), `[5..12]` 64-bit **device ID (FICR DEVICEID)**, `[13..16]` 32-bit word
+`[0] type = 2`, `[1..4]` 32-bit info word (`0x01, 0x17, hw, hw` at build time; `[1..2]` =
+**Pulsar version `0x1701`** = major 1 / sub 23, CONFIRMED in Q6; `[3..4]` hw INFERRED),
+`[5..12]` 64-bit **device ID (FICR DEVICEID)**, `[13..16]` 32-bit word
 (UNKNOWN), `[17..30]` 14 bytes (UNKNOWN, from `elk-spl FUN_00003418`), `[31]` 1 byte. The host
 also accepts a type-1 variant with the ID at `[6..13]`.
 
@@ -242,11 +244,17 @@ this same clock drives the camera-sync LED strobe (Q4).
   (calls Curve25519 inner routines `FUN_00004414/000043a0/000044a4`); pairing buffers (4×32
   bytes: host pub, device pub/priv, shared, decrypted) are zeroed by `FUN_000039bc @ 0x39bc`.
 
-**Message IDs (INFERRED, prior public work; corroborated by `x25519.c`/`device_pairing.c`):**
-`SetupX25519Keys = 0x12` (host pub key out, controller pub key back), `PairingData = 0x11`
-(host sends the link key material encrypted under the ECDH shared secret; first bytes of the
-decrypted payload = new base address), `WriteAESKey = 0x14`, `Reset = 0x15`. These ride the
-SPL command framing (len, cmd, seq, payload, CRC).
+**Message IDs (now CONFIRMED from the SPL command dispatcher `elk-spl FUN_0000822c @
+0x822c`):** the command byte is `[bit0 = read/request vs write][bits1..6 = command
+number][bit7 reserved]`; `FUN_0000822c` splits on bit0, then `switch((b & 0x7f) >> 1)`.
+Confirmed numbers: `SetupX25519Keys = 0x12` (read/odd branch, returns a 32-byte payload =
+the controller public key, via `thunk_FUN_00003948`), `PairingData = 0x11` (write/even
+branch → `FUN_00003abc`), `WriteAESKey = 0x14`, `Reset = 0x15` (→ `FUN_00002a04`). A second
+pairing-data variant `0x1d` (→ `FUN_00003ac6`) exists (see below). **`WriteAESKey 0x14` is
+a no-op stub in this SPL image** (`FUN_000081bc` just `return 0`, like all the `0x81xx`
+app-mode entries) — the link key is committed inside the `0x11` handler itself, so TouchFrame
+does not need to send a separate `0x14`. Commands ride the SPL framing (2-byte header =
+cmd + seq, then payload, then CRC); the handler receives `payload = packet + 2`.
 
 **Host side (syncboss + libsyncboss):** `pulsar_manager_pair`,
 `pulsar_manager_enumerate_advertising_devices`, `syncboss_input_pair`,
@@ -256,9 +264,50 @@ SPL command framing (len, cmd, seq, payload, CRC).
 fallback. `pulsar_host_init` console takes a "16-byte AES key as a hex string" and a
 "16-bit session nonce" (`session_nonce`).
 
-**Key derivation after X25519 / host auth:** no host auth (Gate A). Exact KDF from the
-shared secret to the 16-byte AES key is **UNKNOWN** — the decrypted `PairingData` payload is
-the next thing to decode (`FUN_0000934c` output path).
+### Pairing data layout + key derivation (CONFIRMED, both sides)
+
+No host auth (Gate A). The flow is: `0x12` establishes the X25519 shared secret, then `0x11`
+hands the controller an AES-CCM-wrapped blob that **contains** the link key and the new base
+address. **The 16-byte link AES key is NOT derived from the ECDH secret — the host chooses it
+and sends it encrypted.** The ECDH shared secret's only job is to be the CCM *wrapping* key.
+
+**KDF from the shared secret (CONFIRMED):** the 16-byte CCM wrapping key = the **first 16
+bytes of the 32-byte X25519 shared secret, plain truncation — no hash, HKDF, or SHA.**
+Controller: `FUN_00003abc` computes the shared secret into a buffer (`FUN_000093c0`, an
+X25519 scalarmult of the stored device-priv × host-pub), then `FUN_0000909c` → `FUN_00009084
+@ 0x9084` copies exactly **4 words (16 bytes)** of it into the nRF CCM KEY field. Host mirror:
+`syncboss FUN_00047604 @ 0x47604` arms CCM with the key at host-struct `+0x61` (this is the
+"legacy nonce / connection negotiation" crypt of Q3 — the pairing wrap and the Q3 negotiation
+crypt are the *same* operation).
+
+**`PairingData` (0x11) on-wire payload = 32 bytes** (CONFIRMED from `FUN_00003abc`'s
+`FUN_00009198(payload+8, …, 0x18, …, payload[0..3], payload[4..7], 0, 0)` and host builder
+`FUN_00047604`):
+
+| payload offset | bytes | content |
+|---|---|---|
+| 0 | 8 | **CCM IV/nonce**, random, in the clear (host fills via RNG at struct `+0x88`; packet counter = 0 — the Q3 "legacy nonce") |
+| 8 | 24 | AES-128-CCM ciphertext of the 20-byte plaintext below + **4-byte MIC** |
+
+**Decrypted plaintext = 20 bytes** (`FUN_00009198` returns `len-4 = 0x14`; mismatch logs
+`"incorrect decrypted length"` @ `elk-spl 0xf11c`, `FUN_00003abc` `iVar4 != 0x14` branch):
+
+| plaintext offset | bytes | content |
+|---|---|---|
+| 0 | 4 | **new connected-link base address** (the host `netaddr`, host source `FUN_00045a6c`) |
+| 4 | 16 | **16-byte AES link key** (host source `FUN_000439bc` = `/data/misc/pulsar_aes_key.bin` or default) |
+
+The controller stores it via `FUN_000038e8 @ 0x38e8` into its paired-device record: the full
+20 bytes at record `+0x00` (so base address at `+0x00`, key at `+0x04`) and a second copy of
+the 16 key bytes at record `+0x14`. That record's key is what the connected-link CCM block
+(Q3) later loads.
+
+**Variant `0x1d` (`FUN_00003ac6`, derived-key mode):** identical decrypt, but it calls
+`FUN_000038e8(decrypted, shared_secret)` — i.e. it keeps the base address from the decrypted
+payload but sets the link key = **first 16 bytes of the ECDH shared secret** (ignoring the
+key bytes in the blob). `0x11` passes flag `0` to `FUN_000093c0` and stores the transmitted
+key; `0x1d` passes flag `1` and stores the derived key. TouchFrame should use **`0x11`** (we
+pick the key) and can ignore `0x1d`.
 
 ---
 
@@ -296,25 +345,86 @@ the clear with the negotiation packet. This is the "Must use legacy nonce" path.
 
 **Steady-state link:** there is no other software crypt call, so per-packet CCM runs inline in the
 RADIO↔CCM hardware chain; the LL updates PACKETCOUNTER and the session IV in the config block each
-packet. The exact steady-state IV derivation (session nonce from beacon bytes 6–7, beacon
-timestamp, per-packet counter — see Q1) is **INFERRED, not pinned**. It does not block decoding:
-`tools/pulsar_crypto.py` tries the candidate packings and a correct 4-byte MIC confirms the right
-one from the first captured packet once the key is known.
+packet. Two hypotheses for the steady-state IV, both **INFERRED, not pinned**: (a) the negotiation's
+8-byte random IV is **reused** for the session — `FUN_00047604` copies it from `+0x88` to `+0x99`
+right after the negotiation crypt, which is exactly what a saved session IV looks like — with only
+the packet counter advancing; or (b) the Q1 packing where the 16-bit session nonce rides the top
+bits of the counter and the IV is timestamp-derived. This does not block decoding: capture the
+negotiation packet (its first 8 payload bytes are the IV, in the clear) and run
+`tools/pulsar_crypto.py scan --key <k> --capture conn.jsonl --iv <those 8 bytes>`, which sweeps the
+counter against hypothesis (a); a correct 4-byte MIC confirms key + IV + counter from one packet.
+Without the IV, `scan` falls back to the (firmware-contradicted) session-derived guesses of (b).
 
 ---
 
 ## Q4 — Live reports and host->controller commands
 
-**Controller -> host input (INFERRED, self-describing):** input rides **Pulsar data
-packets** parsed host-side by `process_beacon_mode_pulsar_data(... spi_data_pulsar_data_t
-...)`. The controller advertises its payload layout as a **HID report descriptor** read over
-the link: `pulsar_manager_read_sync(input_id, PULSAR_PKT_ID(hid_report_descriptor), ...)`
-and a capabilities packet `pulsar_pkt_capabilities_t` / `PULSAR_PKT_ID(attachment_info)`.
-So for TouchFrame the live report layout does **not** need to be hard-coded — the controller
-emits a HID descriptor we can parse. Captouch is post-processed host-side
-(`update_captouch`). Physical inputs originate on the Renesas "deerfly" co-processor
-(`input_sampling.c`, `thumbstick.c`, `pinch.c`, trigger min/max cal) and are relayed by elk
-over SPI (`input_mcu_thread.c`, `elk_buttons.c`).
+**Controller -> host input — there is NO HID report descriptor (CORRECTED, CONFIRMED).**
+A full keyword sweep of all three images + `*.strings` finds **no** `hid`,
+`report_descriptor`, `PULSAR_PKT_ID`, `pulsar_manager_read_sync`, or `attachment_info`
+token (earlier drafts asserting a self-describing HID descriptor were ungrounded — the host
+SoC/Android side owns HID, not this firmware). Instead the controller exposes input through a
+**host-register ("hreg") table** the headset reads over Pulsar. There is therefore **no single
+packed on-air input report**: each field is an individually-addressable register value.
+
+**Report assembler = `elk-app FUN_000173bc @ 0x173bc`** (`input_mcu_thread`, CONFIRMED). Each
+cycle it (1) reads the Renesas "deerfly" input-MCU **register `0x37`** over SPI —
+`FUN_00021fd4(0x37, buf, 0x3d)`, a **61-byte** sample; (2) verifies a 4-byte checksum
+`FUN_00029f4c(buf, 0x39)` against `buf[0x39..0x3c]`; (3) re-packs the fields into elk
+host-facing registers via `FUN_0001f464(reg_id, &value)` and the edge/bit variant
+`FUN_0001f748(value, len)`. The elk hreg table is at **`0x2e7dc`** (0x10-byte entries, valid
+IDs `0..0x2d`; payload size = low byte of `entry+0xc`; ID->index check `FUN_0001cf28 @
+0x1cf28`). Two **register spaces** must not be conflated: deerfly-MCU regs (read over SPI,
+e.g. reg `0x37` = sample, reg `0x02` = present-subreport flags) vs the elk host-facing hreg
+registers below (read by the headset over Pulsar). Physical inputs originate on deerfly
+(`input_sampling.c`, `thumbstick.c`, `pinch.c`, trigger min/max cal); captouch is
+post-processed host-side (`update_captouch`).
+
+**Deerfly sample (reg `0x37`, 61 bytes) — offsets CONFIRMED, semantic labels INFERRED**
+(deerfly firmware is not in these dumps, so which analog = which axis and which bit = which
+labelled button is set there, not here). All offsets are into the 61-byte buffer; citations
+`FUN_000173bc @ 0x173bc`:
+
+| off | size | → hreg | field (CONFIRMED packing / INFERRED meaning) |
+|---|---|---|---|
+| 0x00 | 4 | reg 2 (4B) | sample counter / timestamp (INFERRED) |
+| 0x04 | bits0..4 | reg 4 (bits0-3) + reg 0x2b (bit4) | touch / proximity flags (remap CONFIRMED, meaning INFERRED) |
+| 0x05..0x14 | u16×several | reg 8 (10B) | capacitive-touch raw channels (INFERRED) |
+| 0x0f..0x1a | u16×several | reg 0x21 (12B) | cap-touch raw channels (INFERRED) |
+| 0x1b..0x20 | u8/u16 | reg 0x20 (6B) | sensor channels (INFERRED) |
+| **0x21** | 1 (8 bits) | reg 9 (4B) | **buttons** (CONFIRMED this is a button byte; bit map below) |
+| **0x22** | 1 (4 bits) | reg 9 | **buttons** (CONFIRMED) |
+| **0x23** | 12-bit | reg 3 (3B) | **analog axis A** — trigger/grip/stickX/stickY (CONFIRMED analog; which-is-which INFERRED) |
+| **0x25** | 12-bit | reg 3 | **analog axis B** (CONFIRMED analog; identity INFERRED) |
+| 0x2d..0x30 | packed | reg 0x17 (8B) | analog/aux (INFERRED) |
+| **0x31** | 12-bit | reg 0x17 | **analog axis C** (CONFIRMED analog; identity INFERRED) |
+| **0x33** | 12-bit | reg 0x17 | **analog axis D** (CONFIRMED analog; identity INFERRED) |
+| 0x35 | bits | reg 0x17 | aux (INFERRED) |
+| **0x37** | 2 | reg 0x15 (2B) | **battery** mV (INFERRED unit/scale) |
+| 0x39 | 4 | — | checksum over `[0x00:0x39]` (`FUN_00029f4c`; CRC/sum INFERRED) |
+
+The **four clean 12-bit ADC analogs at buffer `0x23 / 0x25 / 0x31 / 0x33`** are exactly the
+{trigger, grip, thumbstick-X, thumbstick-Y} set (12-bit matches the RA2E1 ADC; elk cal strings
+`db.x.min/max`, `db.y.min/max` = stick X/Y, `inner/outer` + `Pinch (%d mN, %d)` = trigger/grip
+confirm the controller has exactly these four analogs). Binding each offset to a specific axis
+needs the deerfly firmware.
+
+**Button bit remap into reg 9 (CONFIRMED math, `FUN_000173bc`)** from deerfly `b=buf[0x21]`,
+`c=buf[0x22]`: out0=b.0, out1=b.2, out2=b.4, out3=c.2, out4=b.6, out5=b.1, out6=b.3, out7=b.5,
+out8=b.7, out9=c.3, out10=c.0, out11=c.1 (12 button bits). Which output bit is A/B/X/Y/menu/
+system/stick-click is set in deerfly (UNKNOWN here).
+
+**Flag remap (CONFIRMED math)** from deerfly `buf[0x04]`: reg4.out0=in.1, out1=in.2, out2=in.0,
+out3=in.3; reg 0x2b = in.4. (Meaning touch vs proximity is INFERRED.)
+
+**IMU is a separate path (CONFIRMED):** elk pushes IMU to **reg 0xb** (12B, `FUN_00014c1c @
+0x14c1c`) and **reg 0x16** (2B, `FUN_00014c38 @ 0x14c38`) from the elk-side ICM426xx/476xx
+(`imu_thread.c`) — not part of the deerfly sample.
+
+**For TouchFrame:** to read a controller's input over the dongle, subscribe to / poll the
+hreg registers (buttons=9, analogs=3 & 0x17, touch flags=4 & 0x2b, cap-touch channels=8/0x20/
+0x21, battery=0x15, IMU=0xb/0x16). There is no descriptor to parse and no packed report to
+unpack; the deerfly byte offsets above are the pre-pack source, not on-air offsets.
 - **IMU:** TDK ICM-42686 / ICM-47688 (`icm426xx_imu.c`, `icm476xx.c`, string `ICM47688`).
   Scales/timestamp units **UNKNOWN** (in the IMU config JSON, Q5).
 - **Battery:** `GetBatteryStatus 0x2F` (prior work); host
@@ -357,20 +467,53 @@ over SPI (`input_mcu_thread.c`, `elk_buttons.c`).
 
 ---
 
-## Q6 — "Pulsar" host version check (CONFIRMED, bypassable)
+## Q6 — "Pulsar" host version check (CONFIRMED; value pinned, bypassable)
 
-- Controller refuses hosts whose Pulsar version it dislikes: event
-  `INVALID_HOST_PULSAR_VERION`, log `"Invalid host Pulsar version detected, stopping seek"`
-  (elk-app). It also emits `incompatible_version` LL counters. This is a numeric
-  compatibility gate, **not** a cryptographic one.
-- Host advertises its version in the beacon/connection negotiation; we must present a value
-  the controller accepts (value **UNKNOWN**; find it in the host beacon builder
-  `pulsar_cl_host.c` / the device's accept check in `pulsar_cl_device.c` near
-  `"Received connection rejection from host"`).
-- The analogous check on the real host is explicitly skippable
+- **The version value is `0x1701` (CONFIRMED).** The controller's Pulsar protocol/CL version
+  is a 16-bit little-endian field = on-air bytes **`01 17`**: **major/CL version = `0x01` (1)**
+  and **`pulsar_protocol_sub_version` = `0x17` (23)**. It is the **only** `0x1701` immediate in
+  the controller image and is **absent from `syncboss`** (no literal) — load-bearing evidence it
+  is the controller's own protocol generation (git `edbf4671d29b`).
+  - Written by the CL device init `elk-app FUN_00018a24`, at **`0x18b90`:
+    `movw r3,#0x1701 ; strh r3,[r4,#8]`** into the controller's connection record at
+    **RAM `0x20004ec0+8`** (`+8`=`0x01`, `+9`=`0x17`; `+0/+4`=64-bit peer ID, `+0xc`=slot,
+    `+0xd`=slot-count).
+  - Echoed outward in the connection-response builder (`elk-app FUN_00023aa8`, from **`0x23bc4`**:
+    writes `0x19`,`0x11`, then reads the connection record `0x20004ec0` and copies its fields,
+    including the `+8` version, into the outgoing packet).
+  - Cross-checks: this is exactly the discovery-advert info word `[1..4] = 01 17 hw hw` (Q1) and
+    the telemetry fields "`cl version: %u`" / "`pulsar_protocol_sub_version`"
+    (`syncboss 0x5ce10` / `0x5e564`).
+- **The seek-stop reaction is CONFIRMED.** Event enum index `0x10` = `INVALID_HOST_PULSAR_VERION`
+  (name table ~elk-app line 9814). Its handler is the **"seek" state handler** installed as a
+  state-machine callback at flash **`0x33210`** (record base `0x33200`, 0x14-byte records
+  `{state*, state*, name*, key, handler}`; name string "seek" @`0x2c8b0`); the unwind table
+  gives its real entry **`0x14964`** (Ghidra misnames it `FUN_00014960` — bytes `0x14960..63`
+  are the previous function's literal pool). On event `0x10` it allocates a log slot
+  (`bl 0x25bc4`), stores msg ptr `0x2c881` ("Invalid host Pulsar version detected, stopping
+  seek"), logs via `0x295fc`, returns action **5**, and tail-branches to the seek-stop
+  transition **`0x20b88`** (which indexes the RAM state table `0x20000390`, stride 0x14). It also
+  emits `incompatible_version` LL counters. This is a numeric compatibility gate, **not**
+  cryptographic.
+- **Where the inbound host version is compared is NOT pinned (honest gap, non-blocking).** The
+  controller's connection-negotiation accept handler (`FUN_00023aa8`, case at `0x23af8`)
+  validates only packet type (`[0]==1`), the 64-bit peer ID (`[3..10]` vs `0x20004ec0+0/+4`),
+  endpoint (`[2]&7`: 2=CONN_NEG, 3=lock), and slot (`[11]`, assert str `0x303b9`) — it reads the
+  `+8` version only to *send* it, never comparing an inbound value. The instruction that reads a
+  host version and raises event `0x10` appears to live in the low-level region Ghidra left as raw
+  bytes (~`0x20000..0x20600`, near the `"Received connection rejection from host"` handler, pool
+  str `0x2f671` @ code ~`0x20598`); the disassembler returns nothing usable there. So it is
+  unresolved whether the controller inspects an inbound host-version byte at all, or whether
+  "stopping seek" is instead triggered after the **host** rejects the controller.
+- **The analogous check on the real host is explicitly skippable**
   (`SYNCBOSS_DISABLE_FW_VERSION_CHECK`, `persist.vendor.syncbosshal.disable_fw_version_check`,
-  "normal for self-tracked controllers"), which is further evidence the gate is policy, not
-  security.
+  "normal for self-tracked controllers") — evidence the gate is policy, not security.
+- **For TouchFrame:** advertise Pulsar version **`0x1701`** (on-air `01 17`, i.e. major 1 /
+  sub 23) wherever the host version goes in the connection-negotiation CL payload, and make the
+  emulated host **never reject the controller** (emulate the skip-version-check path). Both
+  failure modes are then covered: if the controller does compare an inbound version it matches
+  its own `0x1701` generation; if the stop-seek is actually driven by a host rejection, our host
+  never issues one. A live capture is the only way to decide which, but neither blocks bring-up.
 
 ---
 
@@ -423,8 +566,15 @@ All scripts read the flattened images and `images.json` from the gitignored
 `artifacts/work/` produced by step 1; the `*.decomp.c` dumps also stay there.
 
 ## Open items (priority for the next pass)
-1. `PairingData` (0x11) decrypted payload layout + AES-key KDF from the X25519 secret
-   (elk-spl `FUN_0000934c @ 0x934c`). Closes the last Gate A UNKNOWN.
+1. ~~`PairingData` (0x11) decrypted payload layout + AES-key KDF from the X25519 secret.~~
+   **CLOSED** (Q2 "Pairing data layout + key derivation", CONFIRMED both sides). Result:
+   link key is host-chosen and sent encrypted (not derived); CCM wrapping key = first 16
+   bytes of the X25519 shared secret (truncation); payload = `[8-byte clear IV][24-byte
+   CCM(20)]`, plaintext = `[4-byte base addr][16-byte AES key]`; stored by `FUN_000038e8`;
+   `WriteAESKey 0x14` is a stub. This closes the last Gate A UNKNOWN — no live capture
+   needed for pairing. Only loose end (non-blocking, static-only): the exact extra effect of
+   the `FUN_000093c0` 0/1 flag beyond selecting the 0x11 vs 0x1d store path — Ghidra type
+   propagation did not settle on that function, but it does not change the 0x11 layout.
 2. ~~Connected-link PCNF0/1 and access-address derivation~~ — closed (Q1 "Radio
    configuration per link"). Remaining: the host `netaddr` value itself (per headset, not on
    air) — get it from a live capture (address search) or the headset's
@@ -433,9 +583,34 @@ All scripts read the flattened images and `images.json` from the gitignored
    for a live capture: confirm uplink slot anchor (350 µs + offset after the beacon start),
    DM-beacon cadence and the 4000 µs branch, beacon payload byte 0 bit 0 and byte 14
    meaning, advert words at bytes 1..4 / 13..30, pairing-link framing.
-4. CCM 13-byte nonce byte order (`FUN_0001b1a4 @ 0x1b1a4`). Lead: device builds a 64-bit
-   counter `session_nonce << 48 | beacon_timestamp + n·2000` (elk-app `0x2409c..0x240d6`,
-   then `FUN_000239fc`).
-5. Host Pulsar version value the controller accepts.
-6. HID report descriptor bytes (dump one live, or decode `PULSAR_PKT_ID(hid_report_descriptor)`
-   response builder on the controller).
+4. CCM nonce — **structure + negotiation CONFIRMED; steady-state packing still needs one live
+   MIC check** (Q3/Q4). Confirmed: the 13-byte nonce is `packetCounter[5 LE, incl. direction
+   bit] || IV[8]` (nRF HW-CCM; host CCM helper is `syncboss FUN_0001b1a4`, not the elk-app
+   `0x1b1a4` which is a battery routine), and the **negotiation** nonce is an 8-byte random IV
+   (RNG `FUN_000185d8` into config `+0x88`) with counter 0, sent in the clear in the
+   negotiation packet (`FUN_00047604`). The earlier `session_nonce<<48|timestamp @ 0x2409c`
+   lead was wrong: `0x2409c` is the beacon scheduler (`FUN_00023e54`, `n·2000+ts` window), not
+   the nonce builder. Remaining (needs a live capture, non-blocking): confirm which steady-state
+   packing is live — hypothesis (a) the saved random IV (`+0x99`) reused with an advancing
+   counter, or (b) the Q1 session-nonce-in-counter packing. `pulsar_crypto.py scan --iv <IV from
+   negotiation>` decides it in one packet. Tool already leads with (a); see Q3/Q4.
+5. ~~Host Pulsar version value the controller accepts.~~ **CLOSED** (Q6, value CONFIRMED).
+   The controller's own Pulsar protocol version = **`0x1701`** (on-air `01 17`: major 1,
+   `pulsar_protocol_sub_version` 23), the only such immediate in the controller image and
+   absent from `syncboss`; set at `elk-app 0x18b90` (`FUN_00018a24`) into connection record
+   `0x20004ec0+8`, echoed outward by `FUN_00023aa8` @ `0x23bc4`. Dongle should advertise
+   `0x1701` and never reject the controller (emulate the skippable host-side check). Remaining
+   (static-only, needs a live capture; non-blocking): the exact controller instruction that
+   reads an *inbound* host version and raises event `0x10` — it sits in a raw-byte region
+   (~`0x20000..0x20600`) Ghidra did not disassemble, so it is unconfirmed whether the
+   controller inspects an inbound version at all vs. stopping seek on a host-issued rejection.
+6. ~~HID report descriptor bytes.~~ **CLOSED** (Q4 "Controller -> host input", CONFIRMED).
+   Result: there is **no HID report descriptor and no packed report** in this firmware — the
+   controller exposes input as individual host-registers read over Pulsar. Assembler
+   `FUN_000173bc @ 0x173bc` reads the deerfly 61-byte sample (SPI reg 0x37), checksums it, and
+   re-packs into hreg regs: buttons=9, analogs (trigger/grip/stickX/stickY, four 12-bit ADCs
+   at deerfly buf 0x23/0x25/0x31/0x33)=regs 3 & 0x17, touch/prox flags=4 & 0x2b, cap-touch
+   channels=8/0x20/0x21, battery=0x15, IMU=0xb/0x16 (full table + bit remaps in Q4). Remaining
+   (static-only, needs the Renesas "deerfly" firmware or a live dump, non-blocking): the
+   axis identity of the four analogs, the button-bit -> labelled-button map, and the exact
+   meaning/scale of the touch flags, cap-touch channels, and the reg-0x15 battery unit.
