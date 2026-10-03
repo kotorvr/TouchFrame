@@ -13,6 +13,10 @@ counter, direction) is not yet pinned from the firmware (docs/PROTOCOL.md open i
 several candidate layouts and reports which one makes the 4-byte MIC verify — a correct MIC is a
 1-in-4-billion coincidence, so a single verifying packet confirms both the key and the layout.
 
+The connection-negotiation packet is the easy case (docs/PROTOCOL.md Q3): its nonce is counter 0
+plus an 8-byte IV sent in the clear in that packet. Decode it directly with `--counter 0 --iv
+<those 8 bytes>`. Steady-state packets use a per-packet counter and a session IV; use `scan`.
+
   pulsar_crypto.py selftest
   pulsar_crypto.py decode --key <32 hex> --packet <hex payload incl. 4-byte MIC> \\
       [--counter N] [--dir 0|1] [--iv <16 hex>] [--session <4 hex>] [--timestamp N]

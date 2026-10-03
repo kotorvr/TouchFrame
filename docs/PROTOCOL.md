@@ -277,8 +277,29 @@ the next thing to decode (`FUN_0000934c` output path).
   distinct nonce format is used during connection negotiation vs. the steady link.
 - **Key** = the 16-byte AES key provisioned at pairing (Q2), held in the CCM config block.
 
-Open item (UNKNOWN): exact byte order of the 13-byte CCM nonce (how pktctr/dir/IV pack) —
-read the `cfg+0x120..+0x12d` writes in `FUN_0001b1a4` against the device decrypt path.
+**CCM config block layout (CONFIRMED, standard nRF BLE-CCM; setup `FUN_0001b0a4`, crypt
+`FUN_0001b1a4`):** `CNFPTR` points at `cfg+0x110`:
+- `+0x110` KEY, 16 bytes;
+- `+0x120` PACKETCOUNTER, 5 bytes little-endian (39-bit counter; crypt writes the low 32 bits
+  from `param_7` to `+0x120` and the 5th byte from `param_8` to `+0x124`, asserting `param_8 <
+  0x80`, i.e. 7 more bits);
+- `+0x128` DIRECTION (1 byte; bit0 — host vs device);
+- `+0x129` IV, 8 bytes (crypt writes `param_5` to `+0x129` and `param_6` to `+0x12d`).
+So the 13-byte CCM nonce = `packetCounter[5 LE] || IV[8]`, with the direction bit as bit 0 of the
+byte at `+0x128` (the counter and direction live in adjacent fields, as in BLE CCM).
+
+**Connection-negotiation ("legacy") nonce (CONFIRMED, `syncboss FUN_00047604`):** the one software
+crypt call sets KEY at host-struct `+0x61`, fills an **8-byte random IV** at `+0x88` (RNG
+`FUN_000185d8`), and calls crypt with **packet counter 0** (`param_7 = param_8 = 0`), encrypting a
+20-byte blob to `+0xa1` and checking the result is 24 bytes (20 + 4 MIC). The random IV is sent in
+the clear with the negotiation packet. This is the "Must use legacy nonce" path.
+
+**Steady-state link:** there is no other software crypt call, so per-packet CCM runs inline in the
+RADIO↔CCM hardware chain; the LL updates PACKETCOUNTER and the session IV in the config block each
+packet. The exact steady-state IV derivation (session nonce from beacon bytes 6–7, beacon
+timestamp, per-packet counter — see Q1) is **INFERRED, not pinned**. It does not block decoding:
+`tools/pulsar_crypto.py` tries the candidate packings and a correct 4-byte MIC confirms the right
+one from the first captured packet once the key is known.
 
 ---
 
