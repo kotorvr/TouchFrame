@@ -27,12 +27,14 @@ those names.
 - **Period ≤ 500 000 µs, and on-time ≤ period** (CONFIRMED, validator `elk FUN_0001fbb8`).
   Anything else is rejected with `"IR LED configuration rejected: p=%lu, ot=%lu, d=%li"` and the
   old config stays.
-- **Effective duty is ~9–10 % at the very best, in practice far less** (INFERRED from CONFIRMED
-  code). Each pulse is a one-shot timer compare pair re-armed in software after the previous pulse
-  ends, and the next start is scheduled at least **700 µs** in the future
-  (`elk FUN_0001873c`: `if (min_lead < 700) min_lead = 700`). So pulses can't come closer than
-  about 775 µs apart, and the duty can't exceed ~75/800. Thermal/eye-safety design is evidently
-  "short, rare pulses": the Quest default is **19 µs every 33 333 µs (0.06 %)**.
+- **Effective duty is ~9 % at the very best** (INFERRED from CONFIRMED code). Each pulse is a
+  one-shot timer compare pair, re-armed in software after the previous pulse ends. The next start
+  is the next grid point at least **700 µs** ahead (`elk FUN_0001873c`: `if (min_lead < 700)
+  min_lead = 700`, then *one* extra period if the lead is short). With p ≥ ~800 µs a pulse can
+  land on every grid point, so duty ≤ 75/800. With p < 700 µs the floor is applied only once and
+  the lead can drop below the firmware's own 700 µs safety margin. A missed compare would starve
+  the 1 s "IR LED timeout" assert (a controller reset), so **never send p < 700 µs**. The design
+  is evidently "short, rare pulses": the Quest default is **19 µs every 33 333 µs (0.06 %)**.
 - **`ot = 0` turns the LEDs off** without stopping the LED thread (CONFIRMED,
   `elk FUN_0001554c`, `local_20 == 0` branch).
 - **Phase is defined on the host's clock** (CONFIRMED): pulse *start* is the next time `t` (≥ now
@@ -46,7 +48,7 @@ the Frame needs **strobing in sync with the Frame controller-frame exposures**: 
 schedule tap, plus dongle-clock ↔ CLOCK_MONOTONIC_RAW sync. Choose `p` equal to the
 controller-frame period (or a multiple), `d` equal to the exposure centre in dongle time mod `p`,
 and `ot` up to 75 µs. The 75 µs max is the knob that buys tolerance for sync error. A fallback with
-no sync, like many pulses per frame, doesn't work: the 700 µs re-arm floor limits it to about one
+no sync, like many pulses per frame, doesn't work: the re-arm scheduling limits it to about one
 pulse per ~0.8 ms, which only helps if the Frame exposure is ≥ ~0.8 ms.
 
 **Quest-side knobs for Gate B over the relay (no dongle):** the sensors HAL exposes a debug
@@ -182,7 +184,9 @@ ot=%lu, d=%li"`, then validates. There is no minimum period check beyond `ot ≤
 - The thread asserts `"IR LED timeout"` if no event arrives within 1000 ms. That is consistent
   with `max_p = 500 ms` (INFERRED: the period cap exists so the watchdog never trips).
 - `min_lead` = `+0x6c` copied to `+0x10`, never written after the init `memset`, so it is 0 and
-  floored to **700 µs**.
+  floored to **700 µs**. The floor adds at most one period (`if (delta < min_lead) delta += p`),
+  so for p < 700 µs the lead can stay under 700 µs. Modelled in
+  `tools/pulsar_input.py next_pulse_start`.
 
 ### 2.4 Host-side LED APIs that are *not* the controller IR LEDs
 `syncboss_led_set_on_time_and_current(_v2/_sequence)`, `syncboss_led_*` (`0x6bec8..0x6cabc`) use
