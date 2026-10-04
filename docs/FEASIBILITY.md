@@ -166,3 +166,8 @@ Sessions, gates and fallbacks for phases 2–5: [MASTER-PLAN.md](MASTER-PLAN.md)
   - The deerfly firmware *is* in the dumps (Cortex-M23). PROTOCOL said otherwise.
   - The relay-based Gate B can only give an early positive, never a negative, because the Quest strobes the LEDs on its own camera schedule.
   - Work is split into RE, build, audit and hardware sessions.
+- **2026-10-04: first session results** (reports in [docs/re/](re/), folded into PROTOCOL / FRAME-TRACKER):
+  - **RE-2:** the Touch Plus LEDs **can't stay on**. cmd 0x28 clamps the on-time to 75 µs, and the pulse phase is set on the host clock, so 6DoF needs the dongle to flash inside the Frame's camera exposures. Also pinned: the IMU (ntf 1, 500 Hz, ±32 g / ±4000 dps), the input map, haptics, and the per-unit cal read (cmd 0x2b). Several Q4 claims were corrected.
+  - **AUDIT-1:** the 0x47604 question is settled (pairing wrap only). CCM runs on **uplink only**. The negotiation and steady-state nonces are pinned. The on-air SPL command byte is `(num<<1)|read`. A real Quest uses per-device keys (0x1d), so its sessions can't be decrypted by sniffing.
+  - **DEV-1 (on device):** Touch-only **works**: our driver can create the tracker queues itself. Relay Gate B: 0 hits, as expected. No version drift. **The Frame has no CDC ACM**, so the dongle talks over USB HID (hidraw). It has one USB-C port. With the 8-LED model, XRService logs ~300 "neighbor" errors/s; RE-3b is investigating.
+  - RE-3 was stopped by a safety check; its exposure-hook goal is replaced by a closed-loop LED phase sweep in BUILD-2.

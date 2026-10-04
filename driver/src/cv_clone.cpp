@@ -14,6 +14,13 @@
 //    same frame as the clone's, so the clone error needs no frame guesses.
 // The real controller's deviceId changes per connection; it is found by correlating |angular
 // velocity| (frame-independent) with the SteamVR pose, or set with cv_clone_ref_device_id.
+//
+// Touch-only experiment (docs/re/DEV-1.md, G-Touch-only), both off by default:
+//  - cv_clone_imu = "static": no real device needed (cv_clone_serial must still be non-empty, any
+//    value); push a resting IMU (gravity on +Y, zero gyro) so XRService gets a stream from a
+//    device that never existed in SteamVR.
+//  - cv_create_shared_queues = true: CvTracker Creates /xrservice/controller/{event,data} itself
+//    when no Frame controller has created them.
 #include "cv_clone.h"
 
 #include <algorithm>
@@ -163,7 +170,10 @@ public:
         ref_id_ = uint32_t(GetIntSetting("cv_clone_ref_device_id", 0));
         probe_ = GetBoolSetting("cv_clone_probe", true);
         accel_sign_ = GetFloatSetting("cv_clone_accel_sign", 1.0f);
-        mirror_imu_ = GetStringSetting("cv_clone_imu") == "mirror";
+        std::string imu_mode = GetStringSetting("cv_clone_imu");
+        mirror_imu_ = imu_mode == "mirror";
+        static_imu_ = imu_mode == "static";
+        bool create_queues = GetBoolSetting("cv_create_shared_queues", false);
         std::string csv = GetStringSetting("cv_clone_csv");
         std::string role = GetStringSetting("cv_clone_role");
         if (device_id_ < 16 || device_id_ > 63) {
@@ -198,7 +208,8 @@ public:
         Log("cvclone: config %s: serial %s, model %s, role %s, %d LEDs, %zu bytes; clone device id %u, imu %s, probe %d",
             path.c_str(), cfg_.serial.c_str(), cfg_.model_number.c_str(), cfg_.role.c_str(), cfg_.led_count,
             cfg_.json.size(), device_id_,
-            mirror_imu_ ? "mirror" : "synth", int(probe_));
+            mirror_imu_ ? "mirror" : static_imu_ ? "static" : "synth", int(probe_));
+        if (create_queues) Log("cvclone: experiment cv_create_shared_queues ON");
         if (!csv.empty()) {
             csv_ = fopen(csv.c_str(), "w");
             if (csv_) fprintf(csv_, "# kind,fields... see cv_clone.cpp\n");
@@ -210,6 +221,7 @@ public:
         o.config_json = cfg_.json;
         o.serial = cfg_.serial;
         o.tag = "cvclone";
+        o.create_shared_queues = create_queues;
         tracker_ = std::make_unique<CvTracker>(o, [this](const CvPose& p) { OnClonePose(p); });
         if (!tracker_->Start()) return false;
         running_ = true;
@@ -262,6 +274,22 @@ private:
             clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next, nullptr);
             double now = NowSeconds();
 
+            if (static_imu_) {
+                // A device at rest: specific force +g on the IMU's +Y, no rotation.
+                float accel[3] = {0, float(kG), 0}, gyro[3] = {0, 0, 0};
+                bool sent = tracker_->PushImu(now, accel, gyro);
+                {
+                    std::lock_guard<std::mutex> lk(mu_);
+                    last_synth_[0] = {accel[0], accel[1], accel[2]};
+                    last_synth_[1] = {0, 0, 0};
+                    if (csv_ && sent) fprintf(csv_, "imu,%.6f,0,%.4f,0,0,0,0\n", now, kG);
+                }
+                if (now - last_report > 2.0) {
+                    last_report = now;
+                    Report(now, false);
+                }
+                continue;
+            }
             if (real_index_ == vr::k_unTrackedDeviceIndexInvalid) {
                 if (now - last_find > 2.0) {
                     last_find = now;
@@ -563,7 +591,7 @@ private:
     // config / settings
     std::string serial_match_;
     uint32_t device_id_ = 40, ref_id_ = 0;
-    bool probe_ = true, mirror_imu_ = false;
+    bool probe_ = true, mirror_imu_ = false, static_imu_ = false;
     float accel_sign_ = 1.0f;
     ControllerConfig cfg_;
     Pose imu_from_head_, head_from_imu_;

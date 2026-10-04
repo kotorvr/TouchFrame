@@ -169,6 +169,11 @@ void CvTracker::Stop() {
         Log("%s: sent disconnect for device %u", opt_.tag, opt_.device_id);
     }
     if (pose_thread_.joinable()) pose_thread_.join();
+    // Experiment: queues we created are ours to destroy (driver_cv destroys its own at shutdown).
+    if (created_event_ && event_q_) Log("%s: destroyed %s (err %d)", opt_.tag, kControllerEventQueue, int(bq_->Destroy(event_q_)));
+    if (created_data_ && data_q_) Log("%s: destroyed %s (err %d)", opt_.tag, kControllerDataQueue, int(bq_->Destroy(data_q_)));
+    created_event_ = created_data_ = false;
+    event_q_ = data_q_ = 0;
     if (pose_q_) {
         auto e = bq_->Destroy(pose_q_);
         Log("%s: destroyed %s (err %d)", opt_.tag, PoseQueueName(opt_.device_id).c_str(), int(e));
@@ -220,6 +225,21 @@ void CvTracker::SetupLoop() {
             BlockQueueHandle_t h = 0;
             if (!event_q_ && (ee = bq_->Connect(&h, kControllerEventQueue)) == BlockQueueError_None) event_q_ = h;
             if (!data_q_ && (de = bq_->Connect(&h, kControllerDataQueue)) == BlockQueueError_None) data_q_ = h;
+            if (opt_.create_shared_queues) {
+                // Experiment: driver_cv's own Create parameters (FRAME-TRACKER §8.2).
+                if (!event_q_ && ee == BlockQueueError_QueueNotFound) {
+                    ee = bq_->Create(&h, kControllerEventQueue, sizeof(ControllerEventBlock),
+                                     kControllerQueueHeaderSize, kControllerQueueBlockCount, 0);
+                    Log("%s: experiment: Create %s -> err %d", tag, kControllerEventQueue, int(ee));
+                    if (ee == BlockQueueError_None) event_q_ = h, created_event_ = true;
+                }
+                if (!data_q_ && de == BlockQueueError_QueueNotFound) {
+                    de = bq_->Create(&h, kControllerDataQueue, sizeof(ControllerImuBlock),
+                                     kControllerQueueHeaderSize, kControllerQueueBlockCount, 0);
+                    Log("%s: experiment: Create %s -> err %d", tag, kControllerDataQueue, int(de));
+                    if (de == BlockQueueError_None) data_q_ = h, created_data_ = true;
+                }
+            }
             if (!event_q_ || !data_q_) {
                 if (now - last_wait_log > 30) {
                     Log("%s: waiting for a Steam Frame controller to create the shared queues "
@@ -237,6 +257,7 @@ void CvTracker::SetupLoop() {
         if (re == BlockQueueError_InvalidHandle || re == BlockQueueError_QueueNotFound) {
             Log("%s: event queue went away (err %d); reconnecting", tag, int(re));
             event_q_ = data_q_ = 0;
+            created_event_ = created_data_ = false;
             continue;
         }
         if (!has_reader) {
