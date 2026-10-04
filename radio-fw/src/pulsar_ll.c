@@ -2,6 +2,8 @@
 
 #include <string.h>
 
+#include "crypto.h"
+
 // elk-app table 0x32504 (FUN_00028ad0 +0x15e)
 static const uint16_t kSlotOffset[PULSAR_SLOTS] = {0, 225, 525, 825, 1125};
 
@@ -61,4 +63,15 @@ bool pulsar_dm_next(pulsar_dm_t* dm, uint8_t* announce) {
     // byte 0 bits 1..2 can only say 1..3 periods ahead; further out reads as "none"
     *announce = dm->countdown + 1 <= 3 ? (uint8_t)(dm->countdown + 1) : 0;
     return false;
+}
+
+void pulsar_nonce_legacy(uint16_t session_nonce, uint64_t beacon_ts, uint8_t nonce[13]) {
+    uint64_t iv = (beacon_ts & 0xFFFFFFFFFFFFull) | (uint64_t)session_nonce << 48;
+    uint8_t b[8];
+    for (int i = 0; i < 8; i++) b[i] = (uint8_t)(iv >> (8 * i));
+    pulsar_nonce(0, 0, b, nonce);
+}
+
+void pulsar_nonce_steady(uint32_t counter, const uint8_t iv[8], uint8_t nonce[13]) {
+    pulsar_nonce(counter, 0, iv, nonce);
 }

@@ -54,6 +54,15 @@ typedef struct {
 void pulsar_dm_init(pulsar_dm_t* dm, uint32_t netaddr);
 bool pulsar_dm_next(pulsar_dm_t* dm, uint8_t* announce);
 
+// Connected-link CCM nonces (docs/re/AUDIT.md A2/A3; PROTOCOL Q3). CCM runs on UPLINK ONLY (A4):
+// beacons and downlink CL data are plaintext. Direction bit always 0 (A17).
+// Legacy / negotiation nonce: packet counter 0, IV = session_nonce << 48 | beacon_ts48 (u64 LE), the
+// timestamp of the beacon that starts the period the uplink is sent in. Used until the accept.
+void pulsar_nonce_legacy(uint16_t session_nonce, uint64_t beacon_ts, uint8_t nonce[13]);
+// Steady state: per-slot u32 counter (0 after the accept) and the 8-byte IV the controller sent in
+// its connection request.
+void pulsar_nonce_steady(uint32_t counter, const uint8_t iv[8], uint8_t nonce[13]);
+
 // Airtime of a Nrf_2Mbit packet: 1 preamble + 5 address + s0 + 1 LENGTH + payload + 3 CRC bytes.
 static inline uint32_t pulsar_airtime_us(uint8_t s0len, uint8_t payload_len) {
     return (uint32_t)(1 + 5 + s0len + 1 + payload_len + 3) * 4u;

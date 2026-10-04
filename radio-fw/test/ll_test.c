@@ -5,6 +5,8 @@
 //   ll_test unpair <shared 64 hex> <payload 64 hex>                         -> "netaddr key" or "fail"
 //   ll_test advert <device_id>                                              -> 32 bytes hex
 //   ll_test dm <netaddr> <periods>                                          -> announce per period
+//   ll_test legacy <session> <beacon_ts>                                    -> 13-byte nonce hex
+//   ll_test steady <counter> <iv 16 hex>                                    -> 13-byte nonce hex
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -86,6 +88,19 @@ int main(int argc, char** argv) {
             printf("%s ", is_dm ? "D" : (char[2]){(char)('0' + ann), 0});
         }
         printf("\n");
+        return 0;
+    }
+    if (argc == 4 && !strcmp(argv[1], "legacy")) {
+        uint8_t n[13];
+        pulsar_nonce_legacy((uint16_t)strtoul(argv[2], 0, 0), strtoull(argv[3], 0, 0), n);
+        hex(n, 13);
+        return 0;
+    }
+    if (argc == 4 && !strcmp(argv[1], "steady")) {
+        uint8_t n[13], iv[8];
+        unhex(argv[3], iv, 8);
+        pulsar_nonce_steady((uint32_t)strtoul(argv[2], 0, 0), iv, n);
+        hex(n, 13);
         return 0;
     }
     return 2;

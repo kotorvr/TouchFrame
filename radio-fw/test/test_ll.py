@@ -57,6 +57,16 @@ adv = bytes.fromhex(run("advert", 0x1122334455667788))
 assert len(adv) == 32 and adv[0] == 2 and adv[1:3] == b"\x01\x17" and adv[5:13] == (0x1122334455667788).to_bytes(8, "little")
 print("advert: type 2, version 01 17, device id at [5..12]")
 
+# docs/re/AUDIT.md A2: legacy nonce = 00 00 00 00 00 || ts[0..5] LE || session_nonce LE;
+# A3: steady = counter (u32 LE, 5th byte 0) || the controller's IV
+for _ in range(50):
+    sess, ts = rnd.getrandbits(16), rnd.getrandbits(52)
+    want = bytes(5) + (ts & (1 << 48) - 1).to_bytes(6, "little") + sess.to_bytes(2, "little")
+    assert bytes.fromhex(run("legacy", sess, ts)) == want
+    ctr, iv = rnd.getrandbits(32), os.urandom(8)
+    assert bytes.fromhex(run("steady", ctr, iv.hex())) == ctr.to_bytes(5, "little") + iv
+print("nonces: legacy and steady-state layouts match AUDIT A2/A3")
+
 for _ in range(50):
     shared, key, iv = os.urandom(32), os.urandom(16), os.urandom(8)
     netaddr = rnd.getrandbits(32)
