@@ -511,6 +511,26 @@ static void scenario_real_formats(void) {
     CHECK(mic_ok > 0, "real mode decrypted no uplink");
 }
 
+static void scenario_real_conn(void) {
+    printf("scenario: real connection request + negotiation (CONN_NEG, LOCK), learned CCM direction\n");
+    C.plat.radio_halt(&C.plat);
+    start_fake(LINK_FAKE_PAIRED | LINK_FAKE_REAL_CONN, 0);
+    size_t mark = H.nev;
+    for (int i = 0; i < 300 && !find(&H, EVT_CONN, mark, 9, LINK_SLOT_CONNECTED); i++) run(10000);
+    CHECK(find(&H, EVT_CONN, mark, 9, LINK_SLOT_NEGOTIATING), "real: never negotiating");
+    CHECK(find(&H, EVT_CONN, mark, 9, LINK_SLOT_CONNECTED), "real: never connected");
+    int s = -1;
+    for (int i = 0; i < PULSAR_SLOTS; i++)
+        if (H.host->slot[i].device_id == FAKE_ID) s = i;
+    CHECK(s >= 0 && C.ctrl->accepted && C.ctrl->slot == s, "real: fake slot %u vs host %d", C.ctrl->slot, s);
+    CHECK(s >= 0 && H.host->slot[s].dir == 1, "real: CCM direction not learned");
+    run(500000);
+    CHECK(s >= 0 && H.host->slot[s].state == LINK_SLOT_CONNECTED && H.host->slot[s].rx_bad_mic == 0,
+          "real: link not held (%u bad MICs)", s >= 0 ? H.host->slot[s].rx_bad_mic : 0);
+    link_result_t r = HOST_CMD(CMD_REG_READ, link_reg_cmd_t, .slot = (uint8_t)s, .reg = 0x2f);
+    CHECK(r.status == LINK_ERR_PENDING_RE, "real: register read %u", r.status);
+}
+
 static link_result_t start_stored(void) {
     link_host_start_t s = {.tag = tag_n++, .flags = LINK_HOST_STORED | LINK_HOST_DM_BEACONS | LINK_HOST_PLACEHOLDER |
                                                     LINK_HOST_COMPACT,
@@ -641,6 +661,7 @@ int main(int argc, char** argv) {
     scenario_loss_and_outage();
     scenario_disconnect_forget();
     scenario_real_formats();
+    scenario_real_conn();
     scenario_stored();
     scenario_bad_args();
     if (failures) {

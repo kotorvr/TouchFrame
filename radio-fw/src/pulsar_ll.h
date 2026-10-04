@@ -12,6 +12,15 @@
 #define PULSAR_BEACON_MAX_LEN 50       // "Beacon length too large" (<= 0x32)
 #define PULSAR_UPLINK_MAX_LEN 126      // LL_DEV_MAX_PAYLOAD_LEN
 #define PULSAR_SLOTS 5
+
+// Beacon byte 14 (whose downlink rides this beacon) and byte 15 (ack bitmap) are indexed by CL
+// endpoint, 1 << endpoint, endpoints 1..4 (docs/re/LINK.md §4, CONFIRMED). Radio slots are 0..4
+// (TX prefix slot + 1). Which endpoint a slot has is INFERRED: endpoint = slot + this offset (1:
+// endpoints start at TRANSPORT_ENDPOINT_START = 1). One capture settles it; rebuild with -D to try 0.
+#ifndef PULSAR_ENDPOINT_OFFSET
+#define PULSAR_ENDPOINT_OFFSET 1
+#endif
+#define PULSAR_SLOT_BIT(slot) ((uint8_t)(1u << ((slot) + PULSAR_ENDPOINT_OFFSET)))
 #define PULSAR_SLOT_BASE_US 350        // first uplink slot starts this long after the beacon anchor
 #define PULSAR_VERSION 0x1701          // Q6: on air 01 17
 #define PULSAR_S0 0x04                 // connected-link S0 byte
@@ -62,6 +71,11 @@ void pulsar_nonce_legacy(uint16_t session_nonce, uint64_t beacon_ts, uint8_t non
 // Steady state: per-slot u32 counter (0 after the accept) and the 8-byte IV the controller sent in
 // its connection request.
 void pulsar_nonce_steady(uint32_t counter, const uint8_t iv[8], uint8_t nonce[13]);
+// The CCM direction bit (nonce bit 39). AUDIT A17: never written, so 0; tools/pulsar_host.py's
+// steady_state_nonce defaults to 1. The host learns it per controller from the first request.
+static inline void pulsar_nonce_dir(uint8_t nonce[13], uint8_t dir) {
+    nonce[4] = (uint8_t)((nonce[4] & 0x7F) | (dir ? 0x80 : 0));
+}
 
 // Airtime of a Nrf_2Mbit packet: 1 preamble + 5 address + s0 + 1 LENGTH + payload + 3 CRC bytes.
 static inline uint32_t pulsar_airtime_us(uint8_t s0len, uint8_t payload_len) {

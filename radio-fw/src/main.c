@@ -352,7 +352,7 @@ static void send_hello(uint8_t tag) {
     h.version = LINK_VERSION;
     h.mode = mode;
     h.caps = LINK_CAP_SNIFFER | LINK_CAP_HOST | LINK_CAP_FAKE_CTRL | LINK_CAP_PLACEHOLDER | LINK_CAP_HID |
-             LINK_CAP_REAL_PAIRING | (store.ok ? LINK_CAP_STORE : 0);
+             LINK_CAP_REAL_PAIRING | LINK_CAP_REAL_CONN_NEG | LINK_CAP_REAL_NONCE | (store.ok ? LINK_CAP_STORE : 0);
     h.build = BUILD_ID;
     h.dongle_id = hal_device_id();
     h.now_us = clock_now64();

@@ -23,6 +23,7 @@
 #define HOST_DL_MAX_TRIES 60
 #define HOST_CTR_WINDOW 32    // uplink counters tried past the expected one (lost uplinks)
 #define HOST_TX_LEAD_US 150   // a beacon is planned at least this long before it goes out
+#define HOST_REAL_DL_REPEATS 4 // real formats: no CL ack is known, so each downlink goes out this often
 
 typedef struct {
     uint64_t t_us;
@@ -50,6 +51,7 @@ typedef struct {
     uint16_t input_seq, imu_seq;
     uint8_t last_ul_seq;
     bool steady;             // steady-state CCM: iv + per-slot counter (after the accept was queued)
+    uint8_t dir;             // CCM direction bit this controller uses (learned from its request)
     uint8_t iv[8];
     uint32_t ctr;            // next expected uplink counter
     host_dl_t dlq[HOST_DLQ];

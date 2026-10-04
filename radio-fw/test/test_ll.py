@@ -67,6 +67,16 @@ for _ in range(50):
     assert bytes.fromhex(run("steady", ctr, iv.hex())) == ctr.to_bytes(5, "little") + iv
 print("nonces: legacy and steady-state layouts match AUDIT A2/A3")
 
+# docs/re/LINK.md §4: the host's negotiation packet (CONN_NEG, LOCK) and the controller's request
+for _ in range(50):
+    dev, slot, ep = rnd.getrandbits(64), rnd.randrange(5), rnd.choice((H.EP_CONN_NEG, H.EP_LOCK))
+    pkt = bytes.fromhex(run("conn", dev, slot, ep))
+    assert pkt == H.build_conn_negotiation(dev, slot, endpoint=ep), pkt.hex()
+    iv = os.urandom(8)
+    req = H.parse_conn_request(bytes.fromhex(run("req", dev, iv.hex())))
+    assert (req["device_id"], req["version"], req["steady_iv"], req["format"]) == (dev, 0x1701, iv, 2), req
+print("connection: negotiation packets identical to pulsar_host.py; requests parse with pulsar_host.py")
+
 for _ in range(50):
     shared, key, iv = os.urandom(32), os.urandom(16), os.urandom(8)
     netaddr = rnd.getrandbits(32)

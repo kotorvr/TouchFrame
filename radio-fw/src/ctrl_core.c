@@ -78,6 +78,10 @@ void ctrl_start(ctrl_t* c, const uint8_t* body, uint32_t len) {
         c->state = CTRL_ADVERTISING;
     }
     plat->random(plat, c->iv, sizeof c->iv);
+    if (f.flags & LINK_FAKE_REAL_CONN) {
+        c->fmt = &cl_real;
+        c->dir = 1;  // as tools/pulsar_host.py's steady_state_nonce default: exercises the host's learning
+    }
     plat->emit(plat, EVT_RESULT, &r, sizeof r, NULL, 0);
     plat->kick(plat);
 }
@@ -170,10 +174,14 @@ static void build_uplink(ctrl_t* c, uint64_t now, radio_op_t* op) {
     uint8_t pt[CL_UP_MAX], nonce[PULSAR_NONCE_LEN];
     int n = c->fmt->encode(&m, pt, sizeof pt);
     uint8_t s = tx_slot(c);
-    if (n < 0) n = 0;
+    if (n < 0) {  // nothing this format can say (real formats after the accept): one filler byte
+        pt[0] = 0xFF;
+        n = 1;
+    }
     // uplink CCM (the only CCM on the connected link): legacy nonce until the accept, then ours
     if (c->accepted) pulsar_nonce_steady(c->ctr++, c->iv, nonce);
     else pulsar_nonce_legacy(c->session_nonce, c->beacon_ts, nonce);
+    pulsar_nonce_dir(nonce, c->dir);
     c->plat->ccm(c->plat, true, c->key, nonce, pt, (uint8_t)n, op->payload);
     op->len = (uint8_t)(n + PULSAR_MIC_LEN);
     op->kind = RADIO_OP_TX;
@@ -251,6 +259,7 @@ bool ctrl_next_op(ctrl_t* c, uint64_t now, radio_op_t* op) {
 static void on_downlink(ctrl_t* c, const cl_msg_t* m) {
     if (m->type == CL_CONN_ACCEPT) {
         if (m->u.conn.device_id != c->device_id || m->u.conn.slot >= PULSAR_SLOTS) return;
+        if (m->u.conn.endpoint == CL_EP_CONN_NEG) return;  // real: wait for the LOCK that follows
         if (!c->accepted) {
             note(c, EVT_CONN, LINK_SLOT_CONNECTED, m->u.conn.slot, 0);
             c->ctr = 0;  // the controller resets its TX counter at the accept (AUDIT A3)
@@ -336,11 +345,11 @@ static void on_beacon(ctrl_t* c, const radio_rx_t* rx, const pulsar_beacon_t* b)
     c->heard = true;
     c->beacons_heard++;
     if (c->reply_reg_sent) {  // the ack bitmap covers what we sent last period
-        if (b->ack_mask & (1u << tx_slot(c))) c->reply_reg_pending = false;
+        if (b->ack_mask & PULSAR_SLOT_BIT(tx_slot(c))) c->reply_reg_pending = false;
         c->reply_reg_sent = false;
     }
     uint8_t addressed = tx_slot(c);
-    if (rx->len > PULSAR_BEACON_HDR_LEN && (b->cl_slot_mask & (1u << addressed))) {
+    if (rx->len > PULSAR_BEACON_HDR_LEN && (b->cl_slot_mask & PULSAR_SLOT_BIT(addressed))) {
         cl_msg_t m;  // downlink CL data is plaintext (AUDIT A4)
         if (c->fmt->decode(rx->payload + PULSAR_BEACON_HDR_LEN, rx->len - PULSAR_BEACON_HDR_LEN, CL_DIR_DOWN, &m))
             on_downlink(c, &m);

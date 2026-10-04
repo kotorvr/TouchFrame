@@ -20,14 +20,42 @@ static uint64_t get64(const uint8_t* p) { return (uint64_t)get32(p) | (uint64_t)
 
 //------------------------------------------------------------------ real formats
 
-// TODO(RE-1, MASTER-PLAN 3.1.1-2): the host side of connection negotiation (accept / slot
-// assignment, the 36-byte beacon variant), CL/TL framing, hreg read / write / subscribe.
-// TODO(RE-2 formats exist in docs/re/PERIPHERALS.md; they need RE-1's transport): LED cmd 0x28
+// Connection negotiation, host -> controller (docs/re/LINK.md §4, the device accept handler elk-app
+// 0x23aa8): [0] 1, [1] 0 (INFERRED), [2] endpoint (CL_EP_CONN_NEG, then CL_EP_LOCK), [3..10] the
+// controller's device id, [11] the radio slot we assign (0..4), [12..13] version 0x1701. As
+// tools/pulsar_host.py build_conn_negotiation. INFERRED: that these 14 bytes alone (not the 26-byte
+// record body syncboss copies, CL length 36) are enough; the device validates only [0], [2], [3..11].
+#define REAL_CONN_TYPE 1
+#define REAL_CONN_LEN 14
+#define REAL_REQ_LEN 25
+// TODO(RE-1, one capture): the TL header for register read / write / subscribe (LINK.md §3: command
+// register ids 0x05..0xb4) and notifications (0x14 wrapper stripped, ntf chunk stream).
+// TODO(RE-2 formats exist in docs/re/PERIPHERALS.md; they need that transport): LED cmd 0x28
 // {u32 period_us >= 700, u32 ontime_us <= 75, i32 centre_us on the host clock}; haptics 0x97 /
-// 0xa0 {amp, u16 Hz 40..561} / 0x9d ADPCM (each stops after 2 s); input/IMU arrive as notification
-// chunks after cmd 9 (IMU ntf 1 = u48 timestamp + 6 x i16 at 500 Hz, scales from cmd 0x32).
-static int real_encode(const cl_msg_t* m, uint8_t* out, int max) {
-    (void)m, (void)out, (void)max;
+// 0xa0 {amp, u16 Hz 40..561} / 0x9d ADPCM (each stops after 2 s; send 0x97 at duration_ms when
+// shorter); input/IMU arrive as notification chunks after cmd 9 (IMU ntf 1 = u48 timestamp + 6 x
+// i16 at 500 Hz, scales from cmd 0x32).
+static int real_encode(const cl_msg_t* m, uint8_t* b, int max) {
+    if (m->type == CL_CONN_ACCEPT) {
+        if (max < REAL_CONN_LEN) return CL_TOO_BIG;
+        memset(b, 0, REAL_CONN_LEN);
+        b[0] = REAL_CONN_TYPE;
+        b[2] = (uint8_t)(m->u.conn.endpoint & 7);
+        put64(b + 3, m->u.conn.device_id);
+        b[11] = m->u.conn.slot;
+        put16(b + 12, m->u.conn.version);
+        return REAL_CONN_LEN;
+    }
+    if (m->type == CL_CONN_REQ) {  // the request as real_decode reads it (the fake controller sends it)
+        if (max < REAL_REQ_LEN) return CL_TOO_BIG;
+        memset(b, 0, REAL_REQ_LEN);
+        b[1] = 0x11;
+        put64(b + 2, m->u.conn.device_id);
+        put16(b + 10, m->u.conn.version);
+        b[14] = 1;  // slots requested
+        memcpy(b + 15, m->u.conn.iv, 8);
+        return REAL_REQ_LEN;
+    }
     return CL_PENDING_RE;
 }
 
@@ -38,7 +66,18 @@ static int real_encode(const cl_msg_t* m, uint8_t* out, int max) {
 // TODO(RE-1): input / IMU / hreg uplinks.
 static bool real_decode(const uint8_t* b, int n, uint8_t dir, cl_msg_t* m) {
     memset(m, 0, sizeof(*m));
-    if (dir != CL_DIR_UP || n < 23 || b[0] != 0 || (b[1] >> 3) != 2) return false;
+    if (dir == CL_DIR_DOWN) {  // a negotiation packet, checked like the device accept handler does
+        uint8_t ep = n >= REAL_CONN_LEN ? b[2] & 7 : 0;
+        if (b[0] != REAL_CONN_TYPE || (ep != CL_EP_CONN_NEG && ep != CL_EP_LOCK) || b[11] >= PULSAR_SLOTS)
+            return false;
+        m->type = CL_CONN_ACCEPT;
+        m->u.conn.endpoint = ep;
+        m->u.conn.device_id = get64(b + 3);
+        m->u.conn.slot = b[11];
+        m->u.conn.version = get16(b + 12);
+        return true;
+    }
+    if (n < 23 || b[0] != 0 || (b[1] >> 3) != 2) return false;
     m->type = CL_CONN_REQ;
     m->u.conn.device_id = get64(b + 2);
     m->u.conn.version = get16(b + 10);

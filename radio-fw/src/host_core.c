@@ -187,7 +187,7 @@ static bool beacon_op(host_t* h, uint64_t now, radio_op_t* op) {
         if (h->prep.ready) {
             barrier();
             if (h->prep.period == period) {
-                op->payload[14] = (uint8_t)(1u << h->prep.slot);
+                op->payload[14] = PULSAR_SLOT_BIT(h->prep.slot);
                 memcpy(op->payload + n, h->prep.data, h->prep.len);
                 n = (uint8_t)(n + h->prep.len);
                 h->prep.ready = false;
@@ -258,7 +258,7 @@ bool host_next_op(host_t* h, uint64_t now, radio_op_t* op) {
 
 void host_on_rx(host_t* h, const radio_rx_t* rx) {
     if (rx->crc_ok && rx->rxmatch >= 1 && rx->rxmatch <= PULSAR_SLOTS && !pairing_active(h))
-        h->ack_mask |= (uint8_t)(1u << (rx->rxmatch - 1));
+        h->ack_mask |= PULSAR_SLOT_BIT(rx->rxmatch - 1);
     if (pairing_active(h) && h->pair_state != LINK_PAIR_SCANNING && rx->crc_ok) h->pair_tx_ready = false;
     uint32_t head = h->ring_head, next = (head + 1) & (HOST_RX_RING - 1);
     if (next == h->ring_tail) {
@@ -417,6 +417,10 @@ static void dl_prepare(host_t* h) {
         if (!sl->dlq_len) continue;
         if (sl->head_sent && period < sl->head_sent_period + HOST_DL_RETRY_PERIODS) continue;
         host_dl_t* d = &sl->dlq[sl->dlq_head];
+        if (h->fmt->real && sl->head_tries >= HOST_REAL_DL_REPEATS) {  // sent often enough
+            dl_pop(sl);
+            continue;
+        }
         if (sl->head_tries >= HOST_DL_MAX_TRIES) {  // never acknowledged: give up on it
             if (d->msg.type == CL_REG_READ || d->msg.type == CL_REG_WRITE)
                 reg_event(h, now, d->msg.u.reg.tag, s, d->msg.u.reg.reg,
@@ -478,20 +482,6 @@ static void on_conn_req(host_t* h, uint8_t rx_slot, const cl_msg_t* m) {
     }
     host_slot_t* sl = &h->slot[s];
     sl->version = m->u.conn.version;
-    if (h->fmt->real) {
-        // TODO(RE-1): the accept. Until then, report the (decrypted, so key + legacy nonce are right)
-        // request once a second: that alone proves pairing, key and nonce on hardware day.
-        uint64_t now = h->plat->now_us(h->plat);
-        if (h->refused_id == m->u.conn.device_id && now - h->refused_us < 1000000) return;
-        h->refused_id = m->u.conn.device_id;
-        h->refused_us = now;
-        char buf[120];
-        snprintf(buf, sizeof buf, "controller %08lx%08lx v%04x requests a connection (slot %u); accept pending RE-1",
-                 (unsigned long)(m->u.conn.device_id >> 32), (unsigned long)m->u.conn.device_id,
-                 m->u.conn.version, s);
-        text(h, buf);
-        return;
-    }
     if (sl->accept_queued) return;
     if (sl->state != LINK_SLOT_NEGOTIATING) {
         dlq_clear(sl);
@@ -503,10 +493,18 @@ static void on_conn_req(host_t* h, uint8_t rx_slot, const cl_msg_t* m) {
     acc.type = CL_CONN_ACCEPT;
     acc.u.conn.device_id = sl->device_id;
     acc.u.conn.slot = (uint8_t)s;
-    acc.u.conn.version = PULSAR_VERSION;
-    sl->accept_queued = dl_push(h, (uint8_t)s, &acc, rx_slot);
+    acc.u.conn.version = PULSAR_VERSION;  // never anything else (PROTOCOL Q6)
+    if (h->fmt->real) {  // LINK.md §4: CONN_NEG, then LOCK
+        acc.u.conn.endpoint = CL_EP_CONN_NEG;
+        sl->accept_queued = dl_push(h, (uint8_t)s, &acc, rx_slot);
+        acc.u.conn.endpoint = CL_EP_LOCK;
+        sl->accept_queued = sl->accept_queued && dl_push(h, (uint8_t)s, &acc, rx_slot);
+    } else {
+        sl->accept_queued = dl_push(h, (uint8_t)s, &acc, rx_slot);
+    }
     if (sl->accept_queued) {  // the controller restarts its counter when the accept arrives
         memcpy(sl->iv, m->u.conn.iv, 8);
+        sl->dir = h->slot[rx_slot].dir;  // learned from this request, which may have come in on another slot
         sl->ctr = 0;
         sl->steady = true;
     }
@@ -522,10 +520,6 @@ static uint64_t unwrap32(uint64_t ref, uint32_t low) {
 
 static void on_stream(host_t* h, uint8_t s, const host_rx_t* r, const cl_msg_t* m) {
     host_slot_t* sl = &h->slot[s];
-    if (sl->state == LINK_SLOT_NEGOTIATING || (sl->state == LINK_SLOT_LOST && sl->allowed)) {
-        sl->accept_queued = false;
-        conn_event(h, s, LINK_SLOT_CONNECTED, LINK_REASON_NONE);
-    }
     if (sl->state != LINK_SLOT_CONNECTED) return;
     const cl_stream_t* st = &m->u.stream;
     uint8_t fl = h->fmt->real ? 0 : 1;
@@ -547,21 +541,31 @@ static void on_stream(host_t* h, uint8_t s, const host_rx_t* r, const cl_msg_t* 
 }
 
 // Steady-state nonce first (counters from the expected one on, to ride over lost uplinks), then the
-// legacy nonce of this period's beacon (a request, or a controller that has not seen the accept).
-static bool decrypt_uplink(host_t* h, host_slot_t* sl, const host_rx_t* r, uint8_t* pt) {
+// legacy nonce of this period's beacon (a request, or a controller that has not seen the accept),
+// in both directions (pulsar_nonce_dir). 0 = no MIC matched, 1 = steady, 2 = legacy.
+static int decrypt_uplink(host_t* h, host_slot_t* sl, const host_rx_t* r, uint8_t* pt) {
     uint8_t nonce[PULSAR_NONCE_LEN];
     if (sl->steady) {
         for (uint32_t i = 0; i < HOST_CTR_WINDOW; i++) {
             pulsar_nonce_steady(sl->ctr + i, sl->iv, nonce);
+            pulsar_nonce_dir(nonce, sl->dir);
             if (h->plat->ccm(h->plat, false, h->key, nonce, r->data, r->len, pt)) {
                 sl->ctr += i + 1;
-                return true;
+                return 1;
             }
         }
     }
     uint64_t beacon_ts = r->t_us / PULSAR_BEACON_PERIOD_US * PULSAR_BEACON_PERIOD_US;  // beacons are aligned
-    pulsar_nonce_legacy(h->session_nonce, beacon_ts, nonce);
-    return h->plat->ccm(h->plat, false, h->key, nonce, r->data, r->len, pt);
+    for (uint8_t k = 0; k < 2; k++) {
+        uint8_t dir = (uint8_t)(sl->dir ^ k);
+        pulsar_nonce_legacy(h->session_nonce, beacon_ts, nonce);
+        pulsar_nonce_dir(nonce, dir);
+        if (h->plat->ccm(h->plat, false, h->key, nonce, r->data, r->len, pt)) {
+            sl->dir = dir;
+            return 2;
+        }
+    }
+    return 0;
 }
 
 static void on_uplink(host_t* h, const host_rx_t* r) {
@@ -570,7 +574,7 @@ static void on_uplink(host_t* h, const host_rx_t* r) {
     uint8_t flags = r->crc_ok ? LINK_UP_CRC_OK : 0;
     uint8_t pt[PULSAR_UPLINK_MAX_LEN + 4];
     uint8_t n = 0;
-    bool ok = false;
+    int how = 0;
     if (r->crc_ok) {
         h->uplinks++;
         sl->rx_packets++;
@@ -578,17 +582,25 @@ static void on_uplink(host_t* h, const host_rx_t* r) {
         if (r->len > PULSAR_MIC_LEN) {
             flags |= LINK_UP_DECRYPTED;
             n = (uint8_t)(r->len - PULSAR_MIC_LEN);
-            ok = decrypt_uplink(h, sl, r, pt);
-            if (ok) flags |= LINK_UP_MIC_OK;
+            how = decrypt_uplink(h, sl, r, pt);
+            if (how) flags |= LINK_UP_MIC_OK;
             else sl->rx_bad_mic++;
         }
     } else {
         h->crc_errors++;
     }
+    bool ok = how != 0;
     if (h->flags & LINK_HOST_RAW_UPLINKS) {
         link_uplink_t u = {r->t_us, s, r->freq, r->rssi, flags, ok ? n : r->len};
         emit(h, EVT_UPLINK, &u, sizeof u, ok ? pt : r->data, ok ? n : r->len);
     }
+    // The controller uses the steady nonce only after it took our accept: it is on the link.
+    if (how == 1 && sl->allowed && (sl->state == LINK_SLOT_NEGOTIATING || sl->state == LINK_SLOT_LOST)) {
+        sl->accept_queued = false;
+        sl->last_rx_us = r->t_us;
+        conn_event(h, s, LINK_SLOT_CONNECTED, LINK_REASON_NONE);
+    }
+    if (how == 1 && sl->state == LINK_SLOT_CONNECTED) sl->last_rx_us = r->t_us;
     cl_msg_t m;
     if (!ok || !h->fmt->decode(pt, n, CL_DIR_UP, &m)) return;
     sl->last_rx_us = r->t_us;

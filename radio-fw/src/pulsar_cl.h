@@ -1,13 +1,14 @@
 // Pulsar connected-link "CL" messages: what rides in a beacon's CL data (host -> controller,
 // PLAINTEXT) and in an uplink (controller -> host, CCM-encrypted by the LL; nonces in pulsar_ll.h).
 //
-// Only the controller's connection request is pinned so far (docs/re/AUDIT.md A3). The CL/TL
-// transport and the host's answers are RE-1's; the peripheral payloads are in docs/re/PERIPHERALS.md
-// (RE-2) but ride that transport. So the link logic talks to a format through cl_format_t and there
-// are two of them:
+// Pinned so far: the controller's connection request (AUDIT A3) and the host's connection-
+// negotiation packet (docs/re/LINK.md §4). The TL header that carries register access and
+// notifications is not (LINK.md §3: one capture); the peripheral payloads are in
+// docs/re/PERIPHERALS.md (RE-2) but ride that transport. So the link logic talks to a format
+// through cl_format_t and there are two of them:
 //
-//   cl_real         the real Touch Plus formats. Decodes the connection request; everything the
-//                   host would send is a STUB (encode returns CL_PENDING_RE -> LINK_ERR_PENDING_RE).
+//   cl_real         the real Touch Plus formats: connection request and negotiation both ways;
+//                   everything else is a STUB (encode returns CL_PENDING_RE -> LINK_ERR_PENDING_RE).
 //                   RE-1/RE-2 fill these in; nothing else in the firmware has to change.
 //   cl_placeholder  TouchFrame's own invented formats, so host mode can be exercised end to end
 //                   against our fake controller (ctrl_core.c) and in the simulator. NEVER sent to a
@@ -26,12 +27,14 @@
 #define CL_UP_MAX (PULSAR_UPLINK_MAX_LEN - 4)
 #define CL_REG_DATA_MAX 32
 #define CL_PENDING_RE (-2)  // encode: the real format is not known yet
+#define CL_EP_CONN_NEG 2    // real negotiation endpoints (LINK.md §4): CONN_NEG, then LOCK
+#define CL_EP_LOCK 3
 #define CL_TOO_BIG (-1)     // encode: does not fit
 
 enum cl_msg_type {
     CL_NONE = 0,
     // host -> controller
-    CL_CONN_ACCEPT,   // conn: device_id, slot (assigned), version
+    CL_CONN_ACCEPT,   // conn: device_id, slot (assigned), version, endpoint (real: CONN_NEG then LOCK)
     CL_CONN_REJECT,   // conn: device_id, reason
     CL_DISCONNECT,    // conn: device_id
     CL_REG_READ,      // reg: tag, reg, len
@@ -61,7 +64,7 @@ typedef struct {
     uint8_t seq;       // down: message sequence (1..255) for dedupe/ack; up: ul_seq for REG_DATA dedupe
     uint8_t ack;       // up: the last down seq this controller processed (0 = none)
     union {
-        struct { uint64_t device_id; uint8_t slot; uint16_t version; uint8_t reason; uint8_t iv[8]; } conn;
+        struct { uint64_t device_id; uint8_t slot; uint16_t version; uint8_t reason, endpoint; uint8_t iv[8]; } conn;
         struct { uint8_t tag, reg, len, kind, status; uint8_t data[CL_REG_DATA_MAX]; } reg;
         struct { uint8_t reg, flags; uint16_t period_ms; } sub;
         struct { uint8_t mode, intensity; uint32_t period_us, on_us; int32_t phase_us; uint32_t mask; } led;
