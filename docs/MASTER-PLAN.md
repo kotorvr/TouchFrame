@@ -349,3 +349,36 @@ statistics), because it never touches the hardware.
 > competing-controller disconnects, and falls back to Creating the shared queues for Touch-only.
 > Add the udev rule + install.sh support. Test offline with a Python fake dongle and
 > driver/test. No device access until the planner says the devices are free.
+
+## 8. Planner handoff (read this if you are a new planner chat)
+
+The first planner chat was archived on 2026-10-04 at the end of the offline phase. To take over:
+1. **Set this chat's title to exactly `Touchframe project planning and roadmap`.** Every session
+   prompt, and the reporting rule in §5, sends reports to that name. Use the session-title tool
+   (`set_session_title`) or rename the chat in the app.
+2. Read this file end to end, especially §5 (rules, the status table, the device lock, the
+   reporting rule, the one-honest-retry rule) and §6 (gates). Then read docs/HARDWARE-DAY.md.
+   `git log --oneline -40` shows what was merged.
+3. **State at handoff:**
+   - No sessions are running. All offline work is merged and pushed (main `cf341ff` and later).
+   - All hardware is ordered: 2 × nRF52840 dongle, USB-C OTG adapter, USB-C hub with PD.
+   - Quest auto-updates are off.
+   - The Quest + Frame are being used by the EchoQuestCombat project. Its planner is "Echo Combat
+     Quest port feasibility".
+4. **Next trigger:** the user says the dongles arrived. Then:
+   - message "Echo Combat Quest port feasibility" to close its device window;
+   - chip HW-1 (HARDWARE-DAY §0–5, plus the TL-header validation capture and the FRAME-MODEL T1–T3
+     tests), with the reporting rule and the lock rule in the prompt;
+   - then HW-2 → HW-3 → HW-4, one at a time (§5 Phase H).
+5. **Planner duties, as before:**
+   - merge finished branches (`/code-review` build branches first);
+   - fold `docs/re/*.md` results into PROTOCOL / FRAME-TRACKER / HARDWARE-DAY;
+   - update the §5 status table and push;
+   - after a chipped session ends, remove its `artifacts` / `radio-fw/third_party` junctions with
+     `cmd /c rmdir` (no `/s`), then check `du -sh artifacts` is still ~4.4G;
+   - send the Echo planner its all-clear when a TouchFrame device session ends.
+6. **Known follow-ups:**
+   - HW-4: IMU rectification is keyed by hand, not by device (§5 CLEANUP-1 row).
+   - Only if HW-3 shows LED lock slipping: build the optional read-only XRIPC-ring snoop
+     (docs/re/FRAME-TIMING.md c1), off by default.
+   - Plan B (position from Frame hand tracking) only if G-B fails.
