@@ -6,9 +6,9 @@ Goal: Touch Plus controllers working on a standalone Steam Frame like first-part
 - haptics;
 - no Quest headset and no PC in the loop.
 
-Status (2026-10-04): **Phase 1 (relay) done. Phase 0 static RE done for a listening host. Phase 2
-dongle tooling ready, dongle not arrived. Phase 3 injection proven, Gate B open.** The plan of
-record, with what's left and how it's split into sessions, is
+Status (2026-10-04): **Phase 1 (relay) done. Phase 0 static RE done, including the host side. Phase 2
+dongle host mode built offline, dongle not arrived. Phase 3 injection proven, Touch-only confirmed,
+Gate B open.** The plan of record, with what's left and how it's split into sessions, is
 **[MASTER-PLAN.md](MASTER-PLAN.md)**. The "Log" at the end is the history.
 
 ## Verdict so far
@@ -16,8 +16,8 @@ record, with what's left and how it's split into sessions, is
 | Piece | Status | Why |
 |---|---|---|
 | SteamVR side (bindings, models, haptics) | **Easy, built** | Third-party aarch64 OpenVR drivers load on the Frame. SteamVR there already ships the Touch input schema and `oculus_quest_plus_controller_*` render models. Games fall back to Touch bindings. |
-| Radio: buttons, IMU, haptics without a Quest | **Likely** | Touch Plus and Quest radio firmware are plaintext ARM images inside the Quest OTA, so the protocol can be read statically. A Nordic nRF52840 USB dongle on the Frame plays the "Quest". Gate A passed (no host auth). PHY, hop, pairing and cipher structure are pinned. The post-pairing command layer (register access, LED, IMU, haptics) is still to RE (MASTER-PLAN §3.1). |
-| 6DoF from the Frame's cameras | **Driver route proven; LED blobs (Gate B) open** | No camera hook needed: driver_touchframe injects a controller into Valve's XRService tracker through vrserver block queues. A cloned Frame controller tracked at 2.3 mm / 0.64° median (docs/FRAME-TRACKER.md §9). Still open: whether Touch Plus LEDs, kept always on by our radio, produce blobs XRService matches, and whether the controller *allows* always-on (its IR LED config is validated; if it isn't allowed, we strobe in sync with the Frame's exposures). Constraints: one tracked controller per hand; the shared queues have so far only existed after a Frame controller connected. |
+| Radio: buttons, IMU, haptics without a Quest | **Built offline; needs hardware validation** | Touch Plus and Quest radio firmware are plaintext ARM images inside the Quest OTA, so the protocol can be read statically. A Nordic nRF52840 USB dongle on the Frame plays the "Quest". Gate A passed (no host auth). The whole host protocol is pinned statically, post-pairing command layer included ([PROTOCOL.md](PROTOCOL.md)). Radio host mode is built and merged: firmware (BUILD-1 + BUILD-1b) and the driver backend over hidraw (BUILD-2). All offline tests pass; it still has to be validated on hardware (HARDWARE-DAY "Host mode"). PCM haptics not implemented yet. |
+| 6DoF from the Frame's cameras | **Driver route proven; Touch-only confirmed; LED blobs (Gate B) open** | No camera hook needed: driver_touchframe injects a controller into Valve's XRService tracker through vrserver block queues. A cloned Frame controller tracked at 2.3 mm / 0.64° median (docs/FRAME-TRACKER.md §9). **Touch-only works (CONFIRMED on device, [DEV-1](re/DEV-1.md)):** our driver can create the shared queues with no Frame controller; the cost is that the first Frame controller of that SteamVR session gets no pose. The LEDs can't stay on: they **strobe only** (cmd 0x28, on-time ≤ 75 µs, [RE-2](re/PERIPHERALS.md)), so the driver walks the LED phase in a closed loop to land the pulses in the Frame's exposures. **Gate B is open and needs the dongle:** the relay run can only give an early yes and gave none. Constraint: one tracked controller per hand. |
 
 ## Hardware facts
 

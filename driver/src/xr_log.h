@@ -9,7 +9,7 @@
 //
 // The watcher tails the newest XRService log under the Steam logs directory
 // (~/.local/share/Steam/logs/…/XRService*), switching when a newer one appears. Reading a log
-// that is already there, it only takes the tracker mapping from the old lines.
+// that is already there, it only takes the tracker mapping from the old lines, a few MB per Poll.
 #pragma once
 #include <cstdint>
 #include <cstdio>
@@ -47,15 +47,18 @@ public:
 
     uint64_t led_hits() const { return led_hits_; }
     uint64_t frame_stamps() const { return frame_stamps_; }
+    bool catching_up() const { return catching_up_; }  // still reading lines from before we looked
 
 private:
     void Open(const std::string& path, bool from_start);
+    void Consume(double now);  // the complete lines in partial_
     void Line(const std::string& line, double now, bool live);
 
     std::string dir_, path_, partial_;
     Callbacks cb_;
     FILE* f_ = nullptr;
     long offset_ = 0;
+    bool catching_up_ = false;
     double next_scan_ = 0;
     std::map<int, int> tracker_hand_;  // XRService tracker index -> our hand
     double last_hit_[2] = {0, 0};

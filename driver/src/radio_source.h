@@ -21,8 +21,10 @@
 //     live in the state file (compatible with `tools/radio.py host --identity`), sent with
 //     HOST_START and CMD_CONNECT after every dongle reset.
 // Either way the state file records which hand each controller is. The hand comes from the
-// controller if the firmware learns it (EVT_PAIR hand, RE pending), else from RequestPair(hand),
-// else the first free hand, right first.
+// controller (cmd 1, REVIEW-RE R11: our own read, and the dongle's second EVT_PAIR(DONE) or
+// stored pairing), else from RequestPair(hand), else the first free hand, right first. A controller
+// whose hand is in use borrows the other one, and gives it back to that hand's own controller; a
+// third controller waits until a hand is free.
 #pragma once
 #include <atomic>
 #include <cstdint>
@@ -126,6 +128,7 @@ private:
         ImuScale scale;
         bool scale_from_controller = false;
         int scale_reads = 0;
+        ConnEvt conn{};  // the event it connected with (radio thread): re-placed on a move
         Rectifier rect;
         HapticScheduler haptic;
         std::unique_ptr<LedPhaseLoop> led;
@@ -188,6 +191,7 @@ private:
     bool stored_ = false;          // this session uses the dongle's flash identity
     bool restart_ = false;         // end the session (the dongle rebooted under us)
     double pairlist_due_s_ = 0;    // stored mode: re-read the pairings (hands) after a connect
+    std::map<int, ConnEvt> parked_; // slot -> connected controllers waiting for a free hand
     uint8_t hello_mode_ = 0;       // link_mode at HELLO
     uint32_t dongle_netaddr_ = 0;  // stored identity's netaddr (PAIR_LIST)
     std::map<uint8_t, Pending> pending_;

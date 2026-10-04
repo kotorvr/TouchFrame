@@ -117,6 +117,39 @@ static void TestWatcher(const std::string& scratch) {
     CHECK(XrLogWatcher::FindNewestLog(dir) == log2);
 }
 
+static void TestWatcherCatchUp(const std::string& scratch) {
+    // A long XRService log that was there before we looked (DEV-1 saw ~300 error lines/s): read a
+    // few MB per Poll, not all in the first one. The mapping at its end still counts; its LED lines
+    // don't.
+    std::string dir = scratch + "/xrlogs_big";
+    MKDIR(dir.c_str());
+    std::string log = dir + "/XRService-big.log";
+    remove(log.c_str());
+    {
+        std::ofstream f(log, std::ios::binary);
+        std::string filler = "12:00:00.000 [ControllerTracking 0]: Couldn't find any neighbor for blob, skipping it\n";
+        for (size_t n = 0; n < (20u << 20); n += filler.size()) f << filler;
+        f << "[ControllerTracking]: initializing controller 2, serial number: tftouchplus_right\n[ContrLedsStats 2]: old\n";
+    }
+    std::vector<int> hits;
+    XrLogWatcher::Callbacks cb;
+    cb.serial_of_hand = [](int h) { return std::string(h ? "tftouchplus_right" : "tftouchplus_left"); };
+    cb.led_hit = [&](int h, double) { hits.push_back(h); };
+    cb.log = [](const std::string& s) { printf("  | %s\n", s.c_str()); };
+    XrLogWatcher w(dir, cb);
+    double t = 100;
+    w.Poll(t);
+    CHECKF(w.catching_up(), "20 MB read in one Poll");
+    int polls = 1;
+    while (w.catching_up() && polls < 20) w.Poll(t += 0.1), polls++;
+    printf("catch-up: 20 MB in %d polls\n", polls);
+    CHECKF(!w.catching_up() && polls >= 5, "%d polls", polls);
+    CHECKF(hits.empty(), "old LED line counted");
+    Append(log, "[ContrLedsStats 2]: new\n");
+    w.Poll(t += 0.1);
+    CHECKF(hits.size() == 1 && hits[0] == 1, "mapping from the end of the old log lost: %zu hits", hits.size());
+}
+
 static void TestOrientation() {
     // At rest with the controller's +Z up (fake_dongle's accel (0, 0, 1 g)): +Z must come out as world +Y.
     ImuOrientation o;
@@ -300,6 +333,7 @@ int main(int argc, char** argv) {
     }
     TestParse();
     TestWatcher(argv[1]);
+    TestWatcherCatchUp(argv[1]);
     TestOrientation();
     TestFindHidraw(argv[1]);
     TestIdentityJson();

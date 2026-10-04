@@ -20,9 +20,12 @@ controller exists:
 
 As the firmware since BUILD-1b (docs/re/REVIEW-RE.md): slots are 1..4 (slot 0 is the negotiation
 slot and never assigned); without LINK_HOST_PLACEHOLDER (real formats) EVT_INPUT carries flags bit 1
-(arrival time), PCM haptics answer LINK_ERR_PENDING_RE, SIMPLE haptics need 40..561 Hz, and a
-controller paired in this host run gets a second EVT_PAIR(DONE) with its hand when it first
-connects (the hand is also stored with the pairing).
+(arrival time), PCM haptics answer LINK_ERR_PENDING_RE, SIMPLE haptics need 40..561 Hz. Each
+simulated controller answers cmd 1 (device_desc, REVIEW-RE R11) with its hand in bytes 16..23:
+"left", "right" or "unconf" (SimController(hand=...); by default from the id's lowest bit, like
+radio-fw's fake controller). Once a controller connects, the dongle reads it like host_core.c
+got_hand(): "left"/"right" is stored with the pairing and, for the controller paired in this host
+run, sent as a second EVT_PAIR(DONE) that carries only the hand; "unconf" changes nothing.
 
 `pending_re=True` mimics the firmware before BUILD-1b: without LINK_HOST_PLACEHOLDER, controllers
 connect but send no input or IMU events, and registers, LED and haptics answer LINK_ERR_PENDING_RE.
@@ -47,10 +50,28 @@ ADVERT_TYPE = 2
 PULSAR_VERSION = 0x1701
 
 
+REG_DEVICE_DESC = 0x01
+LINK_HANDS = {"left": 1, "right": 2}  # link_hand; anything else ("unconf") is LINK_HAND_UNKNOWN
+
+
+def device_desc(hand):
+    """cmd 1's 32 bytes: four NUL-padded 8-byte fields, as radio-fw/src/ctrl_core.c builds them."""
+    d = bytearray(32)
+    for i, field in enumerate((b"oculus", b"rubyprq", hand.encode(), b"0x0c")):
+        d[8 * i:8 * i + len(field)] = field
+    return bytes(d)
+
+
+def desc_hand(d):
+    """link_hand from a cmd 1 answer, like host_core.c got_hand(): bytes 16..23, NUL-terminated."""
+    if len(d) < 24:
+        return 0
+    return LINK_HANDS.get(bytes(d[16:24]).split(b"\0")[0].decode("latin-1"), 0)
+
+
 class SimController:
-    def __init__(self, device_id, seed=0):
+    def __init__(self, device_id, seed=0, hand=None):
         self.device_id = device_id
-        self.hand = 2 if device_id & 1 else 1  # link_hand from cmd 1 (radio-fw's fake: odd ids are right)
         self.rng = random.Random(seed or device_id)
         self.paired = None   # (netaddr, key) once provisioned
         self.regs = {9: b"\x00\x00", 3: b"\x00\x00\x00", 0x17: bytes(8), 4: b"\x00", 0x2b: b"\x00",
@@ -58,6 +79,16 @@ class SimController:
                      # imu_config (docs/re/PERIPHERALS.md): accel +-32 g, gyro +-4000 dps, 500 Hz each,
                      # g and dps per count
                      0x32: struct.pack("<HHHHff", 32000, 4000, 500, 500, 1 / 1024, 1 / 8.192)}
+        self.set_hand(hand or ("right" if device_id & 1 else "left"))  # radio-fw's fake: odd ids are right
+
+    def set_hand(self, hand):
+        """What cmd 1 says from now on: "left", "right" or "unconf"."""
+        self.regs[REG_DEVICE_DESC] = device_desc(hand)
+
+    @property
+    def hand(self):
+        """link_hand as the dongle reads it from cmd 1 (0 = unconf)."""
+        return desc_hand(self.regs.get(REG_DEVICE_DESC, b""))
 
     def advert(self):
         return bytes([ADVERT_TYPE]) + struct.pack("<HH", PULSAR_VERSION, 0x0301) + \
@@ -270,13 +301,25 @@ class FakeDongle:
         slot.update(ctrl=ctrl, next_input=now, next_imu=now,
                     fmt_flags=1 if self.host["flags"] & R.HOST_PLACEHOLDER else 0)
         self.conn_event(s, 3)
-        if not self.host["flags"] & R.HOST_PLACEHOLDER and not self.pending_re:  # cmd 1 read: the hand
+        if not self.host["flags"] & R.HOST_PLACEHOLDER and not self.pending_re:
+            self.at(4000, lambda: self._got_hand(s, ctrl))  # host_core enumerate(): cmd 1 first, one TL round trip
+
+    def _got_hand(self, s, ctrl):
+        """host_core.c got_hand(): the cmd 1 answer. "unconf" stores nothing and sends nothing."""
+        slot = self.slots[s]
+        if not slot or slot["state"] != 3 or slot.get("ctrl") is not ctrl:
+            return
+        hand = ctrl.hand
+        if not hand:
+            return
+        if self._stored():
             for p in self.flash["pairs"]:
-                if p["device_id"] == ctrl.device_id and self._stored():
-                    p["hand"] = ctrl.hand
-            if ctrl.device_id == self.last_paired and not self.hand_sent:
-                self.hand_sent = True
-                self.pair_event(5, step=3, device_id=ctrl.device_id, hand=ctrl.hand)
+                if p["device_id"] == ctrl.device_id:
+                    p["hand"] = hand
+        if ctrl.device_id == self.last_paired and not self.hand_sent:  # the pairing's DONE, now with the hand
+            self.hand_sent = True
+            self.emit(R.EVT_PAIR, R.pack("link_pair_event_t", t_us=self.now_us(), state=5, status=0, step=3,
+                                         hand=hand, device_id=ctrl.device_id, netaddr=self.host["netaddr"]))
 
     def _pair_step(self, step):
         p = self.pair

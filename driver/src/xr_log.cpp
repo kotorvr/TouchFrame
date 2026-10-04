@@ -111,22 +111,19 @@ void XrLogWatcher::Open(const std::string& path, bool from_start) {
     offset_ = 0;
     partial_.clear();
     tracker_hand_.clear();
-    if (!f_) return;
-    if (cb_.log) cb_.log("xrlog: reading " + path + (from_start ? "" : " (mapping trackers from what is there)"));
-    if (!from_start) {
-        // Old lines: only the tracker mapping counts (the stamps and hits are stale).
-        char buf[65536];
-        size_t n;
-        while ((n = fread(buf, 1, sizeof(buf), f_)) > 0) {
-            partial_.append(buf, n);
-            size_t pos;
-            while ((pos = partial_.find('\n')) != std::string::npos) {
-                Line(partial_.substr(0, pos), 0, false);
-                partial_.erase(0, pos + 1);
-            }
-        }
-        offset_ = ftell(f_);
+    // Old lines (a log that was there before we looked): only the tracker mapping counts, the
+    // stamps and hits are stale. Read in Poll's chunks: the log can be hundreds of MB.
+    catching_up_ = f_ && !from_start;
+    if (f_ && cb_.log) cb_.log("xrlog: reading " + path + (from_start ? "" : " (mapping trackers from what is there)"));
+}
+
+void XrLogWatcher::Consume(double now) {
+    size_t start = 0, pos;
+    while ((pos = partial_.find('\n', start)) != std::string::npos) {
+        Line(partial_.substr(start, pos - start), now, !catching_up_);
+        start = pos + 1;
     }
+    partial_.erase(0, start);
 }
 
 void XrLogWatcher::Poll(double now) {
@@ -143,17 +140,14 @@ void XrLogWatcher::Poll(double now) {
     }
     fseek(f_, offset_, SEEK_SET);
     char buf[65536];
-    size_t n;
-    int budget = 64;  // ≤ 4 MB a poll
+    size_t n = 0;
+    int budget = 64;  // <= 4 MB a poll
     while (budget-- > 0 && (n = fread(buf, 1, sizeof(buf), f_)) > 0) {
         partial_.append(buf, n);
-        size_t pos;
-        while ((pos = partial_.find('\n')) != std::string::npos) {
-            Line(partial_.substr(0, pos), now, true);
-            partial_.erase(0, pos + 1);
-        }
+        Consume(now);
         if (partial_.size() > 1 << 20) partial_.clear();  // no newline in 1 MB: not a text log
     }
+    if (n == 0 && catching_up_) catching_up_ = false;  // at the end: from here on, lines are live
     offset_ = ftell(f_);
     clearerr(f_);
 }
