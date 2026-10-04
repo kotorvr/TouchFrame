@@ -56,7 +56,9 @@ typedef struct {
     uint64_t reply_at_us;
 
     // connected link
-    cl_session_t session;
+    uint16_t session_nonce;   // from the beacons
+    uint8_t iv[8];            // steady-state IV we announce in CONN_REQ
+    uint32_t ctr;             // steady-state uplink counter, 0 at the accept
     pulsar_hop_t hop;
     uint64_t anchor_us;       // local time of the last beacon's ADDRESS (or dead-reckoned)
     uint64_t period;          // beacon period index of that beacon (host timestamp / 2000)

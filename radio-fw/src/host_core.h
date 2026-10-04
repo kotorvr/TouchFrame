@@ -14,12 +14,14 @@
 #include "pulsar_ll.h"
 #include "pulsar_pair.h"
 #include "radio_op.h"
+#include "store.h"
 
 #define HOST_RX_RING 32       // power of two
 #define HOST_DLQ 8            // downlink messages queued per slot
 #define HOST_LOST_US 250000   // a connected slot with no uplink this long is LOST
 #define HOST_DL_RETRY_PERIODS 3
 #define HOST_DL_MAX_TRIES 60
+#define HOST_CTR_WINDOW 32    // uplink counters tried past the expected one (lost uplinks)
 #define HOST_TX_LEAD_US 150   // a beacon is planned at least this long before it goes out
 
 typedef struct {
@@ -47,6 +49,9 @@ typedef struct {
     uint64_t last_rx_us;
     uint16_t input_seq, imu_seq;
     uint8_t last_ul_seq;
+    bool steady;             // steady-state CCM: iv + per-slot counter (after the accept was queued)
+    uint8_t iv[8];
+    uint32_t ctr;            // next expected uplink counter
     host_dl_t dlq[HOST_DLQ];
     uint8_t dlq_head, dlq_len;
     uint8_t next_dl_seq;
@@ -56,7 +61,7 @@ typedef struct {
 } host_slot_t;
 
 typedef struct {
-    // prepared CL data for one beacon: written by the main loop while !ready, consumed by the ISR
+    // prepared CL data (plaintext) for one beacon: written by the main loop while !ready, consumed by the ISR
     volatile bool ready;
     uint64_t period;
     uint8_t slot;
@@ -66,12 +71,13 @@ typedef struct {
 
 typedef struct {
     platform_t* plat;
+    store_t* store;  // flash identity + pairings (LINK_HOST_STORED); NULL = none. Set after host_init.
     const cl_format_t* fmt;
     bool running;
     uint8_t flags;  // LINK_HOST_*
     uint32_t netaddr;
     uint8_t key[16];
-    cl_session_t session;
+    uint16_t session_nonce;
     uint64_t chmap;
     int8_t tx_power;
 
@@ -117,8 +123,9 @@ void host_init(host_t* h, platform_t* plat);
 void host_stop(host_t* h);  // CMD_STOP: everything off, connections reported dropped
 bool host_running(const host_t* h);
 
-// Link v3 host commands (CMD_HOST_START .. CMD_HAPTIC). Emits EVT_RESULT and friends.
-// Returns false if `cmd` is not a host command.
+// Link v3 host commands (CMD_HOST_START .. CMD_HAPTIC, CMD_PAIR_LIST, CMD_PAIR_FORGET). Emits
+// EVT_RESULT and friends. Returns false if `cmd` is not a host command. CMD_PAIR_LIST / FORGET work
+// in any mode (they only touch the store unless the host is running).
 bool host_command(host_t* h, uint8_t cmd, const uint8_t* body, uint32_t len);
 void host_fill_status(const host_t* h, link_host_status_t* s);
 

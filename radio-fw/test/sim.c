@@ -4,7 +4,8 @@
 // the firmware's USB link calls; the link-v3 events that come out are checked.
 //
 // This exercises everything above the RADIO peripheral: beacon scheduling, CSA#1 hop following,
-// slot timing, DM beacons, the real 0x12/0x11 pairing exchange, CCM on every packet, placeholder
+// slot timing, DM beacons, the real 0x25/0x22 pairing exchange, uplink CCM with the pinned legacy
+// and steady-state nonces (plaintext downlink), placeholder
 // CL negotiation / registers / LED / haptics / streams, retransmission and link loss.
 #include <assert.h>
 #include <stdarg.h>
@@ -229,6 +230,13 @@ static void step(node_t** nodes, int nn) {
 static node_t H, C;
 static node_t* nodes[2] = {&H, &C};
 
+// the host dongle's flash store, on RAM that survives a simulated dongle reboot
+static uint32_t flash[2][STORE_PAGE_BYTES / 4];
+static void f_write(void* u, uint32_t* a, uint32_t v) { (void)u, *a &= v; }
+static void f_erase(void* u, uint32_t* page) { (void)u, memset(page, 0xFF, STORE_PAGE_BYTES); }
+static const store_flash_t FLASH = {{flash[0], flash[1]}, NULL, f_write, f_erase, 1};
+static store_t store;
+
 static void run(double us) {
     double end = T + us;
     for (; T < end; T += 1) {
@@ -351,7 +359,9 @@ static void scenario_pair_connect_stream(void) {
         memcpy(&in, H.ev[i].body, sizeof in);
         if (last && in.seq != (uint16_t)(last + 1)) gaps++;
         last = in.seq;
-        CHECK(in.slot == 1 && (in.flags & 1), "input slot/flags");
+            CHECK(in.slot == 1 && (in.flags & 1), "input slot/flags");
+        CHECK(in.battery_pct == 87 && in.trigger + in.grip == 4000 && in.stick[0] == (int16_t)in.trigger - 2000,
+              "input fields %u %u %u %d", in.battery_pct, in.trigger, in.grip, in.stick[0]);
         CHECK(in.t_us > prev_t, "input time not increasing");
         uint64_t host_now = (uint64_t)local_of(&H, H.ev[i].t);
         CHECK(in.t_us <= host_now && host_now - in.t_us < 3000, "sample time %llu vs now %llu",
@@ -408,8 +418,17 @@ static void scenario_pair_connect_stream(void) {
     CHECK(r.status == LINK_OK, "haptic pcm %u", r.status);
     run(60000);
     CHECK(C.ctrl->last_led.u.led.period_us == 11111 && C.ctrl->last_led.u.led.phase_us == -500, "LED not applied");
+    CHECK(C.ctrl->last_led.u.led.on_us == LINK_LED_MAX_ON_US, "on-time not clamped: %u", C.ctrl->last_led.u.led.on_us);
+    // a phase-search loop: many CMD_LEDs back to back never fill the queue, and the newest wins
+    for (int i = 0; i < 20; i++) {
+        r = HOST_CMD(CMD_LED, link_led_t, .slot = 1, .mode = LINK_LED_STROBE, .period_us = 11111, .on_us = 50,
+                     .phase_us = 100 * i);
+        CHECK(r.status == LINK_OK, "LED %d: %u", i, r.status);
+    }
+    run(60000);
+    CHECK(C.ctrl->last_led.u.led.phase_us == 1900, "newest LED phase not applied: %d", C.ctrl->last_led.u.led.phase_us);
     CHECK(C.ctrl->haptic_bytes == 48, "haptic bytes %u", C.ctrl->haptic_bytes);
-    CHECK(C.ctrl->last_haptic.u.haptic.pcm[47 - 42] == (uint8_t)(47 * 5), "haptic pcm content");
+    CHECK(C.ctrl->last_haptic.u.haptic.pcm[47 - 25] == (uint8_t)(47 * 5), "haptic pcm content");
 
     // status
     mark = H.nev;
@@ -485,8 +504,101 @@ static void scenario_real_formats(void) {
     run(1500000);  // the fake loses the restarted hop, re-seeks and asks again: undecryptable here
     CHECK(!find(&H, EVT_CONN, mark, 9, LINK_SLOT_CONNECTED), "connected with unpinned formats");
     CHECK(count(&H, EVT_UPLINK, mark) > 0, "raw uplinks not reported");
-    ev_t* u = find(&H, EVT_UPLINK, mark, -1, 0);
-    CHECK(u && !(u->body[11] & LINK_UP_DECRYPTED), "real mode tried to decrypt");
+    // the LL nonces are pinned (AUDIT A2/A3), so even real mode decrypts the uplinks; only the CL
+    // formats on top are unknown
+    size_t mic_ok = 0;
+    for (size_t i = mark; i < H.nev; i++) mic_ok += H.ev[i].type == EVT_UPLINK && (H.ev[i].body[11] & LINK_UP_MIC_OK);
+    CHECK(mic_ok > 0, "real mode decrypted no uplink");
+}
+
+static link_result_t start_stored(void) {
+    link_host_start_t s = {.tag = tag_n++, .flags = LINK_HOST_STORED | LINK_HOST_DM_BEACONS | LINK_HOST_PLACEHOLDER |
+                                                    LINK_HOST_COMPACT,
+                           .session_nonce = 0x5157, .chmap = {0xff, 0xff, 0xff, 0xff, 0x1f}};
+    return host_cmd(CMD_HOST_START, &s, sizeof s);
+}
+
+static link_pairings_t list_pairings(link_pairing_t* rec) {
+    size_t mark = H.nev;
+    link_result_t r = HOST_CMD(CMD_PAIR_LIST, link_tag_t);
+    CHECK(r.status == LINK_OK, "pair list %u", r.status);
+    link_pairings_t p = {0};
+    ev_t* e = find(&H, EVT_PAIRINGS, mark, -1, 0);
+    CHECK(e, "no EVT_PAIRINGS");
+    if (e) {
+        memcpy(&p, e->body, sizeof p);
+        CHECK(e->len == sizeof p + p.count * sizeof(link_pairing_t), "EVT_PAIRINGS length");
+        if (rec) memcpy(rec, e->body + sizeof p, p.count * sizeof(link_pairing_t));
+    }
+    return p;
+}
+
+static void scenario_stored(void) {
+    printf("scenario: flash identity, pairing saved and auto-connected, dongle reboot, forget\n");
+    link_result_t r = start_stored();
+    CHECK(r.status == LINK_OK && r.detail == 0, "stored start %u/%u", r.status, r.detail);
+    for (uint8_t s = 0; s < LINK_MAX_SLOTS; s++)  // slots allowed by earlier scenarios survive a host start
+        HOST_CMD(CMD_DISCONNECT, link_disconnect_t, .slot = s, .flags = 1);
+    uint32_t netaddr = H.host->netaddr;
+    CHECK(netaddr && netaddr != NETADDR && store.netaddr == netaddr, "identity not generated: %08x", netaddr);
+    link_pairings_t p = list_pairings(NULL);
+    CHECK(p.netaddr == netaddr && p.count == 0 && (p.flags & 1), "fresh list");
+
+    // a fresh fake controller (unpaired) pairs; with STORED it is saved and let in without CMD_CONNECT
+    C.plat.radio_halt(&C.plat);
+    start_fake(LINK_FAKE_STREAM_INPUT | LINK_FAKE_STREAM_IMU, 3);
+    size_t mark = H.nev;
+    r = HOST_CMD(CMD_PAIR_START, link_pair_start_t, .flags = LINK_PAIR_AUTO, .timeout_s = 10);
+    CHECK(r.status == LINK_OK, "pair start");
+    for (int i = 0; i < 300 && !find(&H, EVT_CONN, mark, 9, LINK_SLOT_CONNECTED); i++) run(10000);
+    ev_t* done = find(&H, EVT_PAIR, mark, 8, LINK_PAIR_DONE);
+    CHECK(done && done->body[11] == LINK_HAND_UNKNOWN, "pairing not done");
+    CHECK(C.ctrl->netaddr == netaddr && !memcmp(C.ctrl->key, store.key, 16), "fake got the wrong identity");
+    CHECK(find(&H, EVT_CONN, mark, 9, LINK_SLOT_WAITING), "not allowed after pairing");
+    CHECK(find(&H, EVT_CONN, mark, 9, LINK_SLOT_CONNECTED), "did not connect after pairing");
+    link_pairing_t rec[LINK_MAX_PAIRINGS];
+    p = list_pairings(rec);
+    CHECK(p.count == 1 && rec[0].device_id == FAKE_ID && rec[0].slot == 0, "stored pairing");
+
+    // compact samples instead of input + IMU
+    size_t s0 = H.nev;
+    run(500000);
+    size_t n = count(&H, EVT_SAMPLE, s0);
+    CHECK(n > 200 && count(&H, EVT_INPUT, s0) == 0 && count(&H, EVT_IMU, s0) == 0, "%zu samples in 0.5 s", n);
+    ev_t* e = find(&H, EVT_SAMPLE, s0, -1, 0);
+    if (e) {
+        link_sample_t smp;
+        memcpy(&smp, e->body, sizeof smp);
+        CHECK(e->len == sizeof smp && smp.in.slot == 0 && smp.accel[2] == 1024 && (smp.in.flags & 4), "sample fields");
+    }
+
+    // dongle reboot: RAM gone, flash kept. The controller loses us, seeks, and is let back in.
+    H.plat.radio_halt(&H.plat);
+    host_init(H.host, &H.plat);
+    H.host->store = &store;
+    store_init(&store, &FLASH);
+    CHECK(store.ok && store.netaddr == netaddr && store.npairs == 1, "store after reboot");
+    run(300000);
+    mark = H.nev;
+    r = start_stored();
+    CHECK(r.status == LINK_OK && r.detail == 1 && H.host->netaddr == netaddr, "restart %u/%u", r.status, r.detail);
+    for (int i = 0; i < 150 && !find(&H, EVT_CONN, mark, 9, LINK_SLOT_CONNECTED); i++) run(10000);
+    CHECK(find(&H, EVT_CONN, mark, 9, LINK_SLOT_CONNECTED), "no reconnect after the dongle reboot");
+
+    // forget it: disconnected, slot freed, refused afterwards, gone from the list
+    mark = H.nev;
+    r = HOST_CMD(CMD_PAIR_FORGET, link_pair_forget_t, .device_id = FAKE_ID);
+    CHECK(r.status == LINK_OK && r.detail == 1, "forget %u/%u", r.status, r.detail);
+    CHECK(find(&H, EVT_CONN, mark, 9, LINK_SLOT_FREE), "forgotten controller still in its slot");
+    run(400000);
+    CHECK(!find(&H, EVT_CONN, mark, 9, LINK_SLOT_CONNECTED), "forgotten controller reconnected");
+    CHECK(list_pairings(NULL).count == 0, "still listed");
+    r = HOST_CMD(CMD_PAIR_FORGET, link_pair_forget_t, .device_id = 0);
+    CHECK(r.status == LINK_ERR_ARGS, "forget id 0 without ALL: %u", r.status);
+    r = HOST_CMD(CMD_PAIR_FORGET, link_pair_forget_t, .flags = LINK_FORGET_IDENTITY);
+    CHECK(r.status == LINK_OK && store.netaddr == 0, "forget identity");
+    r = start_stored();
+    CHECK(r.status == LINK_OK && H.host->netaddr && H.host->netaddr != netaddr, "new identity after forget");
 }
 
 static void scenario_bad_args(void) {
@@ -522,11 +634,14 @@ int main(int argc, char** argv) {
     }
     node_init(&H, "host", true, 123456789.0, ppm_h, 0xD0D0CAFE00000001ull);
     node_init(&C, "fake", false, 987654.0, ppm_c, FAKE_ID);
+    store_init(&store, &FLASH);
+    H.host->store = &store;
     T = 0;
     scenario_pair_connect_stream();
     scenario_loss_and_outage();
     scenario_disconnect_forget();
     scenario_real_formats();
+    scenario_stored();
     scenario_bad_args();
     if (failures) {
         print_texts(&H, 0);

@@ -18,7 +18,9 @@ python test/test.py "$PWD/build/test/hop_test.exe"
 "$CC" -std=c11 -Wall -Wextra -Wconversion -O2 -static test/crypto_test.c src/crypto.c -o build/test/crypto_test.exe
 build/test/crypto_test.exe
 python test/test_crypto.py "$PWD/build/test/crypto_test.exe"
-CORE="src/host_core.c src/ctrl_core.c src/pulsar_cl.c src/pulsar_pair.c src/pulsar_ll.c src/pulsar_hop.c src/crypto.c"
+"$CC" -std=c11 -Wall -Wextra -Wconversion -Wno-sign-conversion -O2 -static -Isrc test/store_test.c src/store.c -o build/test/store_test.exe
+build/test/store_test.exe
+CORE="src/store.c src/host_core.c src/ctrl_core.c src/pulsar_cl.c src/pulsar_pair.c src/pulsar_ll.c src/pulsar_hop.c src/crypto.c"
 "$CC" -std=c11 -Wall -Wextra -Wconversion -O1 -static -Isrc test/ll_test.c src/pulsar_ll.c src/pulsar_hop.c   src/pulsar_pair.c src/crypto.c -o build/test/ll_test.exe
 python test/test_ll.py "$PWD/build/test/ll_test.exe"
 "$CC" -std=gnu11 -Wall -Wextra -Wconversion -Wno-sign-conversion -O2 -static -Isrc test/sim.c $CORE -o build/test/sim.exe
