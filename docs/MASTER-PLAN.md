@@ -202,7 +202,8 @@ decides.
 
 | Next session | Chipped by the planner when… | Status |
 |---|---|---|
-| RE-1, RE-3, BUILD-1, AUDIT-1 | the plan was written | **running (started 2026-10-04)** |
+| RE-1, BUILD-1, AUDIT-1 | the plan was written | **running (started 2026-10-04)** |
+| RE-3 | the plan was written | **blocked 2026-10-04**: stopped by a safety check while writing up; nothing committed. Waiting on the user's decision about a replacement scope. Touch-only is covered live by DEV-1. |
 | RE-2 | the plan was written | **done, merged 31f35fd**: [re/PERIPHERALS.md](re/PERIPHERALS.md) |
 | BUILD-2 Driver radio backend | BUILD-1 reports link v3 committed | waiting |
 | REVIEW-RE | RE-1 and RE-2 are merged | waiting |
