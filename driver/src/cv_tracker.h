@@ -15,11 +15,19 @@
 //  2. CONNECT (never Create) the shared /event and /data queues. They exist only once a Frame
 //     controller has connected since SteamVR started; until then we wait and retry, because if
 //     we created them, driver_cv (which always Creates) could no longer enrol a real controller.
-//     Exception: Options::create_shared_queues (experiment, off by default; docs/re/DEV-1.md
-//     G-Touch-only) Creates them with driver_cv's parameters when Connect says QueueNotFound.
+//     Exception: Options::create_shared_queues (docs/re/DEV-1.md G-Touch-only, CONFIRMED to work)
+//     Creates them with driver_cv's parameters when Connect still says QueueNotFound after
+//     create_after_s. Cost: the first Frame controller turned on later in that SteamVR session
+//     fails its own Create and gets no pose until SteamVR restarts (buttons/haptics still work).
 //  3. Send the connect event with the JSON in both slots and both blockDataSize properties set on
 //     the block before release.
 //  4. IMU blocks then flow; poses come back on our queue.
+//
+// Re-announce (FRAME-TRACKER §9.3): a device announced while another controller holds its hand's
+// tracker slot does not get the slot when it frees. Reannounce() sends a disconnect, then after
+// ≥ 1.1 s connects again under a FRESH deviceId with its own new pose queue: XRService reads the
+// event queue about once a second and skips deviceIds it already knows (AUDIT-1 F2/F3). Every
+// event write is spaced ≥ 1.1 s from the previous one for the same reason.
 #pragma once
 #include <atomic>
 #include <cstdint>
@@ -102,6 +110,10 @@ public:
         // with driver_cv's parameters (0x6010 / 0x30, header 0x200, count 4, flags 0) instead of
         // waiting for a Frame controller. Destroyed again in Stop().
         bool create_shared_queues = false;
+        double create_after_s = 0;            // ... after waiting this long for a Frame controller
+        bool destroy_created_queues = true;   // Stop() destroys queues we created (experiment).
+                                              // Touch-only use keeps them: re-Creating later would
+                                              // fail driver_cv again, and vrserver frees them at exit.
     };
     using PoseCallback = std::function<void(const CvPose&)>;
 
@@ -119,8 +131,12 @@ public:
     // Dropped (returns false) until connected or while XRService isn't reading.
     bool PushImu(double t, const float accel[3], const float gyro[3], uint32_t flags = 0);
 
+    // Announce again under new_device_id (16..63, not used before in this SteamVR session).
+    void Reannounce(uint32_t new_device_id) { reannounce_to_ = new_device_id; }
+
     bool connected() const { return connected_; }
-    uint32_t device_id() const { return opt_.device_id; }
+    uint32_t device_id() const { return device_id_; }
+    bool created_shared_queues() const { return created_event_ || created_data_; }
 
     struct Stats {
         uint64_t imu_sent = 0, imu_dropped = 0, poses = 0, poses_valid = 0, connect_events = 0;
@@ -131,14 +147,20 @@ private:
     void SetupLoop();
     void PoseLoop();
     bool SendEvent(uint32_t type);
+    bool CreatePoseQueue(uint32_t id, vrint::BlockQueueHandle_t* out);
+    bool DoReannounce(uint32_t new_id);
 
     Options opt_;
     PoseCallback cb_;
     vrint::IVRBlockQueue* bq_ = nullptr;
     vrint::IVRPaths* paths_ = nullptr;
+    std::mutex pose_mu_;  // pose_q_ swaps (re-announce) vs the pose reader
     vrint::BlockQueueHandle_t pose_q_ = 0;
+    std::atomic<uint32_t> device_id_{0}, reannounce_to_{0};
+    bool derived_hwid_ = false;
+    double last_event_t_ = -1e9;
     std::atomic<vrint::BlockQueueHandle_t> event_q_{0}, data_q_{0};  // 0 = not connected
-    bool created_event_ = false, created_data_ = false;              // we own them (experiment)
+    std::atomic<bool> created_event_{false}, created_data_{false};  // we Created them (Touch-only)
     std::atomic<bool> running_{false};
     std::atomic<bool> connected_{false};
     std::atomic<bool> pose_q_ready_{false};
