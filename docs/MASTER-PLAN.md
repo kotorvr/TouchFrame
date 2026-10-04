@@ -149,8 +149,9 @@ Three separate things gate progress, and only one is shipping:
 - [x] **USB-C (male) to USB-A (female) OTG adapter** (ordered). The dongle is USB-A and the Frame is USB-C.
       If the Frame has one port, get a USB-C hub with PD pass-through so it can charge while the
       dongle is in.
+- [x] **USB-C hub with PD pass-through** (ordered). DEV-1 found the Frame has one USB-C port, so the dongle and charging share it.
 - [ ] Optional: a USB-A extension, to get the dongle away from the headset's own 2.4 GHz radios.
-- [ ] **Freeze Quest updates** (or at least note the build). The Quest pushes controller firmware;
+- [x] **Freeze Quest updates** (done 2026-10-04; controllers on fw 207.5.0 = the OTA build, DEV-1) (or at least note the build). The Quest pushes controller firmware;
       all RE is against OTA build 52433670048800520. Check that the controllers report that build
       before hardware day.
 
