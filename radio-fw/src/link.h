@@ -137,8 +137,9 @@ enum {
     LINK_CAP_HID = 1u << 5,               // the HID interface is present
     // Set when the matching on-air format is pinned by RE and implemented for real controllers.
     LINK_CAP_REAL_PAIRING = 1u << 8,      // discovery + 0x12/0x11 exchange (PROTOCOL Q2)
-    LINK_CAP_REAL_CONN_NEG = 1u << 9,     // connected-link negotiation / slot lock (RE-1)
-    LINK_CAP_REAL_NONCE = 1u << 10,       // steady-state CCM nonce (RE-1)
+    LINK_CAP_REAL_CONN_NEG = 1u << 9,     // connected-link negotiation / slot lock (RE-1; built to
+                                          // docs/re/LINK.md §4, not yet seen on air)
+    LINK_CAP_REAL_NONCE = 1u << 10,       // steady-state CCM nonce (RE-1; counter start unverified)
     LINK_CAP_REAL_HREG = 1u << 11,        // register read / write / subscribe (RE-1)
     LINK_CAP_REAL_INPUT = 1u << 12,       // EVT_INPUT from real controllers (RE-1 + RE-2)
     LINK_CAP_REAL_IMU = 1u << 13,         // EVT_IMU from real controllers (RE-2)
@@ -330,7 +331,8 @@ enum link_hand { LINK_HAND_UNKNOWN = 0, LINK_HAND_LEFT = 1, LINK_HAND_RIGHT = 2 
 // CMD_PAIR_FORGET: remove one stored pairing (device_id), or all (LINK_FORGET_ALL). A forgotten
 // controller that is connected or allowed in a slot is disconnected (EVT_CONN). LINK_FORGET_IDENTITY
 // (implies ALL) also replaces the stored netaddr + key, so no controller paired before can connect
-// until it is paired again; it takes effect at the next CMD_HOST_START with LINK_HOST_STORED.
+// until it is paired again; it takes effect at the next CMD_HOST_START with LINK_HOST_STORED, and
+// until then CMD_PAIR_START answers LINK_ERR_STATE.
 enum { LINK_FORGET_ALL = 1u << 0, LINK_FORGET_IDENTITY = 1u << 1 };
 
 typedef struct __attribute__((packed)) {
@@ -358,7 +360,8 @@ typedef struct __attribute__((packed)) {
 
 // CMD_CONNECT: allow a paired controller into a slot. It connects when it next seeks (it does so
 // on its own after pairing and after every link loss). slot 0xFF = first free slot; the EVT_RESULT
-// detail byte carries the slot chosen.
+// detail byte carries the slot chosen. Slot 4 is not assigned (LINK_ERR_NO_SLOT) while its CL
+// endpoint would be 5 (src/pulsar_ll.h PULSAR_ENDPOINT_OFFSET; docs/re/LINK.md §4: endpoints 1..4).
 typedef struct __attribute__((packed)) {
     uint8_t tag;
     uint8_t slot;        // 0..4, or 0xFF
@@ -551,6 +554,8 @@ enum {
     LINK_FAKE_PAIRED = 1u << 0,      // start already paired to netaddr/link_key (skip advertising)
     LINK_FAKE_STREAM_INPUT = 1u << 1,// send synthetic input samples when connected
     LINK_FAKE_STREAM_IMU = 1u << 2,  // send synthetic IMU samples when connected
+    LINK_FAKE_REAL_CONN = 1u << 3,   // connect with the real request / negotiation formats (host
+                                     // without LINK_HOST_PLACEHOLDER); nothing else after that
 };
 
 // CMD_FAKE_START: this dongle plays a Touch Plus. Unpaired, it advertises on 2402 and answers the

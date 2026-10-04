@@ -55,7 +55,7 @@ def test_link_h_matches_radio_py():
     caps = {k: v for k, v in c.items() if k.startswith("LINK_CAP_")}
     assert sorted(v.bit_length() - 1 for v in caps.values()) == sorted(R.CAPS), caps
     for pyname in ("HOST_AUTO_ACCEPT", "HOST_DM_BEACONS", "HOST_RAW_UPLINKS", "HOST_PLACEHOLDER", "HOST_COMPACT",
-                   "HOST_STORED", "FORGET_ALL", "FORGET_IDENTITY", "PAIR_AUTO",
+                   "HOST_STORED", "FORGET_ALL", "FORGET_IDENTITY", "PAIR_AUTO", "FAKE_REAL_CONN",
                    "FAKE_PAIRED", "FAKE_STREAM_INPUT", "FAKE_STREAM_IMU", "LED_OFF", "LED_ON", "LED_STROBE",
                    "HAPTIC_STOP", "HAPTIC_SIMPLE", "HAPTIC_PCM"):
         assert getattr(R, pyname) == c["LINK_" + pyname], pyname
@@ -209,19 +209,20 @@ def test_host_session():
 
 
 def test_pending_re_behaviour():
-    """Today's firmware: real-controller formats unknown -> PENDING_RE, no connection."""
+    """Today's firmware: real negotiation connects, but no input formats and PENDING_RE peripherals."""
     fake = FakeDongle(pending_re=True, controllers=[SimController(0xAB)])
     fake.controllers[0].paired = (0x1234, bytes(16))
     d = R.Dongle(transport=fake)
     h = d.hello()
-    assert "real_conn_neg" not in h["caps_names"] and "real_pairing" in h["caps_names"]
+    assert "real_conn_neg" in h["caps_names"] and "real_hreg" not in h["caps_names"]
     d.host_start(0x1234, bytes(16), 1)
     d.request(R.CMD_CONNECT, "link_connect_t", slot=0, device_id=0xAB)
+    wait(d, lambda n, e: n == "conn" and e["state"] == 3)
     r, _ = d.request(R.CMD_REG_READ, "link_reg_cmd_t", slot=0, reg=9, check=False)
     assert r["status"] == 5
     t_end = time.monotonic() + 0.3
     for name, e in d.events(0.05):
-        assert not (name == "conn" and e["state"] == 3), "connected without a pinned negotiation"
+        assert name not in ("input", "imu", "sample"), "input from a real controller without a pinned format"
         if time.monotonic() > t_end:
             break
     # ... and with the placeholder formats (loopback) it does connect
@@ -229,7 +230,7 @@ def test_pending_re_behaviour():
     conn, _ = wait(d, lambda n, e: n == "conn" and e["state"] == 3)
     ev, _ = wait(d, lambda n, e: n == "input")
     assert ev["flags"] & 1, "placeholder flag not set on input"
-    print("pending-RE behaviour: PENDING_RE without placeholder, connects with it")
+    print("pending-RE behaviour: real connect, no input, PENDING_RE peripherals; placeholder streams")
 
 
 def test_stored_and_compact():

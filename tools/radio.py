@@ -21,7 +21,8 @@ Host mode (link v3):
                                          remove stored pairings (--identity-too: new netaddr + key, so
                                          every controller must pair again)
   radio.py ping [--count 50]             time-sync quality (rtt, drift) between dongle and PC
-  radio.py fake [--paired] [--slot 0]    loopback rig: this dongle plays a Touch Plus (second dongle)
+  radio.py fake [--paired] [--slot 0] [--real-conn]
+                                         loopback rig: this dongle plays a Touch Plus (second dongle)
   radio.py selftest                      on-dongle X25519 / AES / HW-CCM checks
 
 --hid (any command) talks over the dongle's HID interface instead of the serial port (the Frame has
@@ -87,7 +88,7 @@ HOST_COMPACT, HOST_STORED = 16, 32
 PAIR_AUTO = 1
 FORGET_ALL, FORGET_IDENTITY = 1, 2
 HANDS = {0: "unknown", 1: "left", 2: "right"}
-FAKE_PAIRED, FAKE_STREAM_INPUT, FAKE_STREAM_IMU = 1, 2, 4
+FAKE_PAIRED, FAKE_STREAM_INPUT, FAKE_STREAM_IMU, FAKE_REAL_CONN = 1, 2, 4, 8
 LED_OFF, LED_ON, LED_STROBE = 0, 1, 2
 HAPTIC_STOP, HAPTIC_SIMPLE, HAPTIC_PCM = 0, 1, 2
 MAX_SLOTS, REG_MAX, PCM_MAX, MAX_PAIRINGS = 5, 32, 48, 8
@@ -881,7 +882,7 @@ def cmd_ping(args):
 
 def cmd_fake(args):
     d = open_dongle(args)
-    flags = (FAKE_STREAM_INPUT if not args.no_input else 0) | (FAKE_STREAM_IMU if not args.no_imu else 0)
+    flags = (FAKE_STREAM_INPUT if not args.no_input else 0) | (FAKE_STREAM_IMU if not args.no_imu else 0) |         (FAKE_REAL_CONN if args.real_conn else 0)
     kw = {}
     if args.paired:
         ident = load_identity(args.identity)
@@ -992,6 +993,8 @@ def main():
     p.add_argument("--device-id", help="hex; default = the dongle's own FICR id")
     p.add_argument("--no-input", action="store_true")
     p.add_argument("--no-imu", action="store_true")
+    p.add_argument("--real-conn", action="store_true",
+                   help="connect with the real request/negotiation formats (host without --placeholder)")
     p.set_defaults(fn=cmd_fake)
     sub.add_parser("selftest", help="on-dongle crypto/radio self-tests (X25519, AES, HW CCM)").set_defaults(fn=cmd_selftest)
     args = ap.parse_args()

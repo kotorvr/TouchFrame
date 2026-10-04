@@ -18,58 +18,88 @@ static uint32_t get32(const uint8_t* p) {
 }
 static uint64_t get64(const uint8_t* p) { return (uint64_t)get32(p) | (uint64_t)get32(p + 4) << 32; }
 
-//------------------------------------------------------------------ real formats: RE pending
+//------------------------------------------------------------------ real formats
 
-// TODO(RE-1, MASTER-PLAN 3.1.3): the steady-state nonce the host must produce. PROTOCOL Q3 has two
-// INFERRED hypotheses: (a) the negotiation's random 8-byte IV reused for the session with an
-// advancing 39-bit counter, (b) the 16-bit session nonce in the top counter bits. Whichever RE-1
-// pins goes here; tools/pulsar_crypto.py `scan` checks it against a capture in one packet.
-static bool real_nonce(const cl_session_t* s, uint64_t period, uint8_t dir, uint8_t slot, uint8_t nonce[13]) {
-    (void)s, (void)period, (void)dir, (void)slot, (void)nonce;
-    return false;
-}
-
-// TODO(RE-1, MASTER-PLAN 3.1.1-2): connection negotiation, CL/TL framing, hreg access.
-// Known so far (PROTOCOL Q6, elk-app accept handler FUN_00023aa8): the controller accepts a
-// negotiation packet with [0] = 1 (type), [2] & 7 = endpoint (2 = CONN_NEG, 3 = lock), [3..10] =
-// its 64-bit peer id, [11] = slot; its response starts 0x19, 0x11 and echoes its connection
-// record incl. the 0x1701 version. Not enough to transmit: byte 1, the trailing fields, the
-// 36-byte beacon variant and the nonce are open.
-// TODO(RE-2, MASTER-PLAN 3.1.5-8): LED config (p / ot / d and its limits), haptics, IMU layout.
-static int real_encode(const cl_msg_t* m, uint8_t* out, int max) {
-    (void)m, (void)out, (void)max;
+// Connection negotiation, host -> controller (docs/re/LINK.md §4, the device accept handler elk-app
+// 0x23aa8): [0] 1, [1] 0 (INFERRED), [2] endpoint (CL_EP_CONN_NEG, then CL_EP_LOCK), [3..10] the
+// controller's device id, [11] the radio slot we assign (0..4), [12..13] version 0x1701. As
+// tools/pulsar_host.py build_conn_negotiation. INFERRED: that these 14 bytes alone (not the 26-byte
+// record body syncboss copies, CL length 36) are enough; the device validates only [0], [2], [3..11].
+#define REAL_CONN_TYPE 1
+#define REAL_CONN_LEN 14
+#define REAL_REQ_LEN 25
+// TODO(RE-1, one capture): the TL header for register read / write / subscribe (LINK.md §3: command
+// register ids 0x05..0xb4) and notifications (0x14 wrapper stripped, ntf chunk stream).
+// TODO(RE-2 formats exist in docs/re/PERIPHERALS.md; they need that transport): LED cmd 0x28
+// {u32 period_us >= 700, u32 ontime_us <= 75, i32 centre_us on the host clock}; haptics 0x97 /
+// 0xa0 {amp, u16 Hz 40..561} / 0x9d ADPCM (each stops after 2 s; send 0x97 at duration_ms when
+// shorter); input/IMU arrive as notification chunks after cmd 9 (IMU ntf 1 = u48 timestamp + 6 x
+// i16 at 500 Hz, scales from cmd 0x32).
+static int real_encode(const cl_msg_t* m, uint8_t* b, int max) {
+    if (m->type == CL_CONN_ACCEPT) {
+        if (max < REAL_CONN_LEN) return CL_TOO_BIG;
+        memset(b, 0, REAL_CONN_LEN);
+        b[0] = REAL_CONN_TYPE;
+        b[2] = (uint8_t)(m->u.conn.endpoint & 7);
+        put64(b + 3, m->u.conn.device_id);
+        b[11] = m->u.conn.slot;
+        put16(b + 12, m->u.conn.version);
+        return REAL_CONN_LEN;
+    }
+    if (m->type == CL_CONN_REQ) {  // the request as real_decode reads it (the fake controller sends it)
+        if (max < REAL_REQ_LEN) return CL_TOO_BIG;
+        memset(b, 0, REAL_REQ_LEN);
+        b[1] = 0x11;
+        put64(b + 2, m->u.conn.device_id);
+        put16(b + 10, m->u.conn.version);
+        b[14] = 1;  // slots requested
+        memcpy(b + 15, m->u.conn.iv, 8);
+        return REAL_REQ_LEN;
+    }
     return CL_PENDING_RE;
 }
 
-// TODO(RE-1/RE-2): parse real uplinks (negotiation request, hreg data, input, IMU). Until then the
-// host can only report them raw (LINK_HOST_RAW_UPLINKS).
-static bool real_decode(const uint8_t* in, int len, uint8_t dir, cl_msg_t* m) {
-    (void)in, (void)len, (void)dir, (void)m;
-    return false;
+// The controller's connection request (docs/re/AUDIT.md A3, elk-app 0x23bc4, LENGTH 25):
+// [0] 0, [1] 0x11 (format: [1] >> 3 = 2), [2..9] device id, [10..13] version word (01 17 ..),
+// [14] ?, [15..22] the steady-state IV (u64 LE), [23..24] ?. INFERRED: that the CL payload starts at
+// the first decrypted uplink byte (the LL/CL header split is RE-1's).
+// TODO(RE-1): input / IMU / hreg uplinks.
+static bool real_decode(const uint8_t* b, int n, uint8_t dir, cl_msg_t* m) {
+    memset(m, 0, sizeof(*m));
+    if (dir == CL_DIR_DOWN) {  // a negotiation packet, checked like the device accept handler does
+        uint8_t ep = n >= REAL_CONN_LEN ? b[2] & 7 : 0;
+        if (b[0] != REAL_CONN_TYPE || (ep != CL_EP_CONN_NEG && ep != CL_EP_LOCK) || b[11] >= PULSAR_SLOTS)
+            return false;
+        m->type = CL_CONN_ACCEPT;
+        m->u.conn.endpoint = ep;
+        m->u.conn.device_id = get64(b + 3);
+        m->u.conn.slot = b[11];
+        m->u.conn.version = get16(b + 12);
+        return true;
+    }
+    if (n < 23 || b[0] != 0 || (b[1] >> 3) != 2) return false;
+    m->type = CL_CONN_REQ;
+    m->u.conn.device_id = get64(b + 2);
+    m->u.conn.version = get16(b + 10);
+    m->u.conn.slot = 0xFF;  // a real controller does not ask for a slot
+    memcpy(m->u.conn.iv, b + 15, 8);
+    return true;
 }
 
-const cl_format_t cl_real = {"real", true, real_nonce, real_encode, real_decode, 0};
+const cl_format_t cl_real = {"real", true, real_encode, real_decode, 0};
 
 //------------------------------------------------------------------ placeholder (loopback only)
 // Invented by TouchFrame. Byte 0 = type, byte 1 = seq (down) or ack (up), then the fields below.
-// Nonce: counter = beacon period index, direction bit, IV = session nonce, netaddr, slot, 'T'.
+// Rides the real LL: plaintext downlink, uplink under the legacy nonce until the accept and the
+// steady-state nonce after (the IV travels in CONN_REQ, like the real request).
 
 enum {
     PH_CONN_ACCEPT = 0x01, PH_CONN_REJECT = 0x02, PH_DISCONNECT = 0x03,
     PH_REG_READ = 0x10, PH_REG_WRITE = 0x11, PH_REG_SUB = 0x12,
     PH_LED = 0x20, PH_HAPTIC = 0x21,
     PH_IDLE = 0x80, PH_CONN_REQ = 0x81, PH_STREAM = 0x82, PH_REG_DATA = 0x83,
+    PH_STREAM_LEN = 36,
 };
-
-static bool ph_nonce(const cl_session_t* s, uint64_t period, uint8_t dir, uint8_t slot, uint8_t nonce[13]) {
-    uint64_t pc = (period & ((1ull << 39) - 1)) | (uint64_t)(dir & 1) << 39;
-    for (int i = 0; i < 5; i++) nonce[i] = (uint8_t)(pc >> (8 * i));
-    put16(nonce + 5, s->session_nonce);
-    put32(nonce + 7, s->netaddr);
-    nonce[11] = slot;
-    nonce[12] = 'T';
-    return true;
-}
 
 static int ph_encode(const cl_msg_t* m, uint8_t* p, int max) {
     uint8_t b[CL_UP_MAX];
@@ -88,7 +118,8 @@ static int ph_encode(const cl_msg_t* m, uint8_t* p, int max) {
         b[10] = m->u.conn.slot;
         put16(b + 11, m->u.conn.version);
         b[13] = m->u.conn.reason;
-        n = 14;
+        memcpy(b + 14, m->u.conn.iv, 8);
+        n = 22;
         break;
     case CL_REG_READ:
     case CL_REG_WRITE:
@@ -141,14 +172,18 @@ static int ph_encode(const cl_msg_t* m, uint8_t* p, int max) {
         b[1] = m->ack;
         put16(b + 2, s->seq);
         put32(b + 4, s->sample_us);
-        put16(b + 8, s->buttons);
-        for (int i = 0; i < 4; i++) put16(b + 10 + 2 * i, s->analog[i]);
-        b[18] = s->touch;
-        put16(b + 19, s->battery);
-        for (int i = 0; i < 3; i++) put16(b + 21 + 2 * i, (uint16_t)s->accel[i]);
-        for (int i = 0; i < 3; i++) put16(b + 27 + 2 * i, (uint16_t)s->gyro[i]);
-        put16(b + 33, (uint16_t)s->temp);
-        n = 35;
+        b[8] = s->buttons;
+        b[9] = s->battery_pct;
+        put16(b + 10, s->touch);
+        put16(b + 12, (uint16_t)s->stick[0]);
+        put16(b + 14, (uint16_t)s->stick[1]);
+        put16(b + 16, s->trigger);
+        put16(b + 18, s->grip);
+        put16(b + 20, s->pressure);
+        for (int i = 0; i < 3; i++) put16(b + 22 + 2 * i, (uint16_t)s->accel[i]);
+        for (int i = 0; i < 3; i++) put16(b + 28 + 2 * i, (uint16_t)s->gyro[i]);
+        put16(b + 34, (uint16_t)s->temp);
+        n = PH_STREAM_LEN;
         break;
     }
     case CL_REG_DATA:
@@ -183,7 +218,7 @@ static bool ph_decode(const uint8_t* b, int n, uint8_t dir, cl_msg_t* m) {
     case PH_CONN_REJECT:
     case PH_DISCONNECT:
     case PH_CONN_REQ:
-        if (n < 14 || up != (b[0] == PH_CONN_REQ)) return false;
+        if (n < 22 || up != (b[0] == PH_CONN_REQ)) return false;
         m->type = b[0] == PH_CONN_ACCEPT ? CL_CONN_ACCEPT
                 : b[0] == PH_CONN_REJECT ? CL_CONN_REJECT
                 : b[0] == PH_DISCONNECT ? CL_DISCONNECT : CL_CONN_REQ;
@@ -191,6 +226,7 @@ static bool ph_decode(const uint8_t* b, int n, uint8_t dir, cl_msg_t* m) {
         m->u.conn.slot = b[10];
         m->u.conn.version = get16(b + 11);
         m->u.conn.reason = b[13];
+        memcpy(m->u.conn.iv, b + 14, 8);
         return true;
     case PH_REG_READ:
     case PH_REG_WRITE:
@@ -236,18 +272,22 @@ static bool ph_decode(const uint8_t* b, int n, uint8_t dir, cl_msg_t* m) {
         m->type = CL_IDLE;
         return true;
     case PH_STREAM: {
-        if (!up || n < 35) return false;
+        if (!up || n < PH_STREAM_LEN) return false;
         cl_stream_t* s = &m->u.stream;
         m->type = CL_STREAM;
         s->seq = get16(b + 2);
         s->sample_us = get32(b + 4);
-        s->buttons = get16(b + 8);
-        for (int i = 0; i < 4; i++) s->analog[i] = get16(b + 10 + 2 * i);
-        s->touch = b[18];
-        s->battery = get16(b + 19);
-        for (int i = 0; i < 3; i++) s->accel[i] = (int16_t)get16(b + 21 + 2 * i);
-        for (int i = 0; i < 3; i++) s->gyro[i] = (int16_t)get16(b + 27 + 2 * i);
-        s->temp = (int16_t)get16(b + 33);
+        s->buttons = b[8];
+        s->battery_pct = b[9];
+        s->touch = get16(b + 10);
+        s->stick[0] = (int16_t)get16(b + 12);
+        s->stick[1] = (int16_t)get16(b + 14);
+        s->trigger = get16(b + 16);
+        s->grip = get16(b + 18);
+        s->pressure = get16(b + 20);
+        for (int i = 0; i < 3; i++) s->accel[i] = (int16_t)get16(b + 22 + 2 * i);
+        for (int i = 0; i < 3; i++) s->gyro[i] = (int16_t)get16(b + 28 + 2 * i);
+        s->temp = (int16_t)get16(b + 34);
         return true;
     }
     case PH_REG_DATA:
@@ -265,4 +305,4 @@ static bool ph_decode(const uint8_t* b, int n, uint8_t dir, cl_msg_t* m) {
     return false;
 }
 
-const cl_format_t cl_placeholder = {"placeholder", false, ph_nonce, ph_encode, ph_decode, 21};
+const cl_format_t cl_placeholder = {"placeholder", false, ph_encode, ph_decode, 25};

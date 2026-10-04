@@ -620,6 +620,28 @@ at 0x60 is body-frame: relative error 0.00 as body frame vs 1.14 as world frame.
 
 ### 9.6 Next
 
+> **Update 2026-10-04 (RE-3b, [re/FRAME-MODEL.md](re/FRAME-MODEL.md), authoritative where it disagrees):**
+> - **The "Couldn't find any neighbor" flood:** XRService picks a controller type from substrings
+>   of `model_number` (`FUN_025af580`). Unknown names fall to types that load fixed **18-LED**
+>   neighbour tables, and the P3P bootstrap (`FUN_025b1a10`) then reads them as 8-wide.
+>   **Fix:** `model_number` = `TouchFrame_TouchPlus_<Hand>_Roy_EV1.5` (type EV1.5: neighbours are
+>   computed from our own geometry) plus `cv.led_nominal_brightness` 0.75. This is now the
+>   `tools/touchplus_config.py` default, and `--check` validates a config.
+> - **Controller frames: streamingMode 4 = 30 Hz, 10 µs exposure, gain 1.0.** A 75 µs pulse must
+>   be centred within **±32.5 µs**. With an integer-µs period the pulse drifts ~0.33 µs/frame, so
+>   the phase must be re-applied continuously.
+> - **XRService logs each controller frame's timestamp** ("Not having enough IMU data for
+>   controller frame … Current timestamp"). That gives the camera period and phase without any hook
+>   (test T3).
+> - Corrections:
+>   - §5: DIPr is per hand, not per `model_number`.
+>   - §3: "Manual exposure" is mode 5, which isn't the mode that runs.
+>   - `led_type`, `led_nominal_brightness` and `has_retro_reflectors` live under `"cv"`.
+>   - `channelMap` isn't read.
+>   - The neighbor strings DEV-1 cited are at vaddr `0xb14d1e`/`0xc0f246`.
+> - Last-resort levers: `cv.has_retro_reflectors` (blob threshold 170 → 60), and streamingMode 2/3
+>   (0.25/0.75 ms) via `XRServiceSettings.json`. Per-slot mode arbitration is UNKNOWN.
+
 > **Update 2026-10-04 (DEV-1, [re/DEV-1.md](re/DEV-1.md); AUDIT-1 [re/AUDIT.md](re/AUDIT.md)):**
 > - **Touch-only works.** With both Frame controllers off since SteamVR start, driver_touchframe
 >   Created `/xrservice/controller/{event,data}` with driver_cv's parameters, and XRService

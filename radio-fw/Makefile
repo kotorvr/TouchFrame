@@ -22,6 +22,7 @@ SRC_C = \
   src/pulsar_cl.c \
   src/pulsar_pair.c \
   src/host_core.c \
+  src/store.c \
   src/ctrl_core.c \
   src/clock.c \
   src/hal.c \
@@ -33,6 +34,7 @@ SRC_C = \
   $(TP)/tinyusb/src/device/usbd.c \
   $(TP)/tinyusb/src/device/usbd_control.c \
   $(TP)/tinyusb/src/class/cdc/cdc_device.c \
+  $(TP)/tinyusb/src/class/hid/hid_device.c \
   $(TP)/tinyusb/src/portable/nordic/nrf5x/dcd_nrf5x.c
 SRC_C := $(wildcard $(SRC_C))
 SRC_S = $(TP)/nrfx/mdk/gcc_startup_nrf52840.S

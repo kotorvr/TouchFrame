@@ -62,6 +62,11 @@ void ctrl_start(ctrl_t* c, const uint8_t* body, uint32_t len) {
     reg_set(c, 0x16, zero, 2);
     reg_set(c, 0x17, zero, 8);
     reg_set(c, 0x2b, zero, 1);
+    // imu_config as tools/fake_dongle.py has it: accel +-32 g, gyro +-4000 dps, 500 Hz, 1/1024 g and
+    // 1/8.192 dps per count
+    static const uint8_t imu_cfg[16] = {0x00, 0x7d, 0xa0, 0x0f, 0xf4, 0x01, 0xf4, 0x01,
+                                        0x00, 0x00, 0x80, 0x3a, 0x00, 0x00, 0xfa, 0x3d};
+    reg_set(c, 0x32, imu_cfg, 16);
     if (f.flags & LINK_FAKE_PAIRED) {
         c->paired = true;
         c->netaddr = f.netaddr;
@@ -72,7 +77,11 @@ void ctrl_start(ctrl_t* c, const uint8_t* body, uint32_t len) {
         x25519_base(c->pub, c->priv);  // ~70 ms, before the radio starts
         c->state = CTRL_ADVERTISING;
     }
-    c->session.netaddr = c->netaddr;
+    plat->random(plat, c->iv, sizeof c->iv);
+    if (f.flags & LINK_FAKE_REAL_CONN) {
+        c->fmt = &cl_real;
+        c->dir = 1;  // as tools/pulsar_host.py's steady_state_nonce default: exercises the host's learning
+    }
     plat->emit(plat, EVT_RESULT, &r, sizeof r, NULL, 0);
     plat->kick(plat);
 }
@@ -117,6 +126,7 @@ static void build_uplink(ctrl_t* c, uint64_t now, radio_op_t* op) {
         m.u.conn.device_id = c->device_id;
         m.u.conn.slot = c->want_slot;
         m.u.conn.version = PULSAR_VERSION;
+        memcpy(m.u.conn.iv, c->iv, 8);
     } else if (c->reply_reg_pending) {
         m = c->reg_reply;
         m.ack = c->last_dl_seq;
@@ -135,7 +145,7 @@ static void build_uplink(ctrl_t* c, uint64_t now, radio_op_t* op) {
             m.u.reg.len = reg < CTRL_REGS ? c->reg_len[reg] : 0;
             if (m.u.reg.len) memcpy(m.u.reg.data, c->regs[reg], m.u.reg.len);
         } else if (c->flags & (LINK_FAKE_STREAM_INPUT | LINK_FAKE_STREAM_IMU)) {
-            // synthetic sample: a 1 Hz triangle on the analogs, button 0 toggling each second
+            // synthetic sample: a 1 Hz triangle on trigger / grip / stick, button 0 toggling each second
             cl_stream_t* s = &m.u.stream;
             m.type = CL_STREAM;
             s->seq = ++c->stream_seq;
@@ -143,12 +153,14 @@ static void build_uplink(ctrl_t* c, uint64_t now, radio_op_t* op) {
             uint32_t ph = (uint32_t)(host_now / 1000 % 1000);
             uint16_t tri = (uint16_t)(ph < 500 ? ph * 8 : (1000 - ph) * 8);
             if (c->flags & LINK_FAKE_STREAM_INPUT) {
-                s->buttons = (uint16_t)((host_now / 1000000) & 1);
-                s->analog[0] = tri;
-                s->analog[1] = (uint16_t)(4000 - tri);
-                s->analog[2] = s->analog[3] = 2048;
-                s->touch = 0x01;
-                s->battery = 3900;
+                s->buttons = (uint8_t)((host_now / 1000000) & 1);
+                s->battery_pct = 87;
+                s->touch = 0x001;
+                s->stick[0] = (int16_t)(tri - 2000);
+                s->stick[1] = 0;
+                s->trigger = tri;
+                s->grip = (uint16_t)(4000 - tri);
+                s->pressure = 0;
             }
             if (c->flags & LINK_FAKE_STREAM_IMU) {
                 s->accel[2] = 1024;  // 1 g at +-32 g / 16 bit
@@ -162,7 +174,14 @@ static void build_uplink(ctrl_t* c, uint64_t now, radio_op_t* op) {
     uint8_t pt[CL_UP_MAX], nonce[PULSAR_NONCE_LEN];
     int n = c->fmt->encode(&m, pt, sizeof pt);
     uint8_t s = tx_slot(c);
-    if (n < 0 || !c->fmt->nonce(&c->session, c->period, CL_DIR_UP, s, nonce)) n = 0;
+    if (n < 0) {  // nothing this format can say (real formats after the accept): one filler byte
+        pt[0] = 0xFF;
+        n = 1;
+    }
+    // uplink CCM (the only CCM on the connected link): legacy nonce until the accept, then ours
+    if (c->accepted) pulsar_nonce_steady(c->ctr++, c->iv, nonce);
+    else pulsar_nonce_legacy(c->session_nonce, c->beacon_ts, nonce);
+    pulsar_nonce_dir(nonce, c->dir);
     c->plat->ccm(c->plat, true, c->key, nonce, pt, (uint8_t)n, op->payload);
     op->len = (uint8_t)(n + PULSAR_MIC_LEN);
     op->kind = RADIO_OP_TX;
@@ -240,7 +259,11 @@ bool ctrl_next_op(ctrl_t* c, uint64_t now, radio_op_t* op) {
 static void on_downlink(ctrl_t* c, const cl_msg_t* m) {
     if (m->type == CL_CONN_ACCEPT) {
         if (m->u.conn.device_id != c->device_id || m->u.conn.slot >= PULSAR_SLOTS) return;
-        if (!c->accepted) note(c, EVT_CONN, LINK_SLOT_CONNECTED, m->u.conn.slot, 0);
+        if (m->u.conn.endpoint == CL_EP_CONN_NEG) return;  // real: wait for the LOCK that follows
+        if (!c->accepted) {
+            note(c, EVT_CONN, LINK_SLOT_CONNECTED, m->u.conn.slot, 0);
+            c->ctr = 0;  // the controller resets its TX counter at the accept (AUDIT A3)
+        }
         c->accepted = true;
         c->slot = m->u.conn.slot;
         c->last_dl_seq = m->seq;
@@ -316,23 +339,19 @@ static void on_beacon(ctrl_t* c, const radio_rx_t* rx, const pulsar_beacon_t* b)
     c->period = b->timestamp_us / PULSAR_BEACON_PERIOD_US;
     c->hop.map = b->map;
     c->hop.unmapped = b->unmapped;
-    c->session.session_nonce = b->session_nonce;
+    c->session_nonce = b->session_nonce;
     if (b->dm_in) c->dm_period = c->period + b->dm_in;
     c->missed = 0;
     c->heard = true;
     c->beacons_heard++;
     if (c->reply_reg_sent) {  // the ack bitmap covers what we sent last period
-        if (b->ack_mask & (1u << tx_slot(c))) c->reply_reg_pending = false;
+        if (b->ack_mask & PULSAR_SLOT_BIT(tx_slot(c))) c->reply_reg_pending = false;
         c->reply_reg_sent = false;
     }
     uint8_t addressed = tx_slot(c);
-    if (rx->len > PULSAR_BEACON_HDR_LEN + PULSAR_MIC_LEN && (b->cl_slot_mask & (1u << addressed))) {
-        uint8_t nonce[PULSAR_NONCE_LEN], pt[PULSAR_BEACON_CL_MAX];
-        uint8_t n = (uint8_t)(rx->len - PULSAR_BEACON_HDR_LEN);
-        cl_msg_t m;
-        if (c->fmt->nonce(&c->session, c->period, CL_DIR_DOWN, addressed, nonce) &&
-            c->plat->ccm(c->plat, false, c->key, nonce, rx->payload + PULSAR_BEACON_HDR_LEN, n, pt) &&
-            c->fmt->decode(pt, n - PULSAR_MIC_LEN, CL_DIR_DOWN, &m))
+    if (rx->len > PULSAR_BEACON_HDR_LEN && (b->cl_slot_mask & PULSAR_SLOT_BIT(addressed))) {
+        cl_msg_t m;  // downlink CL data is plaintext (AUDIT A4)
+        if (c->fmt->decode(rx->payload + PULSAR_BEACON_HDR_LEN, rx->len - PULSAR_BEACON_HDR_LEN, CL_DIR_DOWN, &m))
             on_downlink(c, &m);
     }
 }
@@ -410,7 +429,6 @@ void ctrl_poll(ctrl_t* c) {
         if (pair_data_parse(c->shared, c->pair_data, &netaddr, key)) {
             c->netaddr = netaddr;
             memcpy(c->key, key, 16);
-            c->session.netaddr = netaddr;
             c->paired_at_us = c->plat->now_us(c->plat);
             c->pair_done_seq = c->pair_data_seq;
             barrier();
