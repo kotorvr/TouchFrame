@@ -372,7 +372,9 @@ typedef struct __attribute__((packed)) {
 // CMD_CONNECT: allow a paired controller into a slot. It connects when it next seeks (it does so
 // on its own after pairing and after every link loss). slot 0xFF = first free slot; the EVT_RESULT
 // detail byte carries the slot chosen. Slot 0 is the negotiation slot and is never assigned
-// (LINK_ERR_NO_SLOT); slots are 1..4.
+// (LINK_ERR_NO_SLOT); slots are 1..4. Real controllers: no disconnect message is known, so one
+// CMD_DISCONNECT let go of stays on the link in its slot until it loses the beacons; that slot is
+// not free meanwhile, and CMD_CONNECT for that controller gives it back (it reconnects at once).
 typedef struct __attribute__((packed)) {
     uint8_t tag;
     uint8_t slot;        // 1..4, or 0xFF
@@ -426,7 +428,8 @@ enum { LINK_SUB_UNSUBSCRIBE = 1u << 0 };
 // CMD_REG_SUBSCRIBE: stream a register as EVT_REG(NOTIFY). period_ms 0 = on change. Real formats:
 // the controller pushes its notifications by itself, so this only forwards notification id `reg`
 // (0..63, e.g. 0x0b LED echo, 0x16 battery alerts, 0x17 index curl) as EVT_REG(NOTIFY, reg = ntf
-// id) next to EVT_INPUT / EVT_IMU; period_ms is ignored.
+// id) next to EVT_INPUT / EVT_IMU; period_ms is ignored, and a payload longer than LINK_REG_MAX
+// is cut to its first LINK_REG_MAX bytes.
 typedef struct __attribute__((packed)) {
     uint8_t tag;
     uint8_t slot;
@@ -455,7 +458,8 @@ typedef struct __attribute__((packed)) {
     uint64_t t_us;        // sample time, dongle clock (see flags bit1)
     uint8_t slot;
     uint8_t flags;        // bit0: placeholder format (loopback), bit1: t_us is the uplink arrival
-                          // time (no controller stamp), bit2: IMU scale is a guess (EVT_SAMPLE)
+                          // time (no controller stamp), bit2: IMU scale is a guess (EVT_SAMPLE),
+                          // bit3: no new IMU sample, accel / gyro repeat the last one (EVT_SAMPLE)
     uint16_t seq;         // per-slot counter, increments by 1 per event (gaps = lost samples)
     uint8_t buttons;      // ntf 4: b0 A/X, b1 B/Y, b2 stick click, b3 system/menu
     uint8_t battery_pct;  // ntf 0, 0xFF = unknown
@@ -509,7 +513,8 @@ enum link_led_mode { LINK_LED_OFF = 0, LINK_LED_ON = 1, LINK_LED_STROBE = 2 };
 // period_us, CENTRED at dongle times phase_us + k * period_us; the controller runs it off the
 // shared Pulsar clock. period_us >= LINK_LED_MIN_PERIOD_US and on_us > 0, else LINK_ERR_ARGS;
 // on_us is clamped to LINK_LED_MAX_ON_US. Real controllers cannot hold the LEDs on: ON is for the
-// fake controller only. Cheap to repeat (a phase-search loop may send it at ~5 Hz): a newer CMD_LED
+// fake controller only (LINK_ERR_ARGS); cmd 0x28 has no intensity or LED mask, so a real controller
+// ignores those two fields. Cheap to repeat (a phase-search loop may send it at ~5 Hz): a newer CMD_LED
 // replaces one still queued for that slot.
 typedef struct __attribute__((packed)) {
     uint8_t tag;

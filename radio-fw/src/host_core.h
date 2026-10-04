@@ -77,6 +77,7 @@ typedef struct {
     uint8_t tl_seq;          // seq of the newest command; bumped per new command, 15 wraps to 0.
                              // Kept across reconnects: the controller drops a repeat of its last seq
     uint64_t tl_deadline_us; // the head command (head_sent) times out then
+    uint64_t tl_sent_period; // ... and first went out in this beacon period: only later uplinks ack it
     cl_ntf_t ntf;            // notification reassembly (R13)
     uint64_t ntf_fwd;        // ntf ids forwarded as EVT_REG(NOTIFY) (CMD_REG_SUBSCRIBE in real mode)
     struct { uint8_t buttons, battery_pct; uint16_t touch; int16_t stick[2]; uint16_t trigger, grip, pressure; } in;

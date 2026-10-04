@@ -17,12 +17,9 @@
 // [11], TX prefix S + 1, beacon byte 14 (whose downlink rides this beacon) and byte 15 (ack bitmap)
 // bit 1 << S, and uplink CL[0]. S is 1..4: slot 0 (prefix 1) is the negotiation slot a seeking
 // controller requests in, and an accept with [11] = 0 trips a fatal assert in the controller.
-#ifndef PULSAR_ENDPOINT_OFFSET
-#define PULSAR_ENDPOINT_OFFSET 0
-#endif
-#define PULSAR_SLOT_BIT(slot) ((uint8_t)(1u << ((slot) + PULSAR_ENDPOINT_OFFSET)))
+#define PULSAR_SLOT_BIT(slot) ((uint8_t)(1u << (slot)))
 // Slots the host assigns: 1..4.
-#define PULSAR_SLOT_USABLE(slot) ((slot) >= 1 && (slot) + PULSAR_ENDPOINT_OFFSET <= 4)
+#define PULSAR_SLOT_USABLE(slot) ((slot) >= 1 && (slot) <= 4)
 #define PULSAR_NEG_SLOT 0              // CONN_NEG_SLOT: requests and the accept that answers them
 #define PULSAR_SLOT_BASE_US 350        // first uplink slot starts this long after the beacon anchor
 #define PULSAR_VERSION 0x1701          // Q6: on air 01 17

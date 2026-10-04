@@ -4,6 +4,7 @@
 #include <string.h>
 
 #include "crypto.h"
+#include "le.h"
 #include "pulsar_pair.h"
 
 #define BEACON_RX_START_US 250     // listen for uplinks from here ...
@@ -34,11 +35,6 @@
 #define NTF_IMU_TEMP 0x28
 
 static void barrier(void) { __sync_synchronize(); }
-
-static uint16_t get16(const uint8_t* p) { return (uint16_t)(p[0] | p[1] << 8); }
-static uint32_t get32(const uint8_t* p) {
-    return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
-}
 
 //------------------------------------------------------------------ events
 
@@ -134,8 +130,14 @@ static int find_allowed(const host_t* h, uint64_t device_id) {
     return -1;
 }
 
+// A real controller CMD_DISCONNECT let go of is still on the link in its slot (no disconnect
+// message is known): that slot is not free while it is heard.
+static bool slot_heard(const host_t* h, int s) {
+    return h->slot[s].steady && h->plat->now_us(h->plat) - h->slot[s].last_rx_us < HOST_LOST_US;
+}
+
 static bool slot_free(const host_t* h, int s) {
-    return PULSAR_SLOT_USABLE(s) && !h->slot[s].allowed && h->slot[s].state == LINK_SLOT_FREE;
+    return PULSAR_SLOT_USABLE(s) && !h->slot[s].allowed && h->slot[s].state == LINK_SLOT_FREE && !slot_heard(h, s);
 }
 
 // The slot for a controller: where it is already allowed, else `want` if free, else the first free
@@ -143,6 +145,8 @@ static bool slot_free(const host_t* h, int s) {
 static int pick_slot(const host_t* h, uint64_t device_id, uint8_t want) {
     int s = find_allowed(h, device_id);
     if (s >= 0) return s;
+    for (int i = 1; i < PULSAR_SLOTS; i++)  // still on the link there: take it back
+        if (!h->slot[i].allowed && h->slot[i].steady_id == device_id && slot_heard(h, i)) return i;
     if (want < PULSAR_SLOTS && slot_free(h, want)) return want;
     for (int i = 0; i < PULSAR_SLOTS; i++)
         if (slot_free(h, i)) return i;
@@ -306,7 +310,9 @@ bool host_next_op(host_t* h, uint64_t now, radio_op_t* op) {
 }
 
 void host_on_rx(host_t* h, const radio_rx_t* rx) {
-    if (rx->crc_ok && rx->rxmatch >= 1 && rx->rxmatch <= PULSAR_SLOTS && !pairing_active(h))
+    // a real controller CMD_DISCONNECT let go of is not acked: we no longer want it on the link
+    if (rx->crc_ok && rx->rxmatch >= 1 && rx->rxmatch <= PULSAR_SLOTS && !pairing_active(h) &&
+        !(h->fmt->real && h->slot[rx->rxmatch - 1].held))
         h->ack_mask |= PULSAR_SLOT_BIT(rx->rxmatch - 1);
     if (pairing_active(h) && h->pair_state != LINK_PAIR_SCANNING && rx->crc_ok) h->pair_tx_ready = false;
     uint32_t head = h->ring_head, next = (head + 1) & (HOST_RX_RING - 1);
@@ -556,6 +562,7 @@ static void dl_prepare(host_t* h) {
         if (h->fmt->real && d->msg.type != CL_CONN_ACCEPT) {
             d->tl_reg = h->prep.data[0];
             h->idle_seq = d->msg.seq;
+            if (!sl->head_sent) sl->tl_sent_period = period;
         }
         h->prep.len = (uint8_t)n;
         h->prep.slot = d->addr_slot;
@@ -735,7 +742,8 @@ static void tl_notification(host_t* h, uint8_t s, const host_rx_t* r, const uint
     link_input_t in = {r->t_us, s, 2, 0, sl->in.buttons, sl->in.battery_pct, sl->in.touch,
                        {sl->in.stick[0], sl->in.stick[1]}, sl->in.trigger, sl->in.grip, sl->in.pressure};
     if (h->flags & LINK_HOST_COMPACT) {
-        // one EVT_SAMPLE per IMU sample; input changes without one (IMU idle) carry the last IMU values
+        // one EVT_SAMPLE per IMU sample; input changes without one (IMU idle) repeat the last IMU
+        // values, flagged (bit3)
         bool imu_idle = !sl->imu_last_us || r->t_us - sl->imu_last_us > 20000;
         for (uint8_t i = 0; i < c.nimu || (i == 0 && c.input && imu_idle); i++) {
             link_sample_t smp;
@@ -747,6 +755,8 @@ static void tl_notification(host_t* h, uint8_t s, const host_rx_t* r, const uint
                 sl->imu_last_us = r->t_us;
                 smp.in.t_us = c.imu[i].t;
                 smp.in.flags = c.imu[i].flags;
+            } else {
+                smp.in.flags |= 8;
             }
             if (!scale_known) smp.in.flags |= 4;
             memcpy(smp.accel, sl->imu_last, 6);
@@ -819,9 +829,11 @@ static void tl_complete(host_t* h, uint8_t s, const host_rx_t* r, bool err, cons
 static void tl_on_uplink(host_t* h, uint8_t s, const host_rx_t* r, const cl_msg_t* m) {
     host_slot_t* sl = &h->slot[s];
     uint8_t reg = m->u.tl.reg, fl = m->u.tl.flags;
-    if (sl->state != LINK_SLOT_CONNECTED || reg == TL_REG_RF_STATS) return;
+    if (sl->state != LINK_SLOT_CONNECTED || reg == TL_REG_RF_STATS || m->u.tl.slot != s) return;
     bool ntf = fl & TL_NTF;
-    if (sl->head_sent && sl->dlq_len) {
+    // only an uplink after the command's first beacon can answer it: before that, a seq that happens
+    // to match is the controller's previous one
+    if (sl->head_sent && sl->dlq_len && r->t_us / PULSAR_BEACON_PERIOD_US >= sl->tl_sent_period) {
         host_dl_t* d = &sl->dlq[sl->dlq_head];
         if (d->msg.type != CL_CONN_ACCEPT && (fl & TL_SEQ_MASK) == d->msg.seq) {
             bool read = d->msg.type == CL_REG_READ;
@@ -1069,6 +1081,9 @@ static uint8_t host_start(host_t* h, const link_host_start_t* c, uint8_t* detail
     for (int s = 0; s < PULSAR_SLOTS; s++) {
         dlq_clear(&h->slot[s]);
         h->slot[s].input_seq = h->slot[s].imu_seq = 0;
+        // a controller may keep its TL state across our restart: don't start where it last was
+        h->plat->random(h->plat, &h->slot[s].tl_seq, 1);
+        h->slot[s].tl_seq &= TL_SEQ_MASK;
     }
     h->beacons = h->dm_beacons = h->uplinks = h->crc_errors = h->late_beacons = 0;
     h->running = true;
@@ -1266,7 +1281,7 @@ bool host_command(host_t* h, uint8_t cmd, const uint8_t* body, uint32_t len) {
             } else if (c.slot >= PULSAR_SLOTS) {
                 result(h, tag, cmd, LINK_ERR_ARGS, 0);
                 return true;
-            } else if (!slot_free(h, c.slot)) {
+            } else if (!slot_free(h, c.slot) && pick_slot(h, c.device_id, c.slot) != c.slot) {
                 result(h, tag, cmd, LINK_ERR_NO_SLOT, c.slot);
                 return true;
             } else {

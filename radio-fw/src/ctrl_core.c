@@ -4,6 +4,7 @@
 #include <string.h>
 
 #include "crypto.h"
+#include "le.h"
 
 #define TX_LEAD_US 200
 #define ADV_RX_WINDOW_US 8000    // after each advert, listen on the DM link this long
@@ -24,17 +25,6 @@ enum { NTF_BATTERY = 0x00, NTF_IMU = 0x01, NTF_STICK = 0x02, NTF_TRIGGERS = 0x03
 static const uint8_t kSeekChannels[3] = PULSAR_SEEK_CHANNELS;
 
 static void barrier(void) { __sync_synchronize(); }
-
-static void put16(uint8_t* p, uint16_t v) {
-    p[0] = (uint8_t)v;
-    p[1] = (uint8_t)(v >> 8);
-}
-static void put32(uint8_t* p, uint32_t v) {
-    for (int i = 0; i < 4; i++) p[i] = (uint8_t)(v >> (8 * i));
-}
-static uint32_t get32(const uint8_t* p) {
-    return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
-}
 
 static void note(ctrl_t* c, uint8_t kind, uint8_t a, uint8_t b, uint32_t v) {
     uint32_t head = c->note_head, next = (head + 1) % CTRL_NOTES;
