@@ -143,10 +143,10 @@ Three separate things gate progress, and only one is shipping:
    isn't documented. That is RE + firmware + driver work, and it can start now.
 
 ### Hardware checklist (order now)
-- [ ] nRF52840 Dongle PCA10059: ordered.
-- [ ] **A second PCA10059** (~$10). One is the host, one sniffs the host's own traffic or plays a
+- [x] nRF52840 Dongle PCA10059: ordered.
+- [x] **A second PCA10059** (ordered) (~$10). One is the host, one sniffs the host's own traffic or plays a
       fake controller for loopback tests. Debugging a transmitter you can't hear is slow.
-- [ ] **USB-C (male) to USB-A (female) OTG adapter.** The dongle is USB-A and the Frame is USB-C.
+- [x] **USB-C (male) to USB-A (female) OTG adapter** (ordered). The dongle is USB-A and the Frame is USB-C.
       If the Frame has one port, get a USB-C hub with PD pass-through so it can charge while the
       dongle is in.
 - [ ] Optional: a USB-A extension, to get the dongle away from the headset's own 2.4 GHz radios.
