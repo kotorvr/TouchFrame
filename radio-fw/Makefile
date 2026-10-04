@@ -17,6 +17,16 @@ SRC_C = \
   src/main.c \
   src/sniffer.c \
   src/pulsar_hop.c \
+  src/crypto.c \
+  src/pulsar_ll.c \
+  src/pulsar_cl.c \
+  src/pulsar_pair.c \
+  src/host_core.c \
+  src/store.c \
+  src/ctrl_core.c \
+  src/clock.c \
+  src/hal.c \
+  src/radio_engine.c \
   src/usb_descriptors.c \
   $(TP)/nrfx/mdk/system_nrf52840.c \
   $(TP)/tinyusb/src/tusb.c \
@@ -24,6 +34,7 @@ SRC_C = \
   $(TP)/tinyusb/src/device/usbd.c \
   $(TP)/tinyusb/src/device/usbd_control.c \
   $(TP)/tinyusb/src/class/cdc/cdc_device.c \
+  $(TP)/tinyusb/src/class/hid/hid_device.c \
   $(TP)/tinyusb/src/portable/nordic/nrf5x/dcd_nrf5x.c
 SRC_C := $(wildcard $(SRC_C))
 SRC_S = $(TP)/nrfx/mdk/gcc_startup_nrf52840.S
@@ -39,7 +50,8 @@ INC = \
   $(TP)/cmsis/CMSIS/Core/Include
 
 CPU = -mcpu=cortex-m4 -mthumb -mfloat-abi=hard -mfpu=fpv4-sp-d16
-DEFS = -DNRF52840_XXAA -D__STARTUP_CLEAR_BSS -D__HEAP_SIZE=0 -D__STACK_SIZE=8192 -D__START=main
+BUILD_ID ?= $(shell date +%Y%m%d)
+DEFS = -DBUILD_ID=$(BUILD_ID) -DNRF52840_XXAA -D__STARTUP_CLEAR_BSS -D__HEAP_SIZE=0 -D__STACK_SIZE=8192 -D__START=main
 CFLAGS = $(CPU) $(DEFS) $(addprefix -I,$(INC)) -std=gnu11 -Os -g -Wall -Wextra \
   -Wno-unused-parameter -ffunction-sections -fdata-sections -fno-strict-aliasing -MMD -MP
 LDFLAGS = $(CPU) -nostartfiles --specs=nosys.specs --specs=nano.specs -Wl,--gc-sections -Wl,--no-warn-rwx-segments \

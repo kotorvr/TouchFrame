@@ -1,4 +1,5 @@
-// One CDC-ACM interface. VID/PID 1209:0001 is the pid.codes test ID (private use only).
+// Composite: CDC-ACM (interfaces 0-1) + vendor HID (interface 2), the same link stream on both
+// (link.h "Framing"). VID/PID 1209:0001 is the pid.codes test ID (private use only).
 #include <string.h>
 
 #include "nrf.h"
@@ -26,13 +27,21 @@ static const tusb_desc_device_t desc_device = {
 
 const uint8_t* tud_descriptor_device_cb(void) { return (const uint8_t*)&desc_device; }
 
-enum { ITF_NUM_CDC = 0, ITF_NUM_CDC_DATA, ITF_NUM_TOTAL };
+enum { ITF_NUM_CDC = 0, ITF_NUM_CDC_DATA, ITF_NUM_HID, ITF_NUM_TOTAL };
 
-#define CONFIG_TOTAL_LEN (TUD_CONFIG_DESC_LEN + TUD_CDC_DESC_LEN)
+#define CONFIG_TOTAL_LEN (TUD_CONFIG_DESC_LEN + TUD_CDC_DESC_LEN + TUD_HID_INOUT_DESC_LEN)
+// vendor page 0xFF00, 64-byte IN and OUT reports, no report IDs
+static const uint8_t hid_report_desc[] = {TUD_HID_REPORT_DESC_GENERIC_INOUT(64)};
+
+const uint8_t* tud_hid_descriptor_report_cb(uint8_t instance) {
+    (void)instance;
+    return hid_report_desc;
+}
 
 static const uint8_t desc_configuration[] = {
     TUD_CONFIG_DESCRIPTOR(1, ITF_NUM_TOTAL, 0, CONFIG_TOTAL_LEN, 0x00, 100),
     TUD_CDC_DESCRIPTOR(ITF_NUM_CDC, 4, 0x81, 16, 0x02, 0x82, 64),
+    TUD_HID_INOUT_DESCRIPTOR(ITF_NUM_HID, 5, HID_ITF_PROTOCOL_NONE, sizeof hid_report_desc, 0x03, 0x83, 64, 1),
 };
 
 const uint8_t* tud_descriptor_configuration_cb(uint8_t index) {
@@ -46,6 +55,7 @@ static const char* const strings[] = {
     "TouchFrame radio",  // 2: product
     NULL,                // 3: serial from FICR.DEVICEID
     "TouchFrame radio",  // 4: CDC interface
+    "TouchFrame radio HID",  // 5: HID interface
 };
 
 static uint16_t desc_str[33];

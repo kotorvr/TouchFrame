@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""PC side of the TouchFrame radio dongle (radio-fw/). Needs pyserial.
+"""PC side of the TouchFrame radio dongle (radio-fw/). Needs pyserial (and hidapi for --hid).
 
   radio.py ports                         list dongles (app and bootloader)
   radio.py dfu --package build/x.zip     reboot the dongle into its bootloader and flash it
@@ -9,12 +9,34 @@
   radio.py sniff --preset discovery [--out cap.jsonl] [--seconds 30]
   radio.py sniff --freq 26 --prefix 0xAA --base 0xFACEB00C --no-crc --out pairing.jsonl
 
-Wire format: radio-fw/src/link.h (COBS frames, 0x00-terminated, type byte + body).
+Host mode (link v3):
+  radio.py hello                         link version, mode, capability bits (which formats are real)
+  radio.py host [--pair any|ID] [--placeholder] [--compact] [--raw] [--seconds N]
+                                         be the controllers' host: beacons, pairing, connections; prints
+                                         events. The dongle keeps its identity and pairings in flash.
+  radio.py host --identity f.json ...    driver-owned identity instead: netaddr, link key and the paired
+                                         list live in f.json (created on first use), nothing in flash
+  radio.py pairings                      the pairings stored on the dongle
+  radio.py forget ID|all [--identity-too]
+                                         remove stored pairings (--identity-too: new netaddr + key, so
+                                         every controller must pair again)
+  radio.py ping [--count 50]             time-sync quality (rtt, drift) between dongle and PC
+  radio.py fake [--paired] [--slot 0] [--real-conn]
+                                         loopback rig: this dongle plays a Touch Plus (second dongle)
+  radio.py selftest                      on-dongle X25519 / AES / HW-CCM checks
+
+--hid (any command) talks over the dongle's HID interface instead of the serial port (the Frame has
+no cdc_acm; on Windows the serial port is the default).
+
+Wire format: radio-fw/src/link.h (COBS frames, 0x00-terminated, type byte + body). The Python mirror
+of every struct is FORMATS/SIZES below; radio-fw/test/test_link.py checks them against link.h.
+tools/fake_dongle.py is a software dongle for testing PC code without hardware.
 """
 import argparse
 import glob
 import json
 import os
+import re
 import shutil
 import struct
 import subprocess
@@ -36,7 +58,245 @@ EVT_PACKET, EVT_STATUS, EVT_SWEEP, EVT_TEXT = 0x81, 0x82, 0x83, 0x84
 CONFIG_FMT = "<BBII8sBBBBBBBBBBIIHB40sBB"  # link_config_t
 STATUS_FMT = "<BBIIIIIB"                    # link_status_t header, then link_config_t
 PACKET_FMT = "<IBbBBB"                      # link_packet_t
-LINK_VERSION = 2
+LINK_VERSION = 3
+
+# ---------------------------------------------------------------- link v3 (radio-fw/src/link.h)
+# Host-mode commands: body starts with a u8 tag; the dongle answers each with one EVT_RESULT.
+CMD_HELLO = 0x06
+CMD_HOST_START, CMD_HOST_STATUS, CMD_PAIR_START, CMD_PAIR_STOP = 0x10, 0x11, 0x12, 0x13
+CMD_CONNECT, CMD_DISCONNECT, CMD_REG_READ, CMD_REG_WRITE, CMD_REG_SUBSCRIBE = 0x14, 0x15, 0x16, 0x17, 0x18
+CMD_LED, CMD_HAPTIC, CMD_TIME_PING, CMD_FAKE_START, CMD_SELFTEST = 0x19, 0x1A, 0x1B, 0x1C, 0x1D
+CMD_PAIR_LIST, CMD_PAIR_FORGET = 0x1E, 0x1F
+EVT_RESULT, EVT_HELLO, EVT_HOST_STATUS, EVT_ADVERT, EVT_PAIR = 0x85, 0x86, 0x87, 0x88, 0x89
+EVT_CONN, EVT_REG, EVT_INPUT, EVT_IMU, EVT_TIME, EVT_UPLINK = 0x8A, 0x8B, 0x8C, 0x8D, 0x8E, 0x8F
+EVT_SAMPLE, EVT_SOF, EVT_PAIRINGS = 0x90, 0x91, 0x92
+
+MODES = {0: "idle", 1: "sniffer", 2: "host", 3: "fake_ctrl"}
+STATUS_CODES = {0: "ok", 1: "bad args", 2: "wrong state", 3: "busy", 4: "timeout",
+                5: "pending RE (format not pinned)", 6: "no slot", 7: "crypto", 8: "rejected",
+                9: "unknown command", 10: "not connected", 11: "queue full"}
+SLOT_STATES = {0: "free", 1: "waiting", 2: "negotiating", 3: "connected", 4: "lost"}
+PAIR_STATES = {0: "idle", 1: "scanning", 2: "linking", 3: "key_exchange", 4: "provision", 5: "done",
+               6: "failed", 7: "stopped"}
+CONN_REASONS = {0: "", 1: "requested", 2: "timeout", 3: "rejected", 4: "host restart"}
+REG_KINDS = {0: "read", 1: "write_ack", 2: "notify"}
+CAPS = {0: "sniffer", 1: "host", 2: "fake_ctrl", 3: "placeholder", 4: "store", 5: "hid", 8: "real_pairing",
+        9: "real_conn_neg", 10: "real_nonce", 11: "real_hreg", 12: "real_input", 13: "real_imu", 14: "real_led",
+        15: "real_haptic"}
+HOST_AUTO_ACCEPT, HOST_DM_BEACONS, HOST_RAW_UPLINKS, HOST_PLACEHOLDER = 1, 2, 4, 8
+HOST_COMPACT, HOST_STORED = 16, 32
+PAIR_AUTO = 1
+FORGET_ALL, FORGET_IDENTITY = 1, 2
+HANDS = {0: "unknown", 1: "left", 2: "right"}
+FAKE_PAIRED, FAKE_STREAM_INPUT, FAKE_STREAM_IMU, FAKE_REAL_CONN = 1, 2, 4, 8
+LED_OFF, LED_ON, LED_STROBE = 0, 1, 2
+HAPTIC_STOP, HAPTIC_SIMPLE, HAPTIC_PCM = 0, 1, 2
+MAX_SLOTS, REG_MAX, PCM_MAX, MAX_PAIRINGS = 5, 32, 48, 8
+LED_MIN_PERIOD_US, LED_MAX_ON_US = 700, 75
+HID_OPEN_MS, HID_REPORT = 2000, 64
+
+# struct name -> (format, field names). "name*N" = N consecutive values gathered into a list.
+# Sizes are checked against the _Static_asserts in link.h at import (link_h_sizes below) and by
+# radio-fw/test/test_link.py.
+FORMATS = {
+    "link_tag_t": ("<B", "tag"),
+    "link_result_t": ("<BBBB", "tag cmd status detail"),
+    "link_hello_t": ("<BBHIQQB3s", "version mode caps build dongle_id now_us max_slots reserved"),
+    "link_host_start_t": ("<BBHI16s5sb", "tag flags session_nonce netaddr link_key chmap tx_power_dbm"),
+    "link_slot_status_t": ("<BbHQIIQ", "state rssi pulsar_version device_id rx_packets rx_bad_mic last_rx_us"),
+    "link_host_status_t": ("<BBBBQIIIIIIIB3s", "version mode host_flags pair_state now_us netaddr beacons "
+                           "dm_beacons uplinks crc_errors late_beacons events_dropped channel_mhz reserved"),
+    "link_pair_start_t": ("<BBHQ", "tag flags timeout_s device_id"),
+    "link_advert_t": ("<QQbBHHB32s", "t_us device_id rssi type pulsar_version hw len raw"),
+    "link_pair_event_t": ("<QBBBBQI", "t_us state status step hand device_id netaddr"),
+    "link_pair_forget_t": ("<BBHQ", "tag flags reserved device_id"),
+    "link_pairings_t": ("<IBBH", "netaddr count flags writes_left"),
+    "link_pairing_t": ("<QBBH", "device_id slot hand reserved"),
+    "link_connect_t": ("<BBBBQ", "tag slot flags reserved device_id"),
+    "link_disconnect_t": ("<BBB", "tag slot flags"),
+    "link_conn_event_t": ("<QBBBbQHH", "t_us slot state reason rssi device_id pulsar_version reserved"),
+    "link_reg_cmd_t": ("<BBBB", "tag slot reg len"),
+    "link_reg_sub_t": ("<BBBBH", "tag slot reg flags period_ms"),
+    "link_reg_event_t": ("<QBBBBBB", "t_us tag slot reg kind status len"),
+    "link_input_t": ("<QBBHBBH2hHHH", "t_us slot flags seq buttons battery_pct touch stick*2 trigger grip pressure"),
+    "link_sample_t": ("<QBBHBBH2hHHH3h3h", "t_us slot flags seq buttons battery_pct touch stick*2 trigger grip "
+                      "pressure accel*3 gyro*3"),
+    "link_sof_t": ("<HHIQ", "usb_frame reserved sof_count t_us"),
+    "link_imu_t": ("<QBBH3i3ihBBHH", "t_us slot flags seq accel*3 gyro*3 temp_raw bits accel_fs_g "
+                   "gyro_fs_dps reserved"),
+    "link_led_t": ("<BBBBIIiI", "tag slot mode intensity period_us on_us phase_us led_mask"),
+    "link_haptic_t": ("<BBBBHHBB", "tag slot mode amplitude freq_hz duration_ms pcm_len reserved"),
+    "link_time_ping_t": ("<B3sIQ", "tag reserved seq host_t"),
+    "link_time_pong_t": ("<B3sIQQQ", "tag reserved seq host_t dongle_rx_us dongle_tx_us"),
+    "link_fake_start_t": ("<BBBBQI16s", "tag flags slot reserved device_id netaddr link_key"),
+    "link_uplink_t": ("<QBBbBB", "t_us slot channel_mhz rssi flags len"),
+    "link_config_t": (CONFIG_FMT, None),
+    "link_status_t": (STATUS_FMT + CONFIG_FMT[1:], None),
+    "link_packet_t": (PACKET_FMT, None),
+}
+# The same sizes as link.h's _Static_asserts. A mismatch here means the two files drifted.
+SIZES = {"link_tag_t": 1, "link_result_t": 4, "link_hello_t": 28, "link_host_start_t": 30,
+         "link_slot_status_t": 28, "link_host_status_t": 44, "link_pair_start_t": 12, "link_advert_t": 55,
+         "link_pair_event_t": 24, "link_connect_t": 12, "link_disconnect_t": 3, "link_conn_event_t": 24,
+         "link_reg_cmd_t": 4, "link_reg_sub_t": 6, "link_reg_event_t": 14, "link_input_t": 26,
+         "link_imu_t": 44, "link_led_t": 20, "link_haptic_t": 10, "link_time_ping_t": 16,
+         "link_time_pong_t": 32, "link_fake_start_t": 32, "link_uplink_t": 13, "link_config_t": 81,
+         "link_status_t": 104, "link_packet_t": 9, "link_sample_t": 38, "link_sof_t": 16,
+         "link_pair_forget_t": 12, "link_pairings_t": 8, "link_pairing_t": 12}
+for _n, (_f, _) in FORMATS.items():
+    assert struct.calcsize(_f) == SIZES[_n], f"{_n}: radio.py {struct.calcsize(_f)} != link.h {SIZES[_n]}"
+# link_host_status_t is followed by LINK_MAX_SLOTS link_slot_status_t (link.h asserts 44 + 5 * 28).
+SLOT_STATUS_SIZE = SIZES["link_slot_status_t"]
+
+
+def _fields(name):
+    out = []
+    for f in FORMATS[name][1].split():
+        n, _, k = f.partition("*")
+        out.append((n, int(k) if k else 1))
+    return out
+
+
+def layout(name):
+    """[(field, count, struct code)] for a link.h struct ("5s" for byte arrays)."""
+    codes = re.findall(r"\d*[a-zA-Z]", FORMATS[name][0][1:])
+    codes = [c for c in codes for _ in range(1 if c.endswith("s") else int(c[:-1] or 1))]
+    out, i = [], 0
+    for n, k in _fields(name):
+        out.append((n, k, codes[i][-1] if k > 1 else codes[i]))
+        i += k
+    return out
+
+
+def sizeof(name):
+    return SIZES[name]
+
+
+def pack(name, **kw):
+    """Pack a link.h struct; missing fields are zero (bytes fields: zero-filled)."""
+    vals = []
+    for n, k, code in layout(name):
+        v = kw.pop(n, None)
+        if code.endswith("s"):
+            vals.append(bytes(v or b""))
+        elif k > 1:
+            vals += [int(x) for x in (v if v is not None else [0] * k)]
+        else:
+            vals.append(int(v or 0))
+    if kw:
+        raise TypeError(f"{name}: unknown fields {sorted(kw)}")
+    return struct.pack(FORMATS[name][0], *vals)
+
+
+def unpack(name, body, offset=0):
+    """Unpack a link.h struct from body[offset:] into a dict ("name*N" fields become lists)."""
+    v = struct.unpack_from(FORMATS[name][0], body, offset)
+    out, i = {}, 0
+    for n, k in _fields(name):
+        out[n] = list(v[i:i + k]) if k > 1 else v[i]
+        i += k
+    return out
+
+
+def decode_event(evt, body):
+    """(name, dict) for any dongle -> PC frame. Unknown types give ("unknown", {"type", "body"})."""
+    if evt == EVT_RESULT:
+        r = unpack("link_result_t", body)
+        r["status_name"] = STATUS_CODES.get(r["status"], str(r["status"]))
+        return "result", r
+    if evt == EVT_HELLO:
+        h = unpack("link_hello_t", body)
+        h["caps_names"] = [n for b, n in CAPS.items() if h["caps"] >> b & 1]
+        return "hello", h
+    if evt == EVT_HOST_STATUS:
+        s = unpack("link_host_status_t", body)
+        base = sizeof("link_host_status_t")
+        s["slot"] = [unpack("link_slot_status_t", body, base + i * SLOT_STATUS_SIZE) for i in range(MAX_SLOTS)]
+        return "host_status", s
+    if evt == EVT_ADVERT:
+        a = unpack("link_advert_t", body)
+        a["raw"] = a["raw"][:a["len"]]
+        return "advert", a
+    if evt == EVT_PAIR:
+        return "pair", unpack("link_pair_event_t", body)
+    if evt == EVT_CONN:
+        return "conn", unpack("link_conn_event_t", body)
+    if evt == EVT_REG:
+        r = unpack("link_reg_event_t", body)
+        n = sizeof("link_reg_event_t")
+        r["data"] = bytes(body[n:n + r["len"]])
+        return "reg", r
+    if evt == EVT_INPUT:
+        return "input", unpack("link_input_t", body)
+    if evt == EVT_IMU:
+        return "imu", unpack("link_imu_t", body)
+    if evt == EVT_SAMPLE:
+        return "sample", unpack("link_sample_t", body)
+    if evt == EVT_SOF:
+        return "sof", unpack("link_sof_t", body)
+    if evt == EVT_PAIRINGS:
+        p = unpack("link_pairings_t", body)
+        n = sizeof("link_pairings_t")
+        p["pairings"] = [unpack("link_pairing_t", body, n + i * sizeof("link_pairing_t")) for i in range(p["count"])]
+        return "pairings", p
+    if evt == EVT_TIME:
+        return "time", unpack("link_time_pong_t", body)
+    if evt == EVT_UPLINK:
+        u = unpack("link_uplink_t", body)
+        n = sizeof("link_uplink_t")
+        u["data"] = bytes(body[n:n + u["len"]])
+        return "uplink", u
+    if evt == EVT_TEXT:
+        return "text", {"text": body.decode(errors="replace")}
+    if evt == EVT_STATUS:
+        return "status", parse_status(body)
+    if evt == EVT_PACKET:
+        ts, freq, rssi, crc_ok, rxmatch, length = struct.unpack_from(PACKET_FMT, body)
+        return "packet", dict(t_us=ts, frequency=freq, rssi=rssi, crc_ok=crc_ok, rxmatch=rxmatch,
+                              data=bytes(body[struct.calcsize(PACKET_FMT):][:length]))
+    return "unknown", {"type": evt, "body": bytes(body)}
+
+
+class LinkError(Exception):
+    def __init__(self, cmd, status):
+        super().__init__(f"command 0x{cmd:02x}: {STATUS_CODES.get(status, status)}")
+        self.cmd, self.status = cmd, status
+
+
+class TimeSync:
+    """Dongle clock (us) -> PC clock, from CMD_TIME_PING samples (link.h link_time_pong_t).
+
+    Keeps the lowest-RTT samples and fits offset + drift by least squares. pc_t and the result
+    are in the same unit as host_t (pass ns from time.monotonic_ns / CLOCK_MONOTONIC_RAW)."""
+
+    def __init__(self, window=64):
+        self.samples, self.window = [], window  # (pc_mid, dongle_mid_us, rtt)
+
+    def add(self, pong, t_recv):
+        rtt = (t_recv - pong["host_t"]) - (pong["dongle_tx_us"] - pong["dongle_rx_us"]) * 1000
+        pc_mid = (pong["host_t"] + t_recv) / 2
+        d_mid = (pong["dongle_rx_us"] + pong["dongle_tx_us"]) / 2
+        self.samples.append((pc_mid, d_mid, rtt))
+        self.samples = self.samples[-self.window:]
+        return rtt
+
+    def fit(self):
+        """(slope, intercept) with pc_ns = slope * dongle_us + intercept, from the best half."""
+        best = sorted(self.samples, key=lambda s: s[2])[:max(2, len(self.samples) // 2)]
+        if len(best) < 2:
+            pc, d, _ = best[0]
+            return 1000.0, pc - 1000.0 * d
+        n = len(best)
+        mx = sum(d for _, d, _ in best) / n
+        my = sum(p for p, _, _ in best) / n
+        sxx = sum((d - mx) ** 2 for _, d, _ in best)
+        slope = sum((d - mx) * (p - my) for p, d, _ in best) / sxx if sxx else 1000.0
+        return slope, my - slope * mx
+
+    def to_pc(self, dongle_us):
+        slope, icpt = self.fit()
+        return slope * dongle_us + icpt
+
 
 # docs/PROTOCOL.md Q1: Nrf_2Mbit, whitening off, CRC-24 0x108421 / 0xFFFFFF, BALEN 4, big-endian.
 # Discovery/pairing/DM-beacon have no S0 byte; the connected link has a 1-byte S0 (0x04).
@@ -90,14 +350,151 @@ def cobs_decode(data):
     return bytes(out)
 
 
+# ---------------------------------------------------------------- HID transport (link.h "Framing")
+
+def hid_reports(stream):
+    """Split link bytes into 64-byte HID reports: [n][n bytes][zero pad]."""
+    out = []
+    for i in range(0, len(stream), HID_REPORT - 1):
+        chunk = stream[i:i + HID_REPORT - 1]
+        out.append(bytes([len(chunk)]) + chunk + bytes(HID_REPORT - 1 - len(chunk)))
+    return out
+
+
+def hid_payload(report):
+    """The link bytes in one 64-byte report (n = 0: keepalive, nothing)."""
+    n = report[0] if report else 0
+    if n > HID_REPORT - 1:
+        raise ValueError(f"bad HID report length byte {n}")
+    return bytes(report[1:1 + n])
+
+
+class HidTransport:
+    """The dongle's HID interface (interface 2 of 1209:0001) as a byte stream with the serial
+    port's write/read interface. Sends a keepalive report each second so the dongle keeps the
+    interface "open" (link.h: an OUT report within LINK_HID_OPEN_MS)."""
+
+    def __init__(self, path=None, device=None):
+        if device is None:  # `device`: anything with hidapi's write(bytes) / read(size, timeout_ms) (tests)
+            try:
+                import hid
+            except ImportError:
+                sys.exit("hidapi missing: python -m pip install hidapi")
+            if path is None:
+                hits = [d for d in hid.enumerate(*APP_VIDPID) if d.get("interface_number") in (2, -1)]
+                if not hits:
+                    sys.exit("no TouchFrame radio dongle HID interface found")
+                path = hits[0]["path"]
+            device = hid.device()
+            device.open_path(path)
+        self.dev = device
+        self.dtr = True  # accepted and ignored (serial-port compatibility)
+        self.last_out = 0.0
+        self.write(b"")  # open the interface now
+
+    def write(self, data):
+        for rep in hid_reports(bytes(data)) or [bytes(HID_REPORT)]:
+            self.dev.write(b"\x00" + rep)  # report number 0, then the report
+        self.last_out = time.monotonic()
+
+    def read(self, n):
+        if time.monotonic() - self.last_out > 1.0:
+            self.write(b"")
+        rep = self.dev.read(HID_REPORT, 50)
+        return hid_payload(bytes(rep)) if rep else b""
+
+
 class Dongle:
-    def __init__(self, port):
-        self.ser = serial.Serial(port, 115200, timeout=0.05)
+    """One dongle on a serial port (or `hid=True`: its HID interface). `transport` (anything with
+    write/read and a dtr attribute, e.g. tools/fake_dongle.py's FakeDongle) replaces the port in tests."""
+
+    def __init__(self, port=None, transport=None, hid=False):
+        if transport is None:
+            transport = HidTransport() if hid else serial.Serial(port, 115200, timeout=0.05)
+        self.ser = transport
         self.ser.dtr = True  # the firmware only streams packets while DTR is set
         self.buf = bytearray()
+        self.next_tag = 1
+        self.pending = []  # events that arrived while request() waited for its result
 
     def send(self, cmd, body=b""):
         self.ser.write(cobs_encode(bytes([cmd]) + body))
+
+    def request(self, cmd, struct_name=None, tail=b"", timeout=2.0, check=True, **fields):
+        """Send a v3 command (tag filled in) and wait for its EVT_RESULT.
+
+        Returns (result dict, [(name, event) ...] that arrived meanwhile, in order). Other async
+        events are also queued on self.pending for the caller's event loop. Raises LinkError on a
+        non-OK status when check is set."""
+        tag = self.next_tag
+        self.next_tag = self.next_tag % 255 + 1
+        body = pack(struct_name or "link_tag_t", tag=tag, **fields) + bytes(tail)
+        self.send(cmd, body)
+        seen = []
+        deadline = time.monotonic() + timeout  # absolute: streams keep frames() alive forever
+        for t, b in self.frames(timeout):
+            if time.monotonic() > deadline:
+                break
+            name, ev = decode_event(t, b)
+            if name == "result" and ev["tag"] == tag and ev["cmd"] == cmd:
+                if check and ev["status"]:
+                    raise LinkError(cmd, ev["status"])
+                return ev, seen
+            seen.append((name, ev))
+            self.pending.append((name, ev))
+        raise TimeoutError(f"no EVT_RESULT for command 0x{cmd:02x}")
+
+    def events(self, timeout):
+        """Yield (name, event) for every frame (queued ones first) until `timeout` s of silence."""
+        while self.pending:
+            yield self.pending.pop(0)
+        for t, b in self.frames(timeout):
+            yield decode_event(t, b)
+
+    # ---- v3 conveniences
+    def hello(self):
+        _, seen = self.request(CMD_HELLO)
+        hello = [e for n, e in seen if n == "hello"]
+        if not hello:
+            raise LinkError(CMD_HELLO, 9)
+        self.pending = [p for p in self.pending if p[0] != "hello"]
+        return hello[-1]
+
+    def host_start(self, netaddr, link_key, session_nonce, flags=HOST_DM_BEACONS, chmap=(1 << 37) - 1,
+                   tx_power_dbm=8):
+        return self.request(CMD_HOST_START, "link_host_start_t", flags=flags, session_nonce=session_nonce,
+                            netaddr=netaddr, link_key=bytes(link_key), chmap=chmap.to_bytes(5, "little"),
+                            tx_power_dbm=tx_power_dbm)[0]
+
+    def pairings(self):
+        """The dongle's stored identity and pairings (EVT_PAIRINGS), any mode."""
+        _, seen = self.request(CMD_PAIR_LIST)
+        self.pending = [p for p in self.pending if p[0] != "pairings"]
+        return [e for n, e in seen if n == "pairings"][-1]
+
+    def forget(self, device_id=0, all=False, identity=False):
+        """Remove stored pairings; returns how many went."""
+        flags = (FORGET_ALL if all else 0) | (FORGET_IDENTITY if identity else 0)
+        return self.request(CMD_PAIR_FORGET, "link_pair_forget_t", flags=flags, device_id=device_id)[0]["detail"]
+
+    def host_status(self):
+        _, seen = self.request(CMD_HOST_STATUS)
+        self.pending = [p for p in self.pending if p[0] != "host_status"]
+        return [e for n, e in seen if n == "host_status"][-1]
+
+    def time_ping(self, seq):
+        """One ping; returns (pong, t_recv_ns) or None on timeout. Other events stay queued."""
+        t0 = time.monotonic_ns()
+        self.send(CMD_TIME_PING, pack("link_time_ping_t", tag=0, seq=seq, host_t=t0))
+        deadline = time.monotonic() + 0.5
+        for t, b in self.frames(0.5):
+            if time.monotonic() > deadline:
+                break
+            name, ev = decode_event(t, b)
+            if name == "time" and ev["seq"] == seq:
+                return ev, time.monotonic_ns()
+            self.pending.append((name, ev))
+        return None
 
     def frames(self, timeout, idle=False):
         """Yield (type, body) until `timeout` seconds pass without a frame.
@@ -168,6 +565,10 @@ def pack_config(c):
 
 def find_ports(vidpid):
     return [p.device for p in serial.tools.list_ports.comports() if (p.vid, p.pid) == vidpid]
+
+
+def open_dongle(args):
+    return Dongle(hid=True) if getattr(args, "hid", False) else Dongle(app_port(args))
 
 
 def app_port(args):
@@ -331,6 +732,182 @@ def cmd_sniff(args):
     print(f"{count} packets, {good} with CRC ok", file=sys.stderr)
 
 
+# ---------------------------------------------------------------- host mode (link v3)
+
+def format_event(name, e):
+    """One human-readable line per event."""
+    t = f"{e['t_us'] / 1e6:12.6f}" if "t_us" in e else " " * 12
+    if name == "advert":
+        return f"{t} advert id={e['device_id']:016x} rssi={e['rssi']} ver=0x{e['pulsar_version']:04x} hw=0x{e['hw']:04x}"
+    if name == "pair":
+        st = PAIR_STATES.get(e["state"], e["state"])
+        extra = f" status={STATUS_CODES.get(e['status'], e['status'])}" if e["status"] else ""
+        hand = f" hand={HANDS[e['hand']]}" if e["hand"] else ""
+        return f"{t} pair {st} id={e['device_id']:016x} step={e['step']}{hand}{extra}"
+    if name == "conn":
+        return (f"{t} slot{e['slot']} {SLOT_STATES.get(e['state'], e['state'])} id={e['device_id']:016x} "
+                f"rssi={e['rssi']} {CONN_REASONS.get(e['reason'], e['reason'])}")
+    if name in ("input", "sample"):
+        s = (f"{t} slot{e['slot']} {name} #{e['seq']} buttons={e['buttons']:x} stick={e['stick']} "
+             f"trigger={e['trigger']} grip={e['grip']} touch={e['touch']:03x} pressure={e['pressure']} "
+             f"battery={e['battery_pct']}%")
+        return s + (f" accel={e['accel']} gyro={e['gyro']}" if name == "sample" else "")
+    if name == "pairings":
+        rows = ", ".join(f"{p['device_id']:016x}(slot {p['slot']}, {HANDS.get(p['hand'], p['hand'])})"
+                         for p in e["pairings"]) or "none"
+        return f"stored identity netaddr 0x{e['netaddr']:08x}; pairings: {rows}"
+    if name == "sof":
+        return f"{t} usb sof frame {e['usb_frame']} (#{e['sof_count']})"
+    if name == "imu":
+        return f"{t} slot{e['slot']} imu #{e['seq']} accel={e['accel']} gyro={e['gyro']} temp={e['temp_raw']}"
+    if name == "reg":
+        return (f"{t} slot{e['slot']} reg 0x{e['reg']:02x} {REG_KINDS.get(e['kind'], e['kind'])} "
+                f"{STATUS_CODES.get(e['status'], e['status'])} {e['data'].hex()}")
+    if name == "uplink":
+        return f"{t} uplink slot{e['slot']} {2400 + e['channel_mhz']} rssi={e['rssi']} flags={e['flags']} {e['data'].hex()}"
+    if name == "text":
+        return f"dongle: {e['text']}"
+    if name == "result":
+        return f"result cmd=0x{e['cmd']:02x} tag={e['tag']} {e['status_name']} detail={e['detail']}"
+    return f"{name} {e}"
+
+
+def load_identity(path):
+    """Host identity (netaddr + link key + paired controllers) as JSON; created on first use.
+    The dongle keeps nothing across resets: this file is the host's persistent state."""
+    if os.path.exists(path):
+        with open(path) as f:
+            ident = json.load(f)
+    else:
+        ident = {"netaddr": int.from_bytes(os.urandom(4), "little") | 1, "link_key": os.urandom(16).hex(),
+                 "paired": {}}
+        save_identity(path, ident)
+        print(f"new host identity in {path}", file=sys.stderr)
+    return ident
+
+
+def save_identity(path, ident):
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(ident, f, indent=2)
+
+
+def cmd_hello(args):
+    print(json.dumps(open_dongle(args).hello(), indent=2, default=lambda b: b.hex()))
+
+
+def cmd_pairings(args):
+    print(format_event("pairings", open_dongle(args).pairings()))
+
+
+def cmd_forget(args):
+    d = open_dongle(args)
+    n = d.forget(0 if args.id == "all" else int(args.id, 16), all=args.id == "all", identity=args.identity_too)
+    print(f"forgot {n} pairing(s)" + ("; new identity at the next host start" if args.identity_too else ""))
+
+
+def cmd_host(args):
+    d = open_dongle(args)
+    hello = d.hello()
+    if hello["version"] != LINK_VERSION:
+        sys.exit(f"firmware link version {hello['version']}, tool expects {LINK_VERSION}: reflash")
+    ident = load_identity(args.identity) if args.identity else None
+    flags = HOST_DM_BEACONS | (HOST_AUTO_ACCEPT if args.auto_accept else 0) | \
+        (HOST_RAW_UPLINKS if args.raw else 0) | (HOST_PLACEHOLDER if args.placeholder else 0) | \
+        (HOST_COMPACT if args.compact else 0) | (0 if ident else HOST_STORED)
+    session = int.from_bytes(os.urandom(2), "little")
+    if ident:
+        r = d.host_start(ident["netaddr"], bytes.fromhex(ident["link_key"]), session, flags=flags,
+                         tx_power_dbm=args.tx_power)
+        netaddr = ident["netaddr"]
+    else:
+        r = d.host_start(0, bytes(16), session, flags=flags, tx_power_dbm=args.tx_power)
+        netaddr = d.host_status()["netaddr"]
+    print(f"host up: netaddr 0x{netaddr:08x} ({'file ' + args.identity if ident else 'stored on the dongle'}), "
+          f"caps {hello['caps_names']}", file=sys.stderr)
+    if not ident:
+        print(f"{r['detail']} stored pairing(s) allowed in", file=sys.stderr)
+    for dev, slot in (ident["paired"].items() if ident else ()):
+        r, _ = d.request(CMD_CONNECT, "link_connect_t", slot=slot, device_id=int(dev, 16), check=False)
+        print(f"connect {dev} -> slot {slot}: {STATUS_CODES[r['status']]}", file=sys.stderr)
+    if args.pair:
+        dev = 0 if args.pair == "any" else int(args.pair, 16)
+        d.request(CMD_PAIR_START, "link_pair_start_t", flags=PAIR_AUTO if not args.scan_only else 0,
+                  timeout_s=args.pair_timeout, device_id=dev)
+    t_end = time.monotonic() + args.seconds if args.seconds else None
+    last_status = time.monotonic()
+    try:
+        for name, e in d.events(timeout=1e9):
+            if name in ("input", "imu", "sample") and args.quiet_streams:
+                continue
+            print(format_event(name, e))
+            if name == "pair" and e["state"] == 5 and ident:  # DONE: remember it and let it connect
+                dev = f"{e['device_id']:016x}"
+                r, _ = d.request(CMD_CONNECT, "link_connect_t", slot=0xFF, device_id=e["device_id"], check=False)
+                if r["status"] == 0:
+                    ident["paired"][dev] = r["detail"]
+                    save_identity(args.identity, ident)
+                    print(f"paired {dev}, slot {r['detail']} (saved to {args.identity})", file=sys.stderr)
+            now = time.monotonic()
+            if now - last_status > 5:
+                s = d.host_status()
+                slots = " ".join(f"{i}:{SLOT_STATES[x['state']]}" for i, x in enumerate(s["slot"]))
+                print(f"[beacons {s['beacons']} uplinks {s['uplinks']} crc_err {s['crc_errors']} "
+                      f"late {s['late_beacons']} dropped {s['events_dropped']} | {slots}]", file=sys.stderr)
+                last_status = now
+            if t_end and now > t_end:
+                break
+    except KeyboardInterrupt:
+        pass
+    if args.stop:
+        d.send(CMD_STOP)
+
+
+def cmd_ping(args):
+    d = open_dongle(args)
+    ts = TimeSync()
+    rtts = []
+    for i in range(args.count):
+        got = d.time_ping(i + 1)
+        if got:
+            rtts.append(ts.add(*got) / 1000)
+        time.sleep(args.interval)
+    if not rtts:
+        sys.exit("no EVT_TIME replies")
+    slope, icpt = ts.fit()
+    rtts.sort()
+    print(f"{len(rtts)}/{args.count} pongs, rtt us min {rtts[0]:.0f} median {rtts[len(rtts) // 2]:.0f} "
+          f"max {rtts[-1]:.0f}; drift {(slope / 1000 - 1) * 1e6:+.1f} ppm")
+
+
+def cmd_fake(args):
+    d = open_dongle(args)
+    flags = (FAKE_STREAM_INPUT if not args.no_input else 0) | (FAKE_STREAM_IMU if not args.no_imu else 0) |         (FAKE_REAL_CONN if args.real_conn else 0)
+    kw = {}
+    if args.paired:
+        ident = load_identity(args.identity)
+        flags |= FAKE_PAIRED
+        kw = dict(netaddr=ident["netaddr"], link_key=bytes.fromhex(ident["link_key"]))
+    d.request(CMD_FAKE_START, "link_fake_start_t", flags=flags, slot=args.slot,
+              device_id=int(args.device_id, 16) if args.device_id else 0, **kw)
+    print("fake controller running (CMD_STOP or Ctrl-C to end)", file=sys.stderr)
+    try:
+        for name, e in d.events(timeout=1e9):
+            print(format_event(name, e))
+    except KeyboardInterrupt:
+        d.send(CMD_STOP)
+
+
+def cmd_selftest(args):
+    d = open_dongle(args)
+    r, seen = d.request(CMD_SELFTEST, timeout=10, check=False)
+    for name, e in seen:
+        if name == "text":
+            print(e["text"])
+    print("selftest", "passed" if r["status"] == 0 else f"FAILED (bits 0x{r['detail']:02x})")
+    sys.exit(1 if r["status"] else 0)
+
+
 def int0(s):
     return int(s, 0)
 
@@ -338,6 +915,7 @@ def int0(s):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--port", help="serial port (default: first TouchFrame dongle)")
+    ap.add_argument("--hid", action="store_true", help="use the HID interface (link v3 commands only)")
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("ports").set_defaults(fn=cmd_ports)
     p = sub.add_parser("dfu")
@@ -379,6 +957,46 @@ def main():
     p.add_argument("--out", help="append packets as JSON lines")
     p.add_argument("--quiet", action="store_true")
     p.set_defaults(fn=cmd_sniff)
+
+    default_ident = os.path.join(os.path.expanduser("~"), ".touchframe", "radio-host.json")
+    sub.add_parser("hello", help="link version, mode and capabilities").set_defaults(fn=cmd_hello)
+    p = sub.add_parser("host", help="run as the Pulsar host: beacons, pairing, connections, events")
+    p.add_argument("--identity", metavar="FILE",
+                   help="driver-owned identity: netaddr/key/paired list in FILE (created if missing; e.g. "
+                        f"{default_ident}). Default: the dongle's flash identity")
+    p.add_argument("--pair", metavar="ID|any", help="pair a controller in pairing mode (device id hex, or any)")
+    p.add_argument("--scan-only", action="store_true", help="with --pair: only report adverts")
+    p.add_argument("--pair-timeout", type=int, default=60)
+    p.add_argument("--auto-accept", action="store_true", help="accept any controller holding our key")
+    p.add_argument("--placeholder", action="store_true",
+                   help="placeholder connected-link formats: loopback with a `fake` dongle ONLY")
+    p.add_argument("--raw", action="store_true", help="report every uplink (EVT_UPLINK)")
+    p.add_argument("--compact", action="store_true", help="EVT_SAMPLE (input + IMU in one event; use on HID)")
+    p.add_argument("--tx-power", type=int, default=8, help="dBm, -40..8")
+    p.add_argument("--quiet-streams", action="store_true", help="hide input/IMU/sample events")
+    p.add_argument("--seconds", type=float)
+    p.add_argument("--stop", action="store_true", help="stop host mode on exit (default: keep running)")
+    p.set_defaults(fn=cmd_host)
+    sub.add_parser("pairings", help="identity and pairings stored on the dongle").set_defaults(fn=cmd_pairings)
+    p = sub.add_parser("forget", help="remove stored pairings")
+    p.add_argument("id", metavar="ID|all")
+    p.add_argument("--identity-too", action="store_true", help="also replace the netaddr + key (all re-pair)")
+    p.set_defaults(fn=cmd_forget)
+    p = sub.add_parser("ping", help="time-sync quality: rtt and drift vs this PC")
+    p.add_argument("--count", type=int, default=50)
+    p.add_argument("--interval", type=float, default=0.05)
+    p.set_defaults(fn=cmd_ping)
+    p = sub.add_parser("fake", help="loopback rig: this dongle plays a Touch Plus")
+    p.add_argument("--paired", action="store_true", help="start paired to --identity (skip pairing)")
+    p.add_argument("--identity", default=default_ident)
+    p.add_argument("--slot", type=int, default=0)
+    p.add_argument("--device-id", help="hex; default = the dongle's own FICR id")
+    p.add_argument("--no-input", action="store_true")
+    p.add_argument("--no-imu", action="store_true")
+    p.add_argument("--real-conn", action="store_true",
+                   help="connect with the real request/negotiation formats (host without --placeholder)")
+    p.set_defaults(fn=cmd_fake)
+    sub.add_parser("selftest", help="on-dongle crypto/radio self-tests (X25519, AES, HW CCM)").set_defaults(fn=cmd_selftest)
     args = ap.parse_args()
     args.fn(args)
 
