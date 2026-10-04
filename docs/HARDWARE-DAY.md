@@ -13,8 +13,10 @@ and RE-1/RE-2.
 until you re-pair it in the Quest's controller settings, and the same goes the other way. Pair one
 controller first, and keep the other on the Quest until HW-2 is solid.
 
-**HW-1 must capture a Quest connecting a controller, because it unlocks real input.** The one
-firmware stub left is the **TL header** for register access and notifications. Downlink is
+**HW-1 should capture a Quest connecting a controller, to *validate* the TL header.** REVIEW-RE
+pinned it statically (R0, [re/REVIEW-RE.md](re/REVIEW-RE.md)). The capture confirms it and
+settles the CL length accounting and whether the idle `[00][seq]` packet is needed. The header was
+the last firmware stub. Downlink is
 **plaintext** (AUDIT A4), so sniffing a real Quest's beacons/downlink while a controller powers on
 shows the host's register reads/writes in clear: the enumeration of `0x20`, `0x24`, `0x32`, … and the
 cmd 9 "data ready" write (PERIPHERALS §1.2). Our dongle then sends the same headers. The
