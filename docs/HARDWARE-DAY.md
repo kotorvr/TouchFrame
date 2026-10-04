@@ -13,6 +13,19 @@ and RE-1/RE-2.
 until you re-pair it in the Quest's controller settings, and the same goes the other way. Pair one
 controller first, and keep the other on the Quest until HW-2 is solid.
 
+**HW-1 must capture a Quest connecting a controller, because it unlocks real input.** The one
+firmware stub left is the **TL header** for register access and notifications. Downlink is
+**plaintext** (AUDIT A4), so sniffing a real Quest's beacons/downlink while a controller powers on
+shows the host's register reads/writes in clear: the enumeration of `0x20`, `0x24`, `0x32`, … and the
+cmd 9 "data ready" write (PERIPHERALS §1.2). Our dongle then sends the same headers. The
+controller's replies to *our* dongle are under *our* key, which gives the uplink side.
+Use `radio.py sniff --connected <netaddr>` (netaddr by address search, §4), then power-cycle a
+controller.
+
+**Before any Frame camera run, regenerate the Touch Plus configs**
+(`python tools/touchplus_config.py`): the model name changed (RE-3b, FRAME-TRACKER §9.6). On-device
+tests T1–T3 in [re/FRAME-MODEL.md](re/FRAME-MODEL.md) §6 can run during HW-1, with no dongle needed.
+
 **What a sniffed session still has to settle** (RE-1 open items): the on-air TL/notification
 header bytes, the endpoint↔slot mapping, the steady-state CCM counter start/increment, and the
 CRC trailer byte order. Capture one full connected session with the second dongle during HW-2.

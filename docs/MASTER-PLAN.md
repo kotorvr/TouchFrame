@@ -203,11 +203,11 @@ decides.
 
 | Next session | Chipped by the planner when… | Status |
 |---|---|---|
-| BUILD-1 | the plan was written | **running**: link v3 committed at e430b12 on `claude/exciting-bun-66e32e`; adding HID transport, flash persistence and pairing UX |
+| BUILD-1 | the plan was written | **done, merged 30824ad**: host firmware (pairing, connect, uplink CCM, HID, flash store, fake controller); build clean, sim tests pass. **Stub:** the TL header for register access and notifications, so a real controller gives no input, LED or haptics until it is pinned (REVIEW-RE statically, or the HW-1 capture) |
 | RE-1 | the plan was written | **done, merged**: [re/LINK.md](re/LINK.md); tools fixed per AUDIT-1 |
 | AUDIT-1 | the plan was written | **done, merged 82e938e**: [re/AUDIT.md](re/AUDIT.md), folded into the docs |
 | RE-3 | the plan was written | **ended, blocked**: stopped by a safety check, nothing committed. Touch-only was answered live by DEV-1. The exposure-timing hook is dropped; BUILD-2's closed-loop LED phase sweep replaces it. |
-| RE-3b Frame tracker vs Touch Plus model | DEV-1's error flood ("Couldn't find any neighbor", ~300/s) | **running (started 2026-10-04)**: model compatibility + exposure settings, static, no hooking |
+| RE-3b Frame tracker vs Touch Plus model | DEV-1's error flood ("Couldn't find any neighbor", ~300/s) | **done, merged**: [re/FRAME-MODEL.md](re/FRAME-MODEL.md); flood fixed via model_number |
 | RE-2 | the plan was written | **done, merged 31f35fd**: [re/PERIPHERALS.md](re/PERIPHERALS.md) |
 | BUILD-2 Driver radio backend | BUILD-1 reports link v3 committed | **running (started 2026-10-04)** (base e430b12; hidraw transport) |
 | REVIEW-RE | RE-1 and RE-2 are merged | **running (started 2026-10-04)**. Scope also covers: handedness (cmd 1 `device_desc`, "Input MCU handedness"), how many hosts a controller remembers and how it reconnects (if RE-1 leaves them open), and the flash-erase stall vs `PULSAR_DEVICE_MISSED_BEACONS_BEFORE_DC` |
@@ -264,7 +264,7 @@ statistics), because it never touches the hardware.
 
 | Gate | Decided by | If it fails |
 |---|---|---|
-| **G-LED** can the controller hold its LEDs on? | **ANSWERED NO by RE-2 (2026-10-04)**: cmd 0x28 on-time is clamped to 75 µs, p ≤ 500 ms, p ≥ 700 µs for safety, phase `d` = pulse centre on the host (dongle) clock | **Strobe in sync is now the plan:** RE-3's exposure-schedule tap, plus dongle-µs ↔ CLOCK_MONOTONIC_RAW sync good to well under ±37 µs (or a closed loop that walks `d` to maximise XRService's LED matches), with p = the Frame controller-frame period. This is now on the critical path. |
+| **G-LED** can the controller hold its LEDs on? | **ANSWERED NO by RE-2 (2026-10-04)**: cmd 0x28 on-time is clamped to 75 µs, p ≤ 500 ms, p ≥ 700 µs for safety, phase `d` = pulse centre on the host (dongle) clock | **Strobe in sync is now the plan:** RE-3's exposure-schedule tap, plus dongle-µs ↔ CLOCK_MONOTONIC_RAW sync good to **±32.5 µs** (the camera exposure is 10 µs at 30 Hz, RE-3b), or a closed loop that walks `d` to maximise XRService's LED matches. XRService logs each controller-frame timestamp, which gives the phase directly, with p = the Frame controller-frame period. This is now on the critical path. |
 | **G-Touch-only** can queues exist without a Frame controller? | **ANSWERED YES by DEV-1 (2026-10-04)** | Create them only if none exist. If the user later powers on a Frame controller in the same session, it gets no pose until SteamVR restarts, so document that. Alternative: power one Frame controller on once per session (its queues persist after it's switched off). |
 | **G-Link** does the controller accept our host and stream? | HW-2 | Gate A says no auth. A failure means a protocol detail, so back to RE-1 with captures from the second dongle. |
 | **G-B** do Frame cameras track Touch Plus LEDs? | HW-3 (DEV-1 can give an early yes) | **Plan B:** 3DoF from the radio IMU plus position from Frame hand tracking (wrist), if a driver can read it (RE-3). Otherwise keep the relay as the 6DoF product. |
