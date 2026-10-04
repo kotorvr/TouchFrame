@@ -15,6 +15,8 @@
 //  2. CONNECT (never Create) the shared /event and /data queues. They exist only once a Frame
 //     controller has connected since SteamVR started; until then we wait and retry, because if
 //     we created them, driver_cv (which always Creates) could no longer enrol a real controller.
+//     Exception: Options::create_shared_queues (experiment, off by default; docs/re/DEV-1.md
+//     G-Touch-only) Creates them with driver_cv's parameters when Connect says QueueNotFound.
 //  3. Send the connect event with the JSON in both slots and both blockDataSize properties set on
 //     the block before release.
 //  4. IMU blocks then flow; poses come back on our queue.
@@ -96,6 +98,10 @@ public:
         std::string config_json;       // sent in both event slots
         std::string serial;            // optional, /controllerConfigData/deviceSerialNumber
         const char* tag = "cv";        // log prefix
+        // Experiment (DEV-1, G-Touch-only): on QueueNotFound, Create /event and /data ourselves
+        // with driver_cv's parameters (0x6010 / 0x30, header 0x200, count 4, flags 0) instead of
+        // waiting for a Frame controller. Destroyed again in Stop().
+        bool create_shared_queues = false;
     };
     using PoseCallback = std::function<void(const CvPose&)>;
 
@@ -132,6 +138,7 @@ private:
     vrint::IVRPaths* paths_ = nullptr;
     vrint::BlockQueueHandle_t pose_q_ = 0;
     std::atomic<vrint::BlockQueueHandle_t> event_q_{0}, data_q_{0};  // 0 = not connected
+    bool created_event_ = false, created_data_ = false;              // we own them (experiment)
     std::atomic<bool> running_{false};
     std::atomic<bool> connected_{false};
     std::atomic<bool> pose_q_ready_{false};

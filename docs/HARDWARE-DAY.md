@@ -79,6 +79,17 @@ parks on one channel if you'd rather. `pulsar_analyze.py conn.jsonl` splits host
 controllers (`addr` 2+) and shows the 2 ms beacon cadence and uplink slots.
 
 ## 5. Decode a connected packet (optional, offline, needs the key)
+
+> **Mostly not possible against a real Quest (AUDIT-1, [re/AUDIT.md](re/AUDIT.md) A2–A8).**
+> - A real Quest pairs with **0x1d**: the link key is the X25519 shared secret[:16], per device and
+>   never on air. The global `pulsar_aes_key.bin` is only the fallback, and DEV-1 found it doesn't
+>   even exist on this Quest.
+> - The nonce model below is wrong. The negotiation IV is `session_nonce<<48 | beacon_ts48` with
+>   counter 0. The steady IV comes from the controller's connection request, with a per-slot
+>   counter. CCM is uplink only; beacons and downlink are plaintext.
+> - `pulsar_crypto.py scan` will be fixed (A8), but expect §5 to work only on **our own dongle's
+>   sessions** (HW-2), where we chose the key. Sniffing a Quest is still useful for plaintext
+>   beacons, timing and framing (§1–4).
 The AES key never crosses the air. With the headset's `/data/misc/pulsar_aes_key.bin` (or the
 documented default) in hand:
 

@@ -6,7 +6,9 @@ ImuPosition, AccCalibration, GyroCalibration), the format Monado's Rift S driver
 ships factory calibrations of "Ruby" (= Touch Plus) units inside the Quest 3 OTA
 (odm/lib64/libtrackingengines.so). This tool reads them from YOUR extracted OTA at run time; nothing
 Meta-made is stored in the repo. Later the controller's own calibration (read over the radio) can
-be fed in with --cal instead.
+be fed in with --cal instead: a JSON file, or a raw dump of controller command 0x2b (the 8 KB
+`ir_led_cal` flash blob, 0x1fe0 bytes read 32 at a time; docs/re/PERIPHERALS.md §6). That the
+blob holds this same JSON is INFERRED until one live read; load_cal() accepts NUL/0xFF padding.
 
 Output, per hand: an XRService config (docs/FRAME-TRACKER.md §1) with
   lighthouse_config  = the LED positions and normals (meters, Meta model frame),
@@ -44,6 +46,44 @@ def embedded_calibrations(path):
         except ValueError:
             pass
     return out
+
+
+def load_cal(path):
+    """A calibration from a JSON file or a raw cmd-0x2b dump: the first complete JSON object in
+    the bytes, ignoring any leading binary and the NUL/0xFF padding of an erased flash tail."""
+    data = open(path, "rb").read()
+    start = data.find(b"{")
+    if start < 0:
+        raise ValueError(f"{path}: no JSON object (blank or non-JSON calibration blob)")
+    text = data[start:].split(b"\x00", 1)[0].split(b"\xff", 1)[0].decode("latin1")
+    obj, _ = json.JSONDecoder().raw_decode(text)
+    return obj
+
+
+def selftest():
+    import tempfile
+    cal = {"Device": {"DeviceType": "Ruby", "BuildType": "x_left"},
+           "TrackedObject": {"ModelPoints": {"Point0": [0.01, 0, 0, 1, 0, 0],
+                                             "Point1": [0, 0.02, 0, 0, 1, 0]},
+                             "ImuPosition": [0.001, 0.002, 0.003]}}
+    blob = json.dumps(cal).encode().ljust(0x1fe0, b"\x00")
+    with tempfile.TemporaryDirectory() as d:
+        for name, body in (("a.json", json.dumps(cal).encode()), ("b.bin", blob),
+                           ("c.bin", b"\x01\x02" + json.dumps(cal).encode() + b"\xff" * 64)):
+            path = os.path.join(d, name)
+            open(path, "wb").write(body)
+            got = load_cal(path)
+            assert got == cal and is_touch_plus(got) and hand_of(got) == 0, name
+        empty = os.path.join(d, "e.bin")
+        open(empty, "wb").write(b"\xff" * 0x1fe0)
+        try:
+            load_cal(empty)
+            raise AssertionError("erased blob must not parse")
+        except ValueError:
+            pass
+    led_pos, led_nrm, imu = average([cal])
+    assert led_pos[1] == [0, 0.02, 0] and led_nrm[0] == [1.0, 0.0, 0.0] and imu == [0.001, 0.002, 0.003]
+    print("selftest ok -- load_cal reads JSON files and padded cmd-0x2b blobs; average() unchanged")
 
 
 def hand_of(cal):
@@ -110,7 +150,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--lib", default=DEFAULT_LIB, help="libtrackingengines.so from your Quest 3 OTA")
     ap.add_argument("--cal", action="append", default=[],
-                    help="Meta calibration JSON file(s) instead of the OTA library (e.g. read from your controller)")
+                    help="Meta calibration JSON file(s) or raw cmd-0x2b dumps instead of the OTA library")
     ap.add_argument("--out", default=DEFAULT_OUT)
     ap.add_argument("--list", action="store_true", help="list calibrations found and exit")
     ap.add_argument("--model-number", default="",
@@ -118,10 +158,13 @@ def main():
     ap.add_argument("--serial-prefix", default="tftouchplus")
     ap.add_argument("--head", default="0,0,0,0,0,0",
                     help="model_from_head: rx,ry,rz (deg, XYZ) and x,y,z (m)")
+    ap.add_argument("--selftest", action="store_true", help="offline self-check and exit")
     args = ap.parse_args()
+    if args.selftest:
+        return selftest()
 
     if args.cal:
-        cals = [json.load(open(p)) for p in args.cal]
+        cals = [load_cal(p) for p in args.cal]
     else:
         if not os.path.exists(args.lib):
             sys.exit(f"{args.lib} not found: extract your Quest 3 OTA first (docs/PROTOCOL.md 'Reproduce')")
