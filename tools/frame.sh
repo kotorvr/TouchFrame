@@ -12,7 +12,7 @@
 #                              Gate B with the relay: put that relay Touch Plus into the camera
 #                              tracker with its LED model (tools/touchplus_config.py) and an IMU
 #                              synthesized from its relay pose. Same-hand Frame controller must be OFF.
-#                              Restarts SteamVR. docs/GATE-B.md
+#                              Restarts SteamVR. docs/HARDWARE-DAY.md §6 (relay: only a "yes" counts)
 #   tools/frame.sh log         TouchFrame lines from vrserver.txt
 #   tools/frame.sh shell CMD   run a command
 # FRAME_HOST=local runs everything on this machine (when the repo is checked out on the Frame).

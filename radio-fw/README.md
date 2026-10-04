@@ -67,5 +67,8 @@ python tools/radio.py sniff --connected 0x<netaddr> --out conn.jsonl            
    - If CRC is always `BAD`, try `--crc-skip-addr`, then `--no-crc`, to tell a CRC setting problem
      from a wrong address.
    - If nothing arrives at all, try `--little-endian`.
-4. Pairing (2426 MHz), then the connected link on the data channels. The addresses and timing come
-   from docs/PROTOCOL.md's open items.
+4. Pairing (2426 MHz), then the connected link on the data channels. The full runbook, with the
+   addresses and timing pinned, is docs/HARDWARE-DAY.md.
+
+Host mode (TX, beacons, pairing a controller to the dongle) is not written yet: session BUILD-1 in
+docs/MASTER-PLAN.md.

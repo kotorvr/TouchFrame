@@ -1,7 +1,19 @@
 # Hardware day: nRF52840 dongle runbook
 
 Everything here was built and checked without the dongle. This is the order to run once it arrives.
-Nothing on this list needs the Quest or the Frame except the Gate B section at the end.
+Nothing on this list needs the Frame except the Gate B section at the end. Sessions HW-1…HW-4 in
+[MASTER-PLAN.md](MASTER-PLAN.md) §5 run this.
+
+**Scope:** §0–5 are *listening* (sniffer). Host mode (the dongle pairs and drives a controller) also
+needs the firmware TX path and the post-pairing command layer. Neither exists yet: sessions BUILD-1
+and RE-1/RE-2.
+
+**Before you start:**
+- [ ] OTG adapter: the dongle is USB-A, the Frame is USB-C. Not needed for §0–5 on the PC.
+- [ ] Ideally a second dongle: one host, one sniffer.
+- [ ] Note the Quest build and controller firmware version. All RE is against OTA
+      52433670048800520, and a Quest update reflashes the controllers.
+- [ ] Devices free? The Quest/Frame may be on loan to another session. Ask before using them.
 
 ## 0. Flash the dongle (5 min)
 ```bash
@@ -70,9 +82,12 @@ controllers (`addr` 2+) and shows the 2 ms beacon cadence and uplink slots.
 The AES key never crosses the air. With the headset's `/data/misc/pulsar_aes_key.bin` (or the
 documented default) in hand:
 
-The CCM nonce is a per-packet counter + an **8-byte random session IV** (PROTOCOL.md Q4, confirmed
-from firmware). That IV is sent in the clear, once, in the connection-negotiation packet — its
-first 8 payload bytes. Grab those, then let `scan` sweep the counter against the fixed IV:
+The CCM nonce is a per-packet counter + an **8-byte random session IV** (PROTOCOL.md Q3, confirmed
+from firmware). That IV is sent in the clear, once, in the connection-negotiation packet: its
+first 8 payload bytes. **Caveat (open contradiction, PROTOCOL Q3 note):** the function that makes
+that IV builds a blob exactly the shape of `PairingData` 0x11, so the IV may only be on air on
+2426 MHz during a pairing. If you can't find a negotiation packet on the connected link, re-pair a
+controller from the Quest while sniffing §3 and take the IV from the 0x11 payload's first 8 bytes. Grab those, then let `scan` sweep the counter against the fixed IV:
 ```bash
 python tools/pulsar_crypto.py scan --key <32 hex> --capture conn.jsonl --iv <8 bytes from negotiation>
 ```
@@ -92,11 +107,20 @@ Pairing is fully specified (PROTOCOL.md Q2, #1): send `SetupX25519Keys` (0x12) t
 keys, derive the X25519 secret, then send `PairingData` (0x11) carrying `[4-byte base addr][16-byte
 link key]` CCM-wrapped under the first 16 bytes of the secret (`WriteAESKey` 0x14 is a stub — skip
 it). `tools/pulsar_host.py` builds and self-verifies those frames offline. Advertise host Pulsar
-version **`0x1701`** (on-air `01 17`) and never reject the controller (PROTOCOL.md Q6, #5). The
-radio transmit/slot timing is the remaining hardware-day work.
+version **`0x1701`** (on-air `01 17`) and never reject the controller (PROTOCOL.md Q6, #5).
+Not ready yet: the firmware has no TX path (BUILD-1), and after pairing the host must negotiate the
+connection and read registers / set LEDs / send haptics in formats RE-1 and RE-2 are still pinning
+(PROTOCOL open items 8–10).
 
 ## 6. Gate B: do the Frame cameras see Touch Plus LEDs? (needs the Frame + a Touch Plus)
-This does **not** need the dongle — it reuses the relay. It is the one open question for 6DoF.
+This does **not** need the dongle; it reuses the relay. It is the one open question for 6DoF.
+
+**Read this first: with the relay, only a "yes" counts.** The Quest strobes the Touch Plus LEDs for
+~15–100 µs on *its own* camera schedule. They are lit during a Frame controller-frame exposure only
+by coincidence, roughly 1% of frames, in bursts when the two frame rates beat. So run it **10+
+minutes** and look for *any* `[ContrLedsStats]` line for device 41. One hit means the Frame can see
+and match Touch Plus LEDs. No hits proves nothing. The decisive run is session HW-3, with the dongle
+holding the LEDs on (MASTER-PLAN §3.2, §6).
 ```bash
 python tools/touchplus_config.py           # writes artifacts/touchplus/touchplus_{left,right}.json
 FRAME_HOST=steamos@<ip> tools/frame.sh gateb on left

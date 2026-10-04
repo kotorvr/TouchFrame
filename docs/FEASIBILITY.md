@@ -6,15 +6,18 @@ Goal: Touch Plus controllers working on a standalone Steam Frame like first-part
 - haptics;
 - no Quest headset and no PC in the loop.
 
-Status: **Phase 0 under way (2026-10-03).** The section "Log" at the end is the running state.
+Status (2026-10-04): **Phase 1 (relay) done. Phase 0 static RE done for a listening host. Phase 2
+dongle tooling ready, dongle not arrived. Phase 3 injection proven, Gate B open.** The plan of
+record, with what's left and how it's split into sessions, is
+**[MASTER-PLAN.md](MASTER-PLAN.md)**. The "Log" at the end is the history.
 
 ## Verdict so far
 
 | Piece | Status | Why |
 |---|---|---|
 | SteamVR side (bindings, models, haptics) | **Easy, built** | Third-party aarch64 OpenVR drivers load on the Frame. SteamVR there already ships the Touch input schema and `oculus_quest_plus_controller_*` render models. Games fall back to Touch bindings. |
-| Radio: buttons, IMU, haptics without a Quest | **Likely** | Touch Plus and Quest radio firmware are plaintext ARM images inside the Quest OTA, so the protocol can be read statically. A Nordic nRF52840 USB dongle on the Frame plays the "Quest". |
-| 6DoF from the Frame's cameras | **Driver route proven; LED blobs (Gate B) open** | No camera hook needed: driver_touchframe injects a controller into Valve's XRService tracker through vrserver block queues. A cloned Frame controller tracked at 2.3 mm / 0.64° median (docs/FRAME-TRACKER.md §9). Still open: whether Touch Plus LEDs, kept always on by our radio, produce blobs XRService matches. Constraint: one tracked controller per hand. |
+| Radio: buttons, IMU, haptics without a Quest | **Likely** | Touch Plus and Quest radio firmware are plaintext ARM images inside the Quest OTA, so the protocol can be read statically. A Nordic nRF52840 USB dongle on the Frame plays the "Quest". Gate A passed (no host auth). PHY, hop, pairing and cipher structure are pinned. The post-pairing command layer (register access, LED, IMU, haptics) is still to RE (MASTER-PLAN §3.1). |
+| 6DoF from the Frame's cameras | **Driver route proven; LED blobs (Gate B) open** | No camera hook needed: driver_touchframe injects a controller into Valve's XRService tracker through vrserver block queues. A cloned Frame controller tracked at 2.3 mm / 0.64° median (docs/FRAME-TRACKER.md §9). Still open: whether Touch Plus LEDs, kept always on by our radio, produce blobs XRService matches, and whether the controller *allows* always-on (its IR LED config is validated; if it isn't allowed, we strobe in sync with the Frame's exposures). Constraints: one tracked controller per hand; the shared queues have so far only existed after a Frame controller connected. |
 
 ## Hardware facts
 
@@ -76,12 +79,13 @@ Status: **Phase 0 under way (2026-10-03).** The section "Log" at the end is the 
    - The Quest 3 headset sits on a shelf as radio and tracker. A bridge APK sends `tf::StatePacket` over UDP to `driver_touchframe` on the Frame.
    - Proves the whole SteamVR side.
 2. **Native radio.** nRF52840 dongle firmware: sniffer mode first, then host mode. The driver gets a `radio` backend.
-3. **Frame cameras.**
-   - LD_PRELOAD shim on XRService copies tracking frames and timestamps to shared memory.
-   - Phase-sweep the LED beacons until Touch Plus LEDs appear in the LED frames.
+3. **Frame cameras.** *Revised 2026-10-03:* no LD_PRELOAD shim. The driver injects the controller into XRService through block queues (FRAME-TRACKER §6, §9), and XRService does blob detection, PnP and IMU fusion itself.
+   - Drive the Touch Plus LEDs always-on (or strobe in sync with the Frame's exposure schedule if always-on is rejected).
    - **Gate B:** if no blobs appear, 6DoF is a NO-GO; ship 3DoF plus Frame hand tracking for position.
-4. **Tracker.** Port the Monado constellation tracker; fuse the IMU; optionally the Frame's hand-tracking wrist pose.
+4. ~~**Tracker.** Port the Monado constellation tracker.~~ Superseded by phase 3: XRService is the tracker. What's left is our IMU feed (rectified, 240 Hz, CLOCK_MONOTONIC_RAW) and the Touch Plus LED model.
 5. **Polish.** Pairing UI, battery, skeleton input, auto-start, install docs. Relay versions of skeleton input, auto-start and install docs are done (log, 2026-10-03; [INSTALL.md](INSTALL.md)).
+
+Sessions, gates and fallbacks for phases 2–5: [MASTER-PLAN.md](MASTER-PLAN.md).
 
 ## Log
 - **2026-10-03:**
@@ -153,3 +157,12 @@ Status: **Phase 0 under way (2026-10-03).** The section "Log" at the end is the 
   - `tools/radio.py`: ports / dfu / status / sweep / sniff, plus JSONL capture.
   - Discovery preset confirmed in syncboss: logical address 7 = BASE1 `0xFACEB00C` + AP7 `0xAA` (`FUN_0001bb78`, `FUN_0001bb90`), 2402 MHz (`FUN_0001bcf0(2)`). The test path's PCNF1 is `0x030400FF` (MAXLEN 255, BALEN 4, big-endian).
   - Verified without hardware: clean build with no warnings, vector table at 0x1000 with our RADIO/USBD/POWER/SysTick handlers, struct sizes asserted on both sides, the C COBS code transcribed and fuzzed against the Python side (20k frames), and every `radio.py` command run against a fake dongle. Not yet run on a dongle.
+- **2026-10-04: static RE for pairing done; offline host tools** (PROTOCOL.md Q2–Q6, open items 1, 4, 5, 6).
+  - Pairing pinned: `SetupX25519Keys` 0x12, then `PairingData` 0x11 carrying `[base addr][link key]`, CCM-wrapped under the first 16 bytes of the X25519 secret. The link key is host-chosen. Host Pulsar version `0x1701`.
+  - Input is host-registers fed from a 61-byte deerfly sample, not a HID report.
+  - New offline tools, all with selftests: `tools/pulsar_host.py` (pairing packets), `tools/pulsar_input.py` (input decode), and `pulsar_crypto.py scan --iv`.
+- **2026-10-04: planning pass** ([MASTER-PLAN.md](MASTER-PLAN.md)).
+  - The code audit found that the dongle firmware has no transmit path yet, and the post-pairing command layer (register access, LED, IMU, haptics) isn't RE'd.
+  - The deerfly firmware *is* in the dumps (Cortex-M23). PROTOCOL said otherwise.
+  - The relay-based Gate B can only give an early positive, never a negative, because the Quest strobes the LEDs on its own camera schedule.
+  - Work is split into RE, build, audit and hardware sessions.

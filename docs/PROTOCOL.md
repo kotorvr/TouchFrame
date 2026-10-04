@@ -73,8 +73,11 @@ version, 12-char git hash. Load base = `vectorAddr - 0x100`.
 | `odm/firmware/syncboss.bin` | nRF52833 | 0x00000 | 0x48c19 | (raw, vec@0x1100) | Headset radio MCU (the host we must emulate) |
 
 `ruby` (the older variant) is identical in structure; `deerfly-app.bin` is the Renesas
-RA2E1 input co-processor (not ARM; it owns the physical buttons/stick/trigger/captouch and
-feeds elk over SPI). Unwind tables (`*-unwind.bin`, DWARF `.debug_frame`) give exact
+RA2E1 input co-processor (it owns the physical buttons/stick/trigger/captouch and feeds elk over
+SPI). **Correction (2026-10-04):** an earlier draft called deerfly "not ARM" and absent from the
+dumps. Both are wrong: the RA2E1 is a Cortex-M23, and `fw/ruby_prq/deerfly-app.bin` (69 KB) is a
+normal `dAeH` image with a Cortex-M vector table (SP `0x20007a60`, reset `0x10919`). It can be
+disassembled like elk (ARMv8-M baseline Thumb). Not yet analysed; see open item 7. Unwind tables (`*-unwind.bin`, DWARF `.debug_frame`) give exact
 function boundaries for `syncboss` (2220 fns) and the `ruby` elk-app (870 fns); the
 `ruby_prq` elk-app and both SPLs have no unwind table, so their Ghidra function splitting is
 rougher.
@@ -343,6 +346,15 @@ crypt call sets KEY at host-struct `+0x61`, fills an **8-byte random IV** at `+0
 20-byte blob to `+0xa1` and checking the result is 24 bytes (20 + 4 MIC). The random IV is sent in
 the clear with the negotiation packet. This is the "Must use legacy nonce" path.
 
+> **Open contradiction (2026-10-04, MASTER-PLAN §3.1.4; to be settled by RE-1/AUDIT-1).** A 20-byte
+> blob encrypted to 24 bytes under a random 8-byte IV with counter 0 is exactly the `PairingData`
+> 0x11 layout of Q2 ([4-byte base][16-byte key]), and Q2 calls this function the pairing wrap. But
+> "connection negotiation" and the elk-app string "Must use legacy nonce for connection
+> negotiation" belong to the **connected** link, not the pairing SPL. Either one function serves
+> both, or these are two different crypts. Until this is settled, don't assume the IV the
+> steady-state link reuses is on air on the connected link. It may only be visible on 2426 MHz
+> during a (re-)pair. HARDWARE-DAY §5 carries the same caveat.
+
 **Steady-state link:** there is no other software crypt call, so per-packet CCM runs inline in the
 RADIO↔CCM hardware chain; the LL updates PACKETCOUNTER and the session IV in the config block each
 packet. Two hypotheses for the steady-state IV, both **INFERRED, not pinned**: (a) the negotiation's
@@ -381,8 +393,8 @@ registers below (read by the headset over Pulsar). Physical inputs originate on 
 post-processed host-side (`update_captouch`).
 
 **Deerfly sample (reg `0x37`, 61 bytes) — offsets CONFIRMED, semantic labels INFERRED**
-(deerfly firmware is not in these dumps, so which analog = which axis and which bit = which
-labelled button is set there, not here). All offsets are into the 61-byte buffer; citations
+(which analog = which axis and which bit = which labelled button is set in the deerfly firmware,
+which is in the dumps but not yet analysed; see open item 7). All offsets are into the 61-byte buffer; citations
 `FUN_000173bc @ 0x173bc`:
 
 | off | size | → hreg | field (CONFIRMED packing / INFERRED meaning) |
@@ -407,12 +419,12 @@ The **four clean 12-bit ADC analogs at buffer `0x23 / 0x25 / 0x31 / 0x33`** are 
 {trigger, grip, thumbstick-X, thumbstick-Y} set (12-bit matches the RA2E1 ADC; elk cal strings
 `db.x.min/max`, `db.y.min/max` = stick X/Y, `inner/outer` + `Pinch (%d mN, %d)` = trigger/grip
 confirm the controller has exactly these four analogs). Binding each offset to a specific axis
-needs the deerfly firmware.
+needs the deerfly firmware (`deerfly-app.bin`, available, open item 7).
 
 **Button bit remap into reg 9 (CONFIRMED math, `FUN_000173bc`)** from deerfly `b=buf[0x21]`,
 `c=buf[0x22]`: out0=b.0, out1=b.2, out2=b.4, out3=c.2, out4=b.6, out5=b.1, out6=b.3, out7=b.5,
 out8=b.7, out9=c.3, out10=c.0, out11=c.1 (12 button bits). Which output bit is A/B/X/Y/menu/
-system/stick-click is set in deerfly (UNKNOWN here).
+system/stick-click is set in deerfly (UNKNOWN here; statically recoverable from `deerfly-app.bin`).
 
 **Flag remap** from deerfly `buf[0x04]`: `reg4.out0=in.1`, `out1=in.2`, and `reg 0x2b = in.4` are
 CONFIRMED (agree across two independent reads of `FUN_000173bc`). The `out2`/`out3` pair is
@@ -541,7 +553,8 @@ Notes for the connected link:
   headset; stored in `/persist/pulsar/pulsar_host_address.bin`). Because the CRC covers the
   address, any candidate address can be verified offline against a captured packet.
 - To see both directions at once the sniffer needs several logical addresses (AP for `0xF0`
-  plus `0x01..0x05`, all on the same base); the current `sniffer_config_t` has one prefix.
+  plus `0x01..0x05`, all on the same base). `radio-fw` does this (`link_config_t.prefix[8]` +
+  `rx_mask`; `radio.py sniff --connected` sets it up, commit aca8aed).
 - With a full map the 37-step CSA#1 sequence is fixed per `netaddr` (37 is prime, so every
   channel is visited once per 74 ms); a static `hop_list` of 37 entries at 2 ms dwell works
   only if started in phase. Better: park on 3c or any one channel, catch a beacon, then
@@ -615,6 +628,23 @@ All scripts read the flattened images and `images.json` from the gitignored
    re-packs into hreg regs: buttons=9, analogs (trigger/grip/stickX/stickY, four 12-bit ADCs
    at deerfly buf 0x23/0x25/0x31/0x33)=regs 3 & 0x17, touch/prox flags=4 & 0x2b, cap-touch
    channels=8/0x20/0x21, battery=0x15, IMU=0xb/0x16 (full table + bit remaps in Q4). Remaining
-   (static-only, needs the Renesas "deerfly" firmware or a live dump, non-blocking): the
+   (static, from `deerfly-app.bin`, which is in the dumps, or a live dump; non-blocking): the
    axis identity of the four analogs, the button-bit -> labelled-button map, and the exact
    meaning/scale of the touch flags, cap-touch channels, and the reg-0x15 battery unit.
+
+Items 1–6 were the questions for a *listening* host. A *transmitting* host needs more
+(docs/MASTER-PLAN.md §3.1). All of it is static RE, no hardware:
+
+7. **deerfly input map**: `deerfly-app.bin` is available and is Cortex-M23 code (see "Images").
+   Axis identity, button labels, touch flags, battery scale. (RE-2)
+8. **Connected-link bring-up + register access**: the connection-negotiation packets in both
+   directions and the slot assignment; CL/TL framing; how the host reads, writes and subscribes to
+   hreg registers (input, IMU) and receives notifications; the steady-state CCM nonce as the
+   host must *produce* it; and the `FUN_00047604` pairing-vs-negotiation contradiction (Q3 note).
+   Prime source: `libsyncboss.so` (has symbols). (RE-1)
+9. **Peripherals**: the IR LED config command layout and validation limits (can the LEDs be held
+   on for the Frame cameras?), the IMU full-scale/rate/layout and the per-unit calibration read,
+   and the haptics command formats. (RE-2)
+10. **Pairing-link initiation**: how the host opens the 2426 MHz DM link to an advertising
+    controller, SPL-frame CRC byte order, what the controller does after 0x11. Optional: the
+    default AES key in libsyncboss/syncboss. (RE-1)
