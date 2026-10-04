@@ -175,6 +175,17 @@ Rules for every session:
 - Static RE tags stay **CONFIRMED / INFERRED / UNKNOWN**, with addresses. No Meta/Valve bytes in the
   repo (README "Legal").
 - Commit small. Run `/code-review` on build branches before merging.
+- **Report to the planner, always (mandatory).** The planner chat is named **"Touchframe project
+  planning and roadmap"**. Every TouchFrame session must message it with `SendMessage` (load
+  it with ToolSearch `select:SendMessage`; find the name with `ListAgents`):
+  1. **when it finishes**: branch name, commits, a summary, what's still open, and what the
+     planner must merge or fold into the docs;
+  2. **at milestones others wait on** (e.g. BUILD-1's "link v3 committed");
+  3. **when it's blocked** or needs a decision.
+
+  A chat that ends without messaging the planner isn't finished: the planner only learns about
+  work it's told about. Several Echo chats share name prefixes (e.g. "RE-2: …"), so address the
+  planner by its exact name.
 
 ### Who starts sessions: the planner chips them
 
@@ -191,7 +202,8 @@ decides.
 
 | Next session | Chipped by the planner when… | Status |
 |---|---|---|
-| RE-1, RE-2, RE-3, BUILD-1, AUDIT-1 | the plan was written | **running (started 2026-10-04)** |
+| RE-1, RE-3, BUILD-1, AUDIT-1 | the plan was written | **running (started 2026-10-04)** |
+| RE-2 | the plan was written | **done, merged 31f35fd**: [re/PERIPHERALS.md](re/PERIPHERALS.md) |
 | BUILD-2 Driver radio backend | BUILD-1 reports link v3 committed | waiting |
 | REVIEW-RE | RE-1 and RE-2 are merged | waiting |
 | DEV-1 on-device bench | the Echo session releases the Quest + Frame (it messages the planner) | **running (started 2026-10-04)**; EchoQuestCombat waits for the planner's all-clear |
@@ -247,7 +259,7 @@ statistics), because it never touches the hardware.
 
 | Gate | Decided by | If it fails |
 |---|---|---|
-| **G-LED** can the controller hold its LEDs on? | RE-2 (static), HW-2 (live) | Strobe in sync: RE-3 exposure tap + `set_led_timing` phase. Harder, still viable. |
+| **G-LED** can the controller hold its LEDs on? | **ANSWERED NO by RE-2 (2026-10-04)**: cmd 0x28 on-time is clamped to 75 µs, p ≤ 500 ms, p ≥ 700 µs for safety, phase `d` = pulse centre on the host (dongle) clock | **Strobe in sync is now the plan:** RE-3's exposure-schedule tap, plus dongle-µs ↔ CLOCK_MONOTONIC_RAW sync good to well under ±37 µs (or a closed loop that walks `d` to maximise XRService's LED matches), with p = the Frame controller-frame period. This is now on the critical path. |
 | **G-Touch-only** can queues exist without a Frame controller? | RE-3, DEV-1 | Workaround: power one Frame controller on per session, then off. Document it. |
 | **G-Link** does the controller accept our host and stream? | HW-2 | Gate A says no auth. A failure means a protocol detail, so back to RE-1 with captures from the second dongle. |
 | **G-B** do Frame cameras track Touch Plus LEDs? | HW-3 (DEV-1 can give an early yes) | **Plan B:** 3DoF from the radio IMU plus position from Frame hand tracking (wrist), if a driver can read it (RE-3). Otherwise keep the relay as the 6DoF product. |

@@ -371,6 +371,33 @@ Without the IV, `scan` falls back to the (firmware-contradicted) session-derived
 
 ## Q4 — Live reports and host->controller commands
 
+> **Superseded in part by [re/PERIPHERALS.md](re/PERIPHERALS.md) (RE-2, 2026-10-04), which is
+> authoritative for LEDs, IMU, input, battery, haptics and calibration.** RE-2 found that this
+> section mixed three register spaces: **command registers** (host `pulsar_read`/`pulsar_write`),
+> **notification registers** (pushed by the controller as chunks, ids `0..0x2d`, elk table
+> `0x2e7dc`) and **deerfly SPI registers**. Corrections (PERIPHERALS §8):
+> - **IMU = ntf 1** (18 B: u48 µs host-clock timestamp + 3×i16 accel + 3×i16 gyro, 500 Hz,
+>   ICM-42686 ±32 g / ±4000 dps, scales in cmd 0x32). ntf 0xb is the **IR LED config echo**, and
+>   ntf 0x16 is **battery alerts**. Neither is IMU.
+> - **Buttons = ntf 4** (b0 A/X, b1 B/Y, b2 stick click, b3 system/menu). **ntf 9 = touch +
+>   proximity** (12 bits). They were swapped below.
+> - **ntf 2 = thumbstick** (2×i16, deerfly buf[0..3], not a counter). **ntf 3 = index trigger +
+>   grip** (2×12-bit, Hall sensors). Buf 0x31/0x33 (ntf 0x17) are index-curl joint angles, not
+>   stick axes.
+> - **ntf 0x15 = index-trigger pressure** (12-bit, 8.5 N), not battery. Battery = ntf 0 (%) and
+>   cmd 0x2f (mV).
+> - Streaming isn't polled: the host writes **cmd 9 "data ready"** after enumeration and the
+>   controller pushes notification chunks (u16 chunk header, type = ntf id; PERIPHERALS §1.1–1.2).
+> - The contested reg-4 out2/out3 ordering is resolved (PERIPHERALS §4.1).
+> - **IR LED: cmd 0x28 = `{u32 period_us, u32 ontime_us, i32 delay_us}`. The on-time is silently
+>   clamped to 75 µs. Rejected if ot > p or p > 500 000. `d` = pulse centre on the host clock.
+>   Default 33333/19/−9. Not settable to "always on".** Never send p < 700 µs.
+> - Haptics: cmd 0x97 (amp), 0xa0 (amp + 40..561 Hz), 0x9b (sync buffer), 0x9d (IMA-ADPCM).
+>   Each auto-stops after 2 s.
+>
+> The text below is kept for its addresses. Where it disagrees with PERIPHERALS.md, PERIPHERALS
+> wins.
+
 **Controller -> host input — there is NO HID report descriptor (CORRECTED, CONFIRMED).**
 A full keyword sweep of all three images + `*.strings` finds **no** `hid`,
 `report_descriptor`, `PULSAR_PKT_ID`, `pulsar_manager_read_sync`, or `attachment_info`
@@ -466,6 +493,13 @@ unpack; the deerfly byte offsets above are the pre-pack source, not on-air offse
 ---
 
 ## Q5 — Calibration (CONFIRMED paths; values on device)
+
+> **Update (RE-2, [re/PERIPHERALS.md](re/PERIPHERALS.md) §6):** cmd **0x2b** (`ir_led_cal`) reads
+> the controller's 8 KB per-unit calibration flash at `0x3d000`, 32 bytes per read (host reads
+> 0x1fe0 bytes). INFERRED to be the constellation cal JSON (`ModelPoints`, `ImuPosition`,
+> `Acc/GyroCalibration`), i.e. the per-unit LED model. That contradicts the "LED positions NOT in
+> the controller's readable cal" line below. One live read settles it;
+> `tools/touchplus_config.py --cal` already accepts the blob.
 
 - **IMU + input calibration** live on the controller and are read by the host:
   `syncboss_input_get_calibration_data(id, type, buf, len)`; controller user-cal in
@@ -635,16 +669,17 @@ All scripts read the flattened images and `images.json` from the gitignored
 Items 1–6 were the questions for a *listening* host. A *transmitting* host needs more
 (docs/MASTER-PLAN.md §3.1). All of it is static RE, no hardware:
 
-7. **deerfly input map**: `deerfly-app.bin` is available and is Cortex-M23 code (see "Images").
-   Axis identity, button labels, touch flags, battery scale. (RE-2)
+7. ~~**deerfly input map**~~ **CLOSED by RE-2** ([re/PERIPHERALS.md](re/PERIPHERALS.md) §4–5).
+   Left open: ntf 0x20/0x21/0x2b and "trigger2" meanings, and the handedness field.
 8. **Connected-link bring-up + register access**: the connection-negotiation packets in both
    directions and the slot assignment; CL/TL framing; how the host reads, writes and subscribes to
    hreg registers (input, IMU) and receives notifications; the steady-state CCM nonce as the
    host must *produce* it; and the `FUN_00047604` pairing-vs-negotiation contradiction (Q3 note).
    Prime source: `libsyncboss.so` (has symbols). (RE-1)
-9. **Peripherals**: the IR LED config command layout and validation limits (can the LEDs be held
-   on for the Frame cameras?), the IMU full-scale/rate/layout and the per-unit calibration read,
-   and the haptics command formats. (RE-2)
+9. ~~**Peripherals**~~ **CLOSED by RE-2** ([re/PERIPHERALS.md](re/PERIPHERALS.md)). LEDs:
+   strobe only, ≤75 µs, phase on the host clock (no always-on). IMU: ntf 1, 500 Hz, scales in
+   cmd 0x32. Cal: cmd 0x2b. Haptics: 0x97/0xa0/0x9b/0x9d. Left open: the cmd 0x2b blob content
+   (one live read) and the sync-buffer haptics rate.
 10. **Pairing-link initiation**: how the host opens the 2426 MHz DM link to an advertising
     controller, SPL-frame CRC byte order, what the controller does after 0x11. Optional: the
     default AES key in libsyncboss/syncboss. (RE-1)
