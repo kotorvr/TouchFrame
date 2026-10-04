@@ -171,6 +171,33 @@ Rules for every session:
   repo (README "Legal").
 - Commit small. Run `/code-review` on build branches before merging.
 
+### Who starts sessions: the planner chips them
+
+The **planner** (the "TouchFrame planning" chat) is the dispatcher, not the audit. It gets a
+notification when each chipped session ends, so it is the one place that knows what finished. It:
+1. merges the finished branch, folds RE results into PROTOCOL.md / FRAME-TRACKER.md, updates this
+   plan and pushes;
+2. **chips the next session** when its trigger below fires;
+3. tells the user, who clicks the chip to start it.
+
+AUDIT-1 / REVIEW-RE only *review*. They report to the planner and never start sessions.
+Worker sessions don't chip follow-ups. They end with a summary of what's next, and the planner
+decides.
+
+| Next session | Chipped by the planner when… | Status |
+|---|---|---|
+| RE-1, RE-2, RE-3, BUILD-1, AUDIT-1 | the plan was written | **running (started 2026-10-04)** |
+| BUILD-2 Driver radio backend | BUILD-1 reports link v3 committed | waiting |
+| REVIEW-RE | RE-1 and RE-2 are merged | waiting |
+| DEV-1 Frame bench | the Echo session releases the Quest + Frame (it messages the planner) | waiting |
+| HW-1 Sniff & validate | the dongles arrive (the user says so) | waiting |
+| HW-2 Host bring-up | HW-1 done + BUILD-1 merged + REVIEW-RE has no blockers | waiting |
+| HW-3 Gate B + tracking | HW-2 passes G-Link + BUILD-2 merged | waiting |
+| HW-4 Integrate & ship | HW-3 decides G-B (6DoF or Plan B) | waiting |
+
+If the planner chat is gone, any new chat can take the role: read this section, check the Status
+column and `git log`, and carry on.
+
 ### Phase N: now (no devices, no dongle). Up to 4 at once.
 
 | Session | Type | Goal | Owns | Parallel? |
