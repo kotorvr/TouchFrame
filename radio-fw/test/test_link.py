@@ -256,6 +256,8 @@ def test_stored_and_compact():
     done, _ = wait(d, lambda n, e: n == "pair" and e["state"] == 5)
     assert done["netaddr"] == netaddr and done["hand"] == 0
     wait(d, lambda n, e: n == "conn" and e["state"] == 3)  # no CMD_CONNECT needed
+    hand, _ = wait(d, lambda n, e: n == "pair" and e["state"] == 5)  # cmd 1 read: the second DONE, with the hand
+    assert hand["device_id"] == 0xC0FFEE and hand["hand"] == 1
     smp, seen = wait(d, lambda n, e: n == "sample")
     assert smp["accel"] == [0, 0, 1024] and smp["flags"] == 0 and not any(n in ("input", "imu") for n, _ in seen)
     p = d.pairings()
@@ -277,6 +279,33 @@ def test_stored_and_compact():
     d.host_start(0, bytes(16), 9, flags=flags)
     assert d.host_status()["netaddr"] not in (0, netaddr)
     print("stored identity: pair -> saved + auto-connected, reboot -> reconnects, list / forget ok; compact samples ok")
+
+
+def test_cmd1_hand():
+    """cmd 1 (REVIEW-RE R11) as host_core.c got_hand() reads it: "unconf" stores nothing and sends no
+    second DONE; a hand learnt at a later connect still gets the pairing's one second DONE."""
+    ctrl = SimController(0xC0FFEE, hand="unconf")
+    fake = FakeDongle(controllers=[ctrl])
+    d = R.Dongle(transport=fake)
+    d.host_start(0, bytes(16), 7, flags=R.HOST_DM_BEACONS | R.HOST_STORED | R.HOST_COMPACT)
+    d.request(R.CMD_PAIR_START, "link_pair_start_t", flags=R.PAIR_AUTO, timeout_s=10)
+    wait(d, lambda n, e: n == "pair" and e["state"] == 5)
+    conn, _ = wait(d, lambda n, e: n == "conn" and e["state"] == 3)
+    r, _ = d.request(R.CMD_REG_READ, "link_reg_cmd_t", slot=conn["slot"], reg=1, len=32)
+    reg, _ = wait(d, lambda n, e: n == "reg" and e["reg"] == 1)
+    assert reg["status"] == 0 and reg["data"][16:24].rstrip(b"\0") == b"unconf", reg
+    end = time.monotonic() + 0.2
+    for name, e in d.events(0.05):
+        assert name != "pair", "a second DONE for an unconf controller"
+        if time.monotonic() > end:
+            break
+    assert d.pairings()["pairings"][0]["hand"] == 0
+    ctrl.set_hand("right")
+    fake.drop_slot(conn["slot"])
+    wait(d, lambda n, e: n == "conn" and e["state"] == 3)
+    done, _ = wait(d, lambda n, e: n == "pair" and e["state"] == 5)
+    assert done["hand"] == 2 and d.pairings()["pairings"][0]["hand"] == 2
+    print("cmd 1: unconf -> no hand, no second DONE; a later left/right -> stored + the one second DONE")
 
 
 class _HidShim:
@@ -324,5 +353,6 @@ if __name__ == "__main__":
     test_host_session()
     test_pending_re_behaviour()
     test_stored_and_compact()
+    test_cmd1_hand()
     test_hid_transport()
     print("link tests passed")
