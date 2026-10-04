@@ -57,15 +57,29 @@ quest_uninstall() {
 }
 
 radio_set_mode() {  # radio_set_mode MODE: edit SteamVR's settings with SteamVR stopped
-  tools/frame.sh shell "XDG_RUNTIME_DIR=/run/user/\$(id -u) systemctl --user stop steamvr.service; python3 - <<EOF
+  # SteamVR rewrites its settings on exit, so a running SteamVR is stopped first and started
+  # again; NO_RESTART=1 leaves a running SteamVR alone (and the mode unchanged).
+  local keep=0
+  [ -z "${NO_RESTART:-}" ] || keep=1
+  tools/frame.sh shell "export XDG_RUNTIME_DIR=/run/user/\$(id -u)
+running=0
+if systemctl --user -q is-active steamvr.service; then
+  if [ $keep = 1 ]; then
+    echo '  SteamVR is running and NO_RESTART is set: driver_touchframe.mode unchanged'
+    exit 0
+  fi
+  running=1
+  systemctl --user stop steamvr.service
+fi
+python3 - <<EOF
 import json, os
 p = os.path.expanduser('~/.config/openvr/config/steamvr.vrsettings')
 s = json.load(open(p))
 s.setdefault('driver_touchframe', {})['mode'] = '$1'
 json.dump(s, open(p, 'w'), indent=3)
 print('  driver_touchframe.mode = $1')
-EOF"
-  [ -n "${NO_RESTART:-}" ] || tools/frame.sh restart
+EOF
+[ \$running = 0 ] || systemctl --user start steamvr.service"
 }
 
 radio_install() {

@@ -102,7 +102,12 @@ enum LedMode : uint8_t { LED_OFF = 0, LED_ON = 1, LED_STROBE = 2 };
 enum HapticMode : uint8_t { HAPTIC_STOP = 0, HAPTIC_SIMPLE = 1, HAPTIC_PCM = 2 };
 
 // Sample flags (link_input_t / link_imu_t / link_sample_t).
-enum { SAMPLE_PLACEHOLDER = 1u << 0, SAMPLE_ARRIVAL_TIME = 1u << 1, SAMPLE_SCALE_GUESSED = 1u << 2 };
+enum {
+    SAMPLE_PLACEHOLDER = 1u << 0,
+    SAMPLE_ARRIVAL_TIME = 1u << 1,
+    SAMPLE_SCALE_GUESSED = 1u << 2,
+    SAMPLE_IMU_REPEAT = 1u << 3,  // EVT_SAMPLE: no new IMU sample, accel / gyro repeat the last one
+};
 
 // Controller command register 0x32 imu_config (docs/re/PERIPHERALS.md §3.2).
 constexpr uint8_t kRegImuConfig = 0x32;

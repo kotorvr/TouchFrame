@@ -25,7 +25,7 @@ namespace radio {
 class TimeSync {
 public:
     struct Options {
-        double window_s = 60;           // slope: least squares over the pings of the last window_s
+        double window_s = 60;           // slope: fitted over the pings of the last window_s
         double intercept_window_s = 15;  // intercept: band of the last few seconds at that slope
         double margin_span_s = 20;      // switch the slope to max-margin once pings span this
         double max_rtt_us = 20000;      // drop slower samples

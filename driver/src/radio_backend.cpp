@@ -238,12 +238,15 @@ void RadioBackend::Service() {
     double next_status = NowSeconds() + 10;
     while (running_) {
         double now = NowSeconds();
-        if (xrlog_ && (connected_[0] || connected_[1])) xrlog_->Poll(now);
+        // The log's lines carry no host time: they're stamped when read, so read often (the LED
+        // loop attributes a hit to the probe that was live then).
+        bool watching = xrlog_ && (connected_[0] || connected_[1]);
+        if (watching) xrlog_->Poll(now);
         if (opt_.status_every_s > 0 && now >= next_status) {
             next_status = now + opt_.status_every_s;
             Log(Status());
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        std::this_thread::sleep_for(std::chrono::milliseconds(watching ? 20 : 100));
     }
 }
 

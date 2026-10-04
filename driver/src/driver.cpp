@@ -468,11 +468,10 @@ private:
     // controller holds that hand's slot doesn't get the slot when it frees (FRAME-TRACKER §9.3),
     // so when the competitor goes away, announce again under a fresh deviceId.
     void ScanCompetitors(uint64_t now) {
-        static TrackedDevicePose_t poses[k_unMaxTrackedDeviceCount];
-        VRServerDriverHost()->GetRawTrackedDevicePoses(0, poses, k_unMaxTrackedDeviceCount);
+        VRServerDriverHost()->GetRawTrackedDevicePoses(0, scan_poses_, k_unMaxTrackedDeviceCount);
         bool comp[2] = {false, false};
         for (uint32_t i = 1; i < k_unMaxTrackedDeviceCount; i++) {
-            if (i == hands_[0]->Id() || i == hands_[1]->Id() || !poses[i].bDeviceIsConnected) continue;
+            if (i == hands_[0]->Id() || i == hands_[1]->Id() || !scan_poses_[i].bDeviceIsConnected) continue;
             PropertyContainerHandle_t c = VRProperties()->TrackedDeviceToPropertyContainer(i);
             if (c == k_ulInvalidPropertyContainer) continue;
             ETrackedPropertyError e = TrackedProp_Success;
@@ -525,7 +524,9 @@ private:
     }
 
     // Radio: one hand's state, with the pose's age (XRService's own timestamps, or the IMU's).
+    // Camera mode calls this from the radio thread and the hand's pose thread: one at a time.
     void OnHand(int h, const HandState& s, double age_s) {
+        std::lock_guard<std::mutex> lk(hand_mu_[h]);
         last_hand_ns_[h] = MonotonicNs();
         if (!added_[h]) {
             if (!(s.flags & kConnected)) return;
@@ -557,6 +558,8 @@ private:
     bool reannounce_ = true;
     bool competitor_[2] = {false, false};
     uint64_t last_reannounce_ns_[2] = {0, 0};
+    TrackedDevicePose_t scan_poses_[k_unMaxTrackedDeviceCount];
+    std::mutex hand_mu_[2];
     std::mutex head_mu_;
     cv::Pose head_;
     bool have_head_ = false;

@@ -488,12 +488,25 @@ void RadioSource::HandleFrame(const uint8_t* f, size_t n, int64_t now) {
                  p.status ? (std::string(", ") + StatusName(p.status)).c_str() : "", p.device_id);
             if (p.state == PAIR_DONE) {
                 int hand;
+                bool ours;
                 {
                     std::lock_guard<std::mutex> lk(mu_);
                     hand = pair_.hand;
+                    ours = pair_.active;
                     pair_.active = false;
                 }
-                if (p.hand == HAND_LEFT || p.hand == HAND_RIGHT) hand = p.hand == HAND_LEFT ? 0 : 1;  // the controller knows
+                const bool told = p.hand == HAND_LEFT || p.hand == HAND_RIGHT;
+                if (told) hand = p.hand == HAND_LEFT ? 0 : 1;  // the controller knows
+                if (!ours && id_.paired.count(p.device_id)) {
+                    // The dongle's follow-up once it has read the controller's cmd 1: only its hand.
+                    // (Replacing the other controller on that hand is for a new pairing only.)
+                    if (told && (!id_.hand.count(p.device_id) || id_.hand[p.device_id] != hand)) {
+                        id_.hand[p.device_id] = hand;
+                        SaveIdentity();
+                        MoveToReportedHands();
+                    }
+                    return;
+                }
                 std::vector<uint64_t> replaced;
                 for (auto& kv : id_.hand)
                     if (kv.second == hand && kv.first != p.device_id) replaced.push_back(kv.first);
@@ -578,7 +591,8 @@ void RadioSource::HandleFrame(const uint8_t* f, size_t n, int64_t now) {
             SampleEvt s;
             if (!Body(b, bn, &s)) return;
             int32_t a[3] = {s.accel[0], s.accel[1], s.accel[2]}, g[3] = {s.gyro[0], s.gyro[1], s.gyro[2]};
-            OnSample(s.in, a, g, nullptr, now);
+            const bool repeat = s.in.flags & SAMPLE_IMU_REPEAT;  // the last IMU sample again: inputs only
+            OnSample(s.in, repeat ? nullptr : a, repeat ? nullptr : g, nullptr, now);
             return;
         }
         case EVT_TEXT:
@@ -689,8 +703,8 @@ int RadioSource::HandForDevice(uint64_t dev) {
     // No hand known (paired with tools/radio.py, or the firmware can't tell): the first free hand,
     // right first (the planner's default; RequestPair(hand) overrides).
     for (int h = 1; h >= 0; h--) {
-        bool used = false;
-        for (auto& kv : id_.hand) used |= kv.second == h;
+        bool used = false;  // by a paired controller (forgotten ones may linger in the file)
+        for (auto& kv : id_.hand) used |= kv.second == h && id_.paired.count(kv.first);
         if (!used) {
             id_.hand[dev] = h;
             SaveIdentity();
@@ -760,11 +774,23 @@ void RadioSource::ConnectPaired() {
 }
 
 void RadioSource::OnConn(const ConnEvt& c) {
-    int hand = c.device_id ? HandForDevice(c.device_id) : HandOfSlot(c.slot);
     if (c.state == SLOT_CONNECTED) {
+        int hand = c.device_id ? HandForDevice(c.device_id) : HandOfSlot(c.slot);
         if (hand < 0) {
             Logf("radio: controller %016" PRIx64 " connected in slot %u but isn't one of ours", c.device_id, c.slot);
             return;
+        }
+        if (hands_[hand].connected && hands_[hand].device_id != c.device_id) {
+            // Two controllers for one hand (e.g. cmd 1 said otherwise than the pairing): the other
+            // hand if it is free, else wait for one to go.
+            if (hands_[1 - hand].connected) {
+                Logf("radio: controller %016" PRIx64 " (slot %u) is a %s controller and both hands are in use; "
+                     "ignoring it", c.device_id, c.slot, kHandName[hand]);
+                return;
+            }
+            Logf("radio: controller %016" PRIx64 " is a %s controller, but that hand is in use; using it as %s for now",
+                 c.device_id, kHandName[hand], kHandName[1 - hand]);
+            hand = 1 - hand;
         }
         {
             std::lock_guard<std::mutex> lk(mu_);
@@ -795,7 +821,9 @@ void RadioSource::OnConn(const ConnEvt& c) {
         if (cb_.connection) cb_.connection(hand, true);
         return;
     }
-    if (hand >= 0 && hands_[hand].connected && hands_[hand].slot == c.slot) {
+    // By slot: a controller may sit on the other hand than its own for now (above).
+    int hand = HandOfSlot(c.slot);
+    if (hand >= 0 && (!c.device_id || hands_[hand].device_id == c.device_id)) {
         Disconnected(hand, (std::string(SlotStateName(c.state)) + (c.reason ? std::string(", ") + ReasonName(c.reason) : "")).c_str());
         return;
     }
