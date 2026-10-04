@@ -213,6 +213,8 @@ decides.
 | REVIEW-RE | RE-1 and RE-2 are merged | **done, merged 19c8bd8**: [re/REVIEW-RE.md](re/REVIEW-RE.md). TL header pinned; 6 BLOCKING firmware bugs (R1–R6); handedness, the DC threshold (25 beacons) and the seek cadence closed |
 | BUILD-1b firmware + tool fixes | REVIEW-RE's BUILD-1 checklist | **done, merged c06d4bb**: all REVIEW-RE fixes; real controllers get input/IMU/LED/haptics (PCM pending). Build clean, all tests pass |
 | DEV-1 on-device bench | the Echo session releases the Quest + Frame | **done, merged 5a0b33d**: [re/DEV-1.md](re/DEV-1.md); devices handed back to Echo |
+| CLEANUP-1 | the planner's final offline check | **chipped 2026-10-04**: test the driver's handedness/hand-collision paths against the fake dongle, consolidate PROTOCOL.md, refresh the FEASIBILITY verdict |
+| Plan B research (position from Frame hand tracking) | HW-3 fails G-B | deferred. RE-3's goal 4 was never done. First check: whether the Frame's hand tracking shows up as OpenVR devices a driver can read through the public API |
 | HW-1 Sniff & validate | the dongles arrive (the user says so) | **waiting on hardware. All offline work is done (2026-10-04)** |
 | HW-2 Host bring-up | HW-1 done + BUILD-1 merged + REVIEW-RE has no blockers | waiting |
 | HW-3 Gate B + tracking | HW-2 passes G-Link + BUILD-2 merged | waiting |
