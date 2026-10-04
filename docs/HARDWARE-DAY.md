@@ -8,10 +8,14 @@ Nothing on this list needs the Frame except the Gate B section at the end. Sessi
 needs the firmware TX path and the post-pairing command layer. Neither exists yet: sessions BUILD-1
 and RE-1/RE-2.
 
-**Pairing a controller to the dongle unpairs it from the Quest.** Expect the relay (the working
-setup today) to stop for that controller until you re-pair it in the Quest's controller settings.
-Whether a Touch Plus can remember two hosts is not known yet. Pair one controller first, and keep
-the other on the Quest until HW-2 is solid.
+**Pairing a controller to the dongle unpairs it from the Quest (CONFIRMED, [re/LINK.md](re/LINK.md)
+§5.1).** A Touch Plus keeps a single host pairing record, so the relay stops for that controller
+until you re-pair it in the Quest's controller settings, and the same goes the other way. Pair one
+controller first, and keep the other on the Quest until HW-2 is solid.
+
+**What a sniffed session still has to settle** (RE-1 open items): the on-air TL/notification
+header bytes, the endpoint↔slot mapping, the steady-state CCM counter start/increment, and the
+CRC trailer byte order. Capture one full connected session with the second dongle during HW-2.
 
 **Before you start:**
 - [ ] OTG adapter: the dongle is USB-A, the Frame is USB-C. Not needed for §0–5 on the PC.

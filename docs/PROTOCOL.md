@@ -8,6 +8,11 @@ gitignored `artifacts/quest/`. Nothing here reproduces Meta firmware; only our o
 prose, addresses, and small struct tables. Reproduce the analysis with
 `tools/ghidra/extract_images.py`, `fde_starts.py`, and `run.sh` (see end).
 
+> **Session reports that supersede parts of this file (2026-10-04)**, authoritative where they disagree:
+> - [re/LINK.md](re/LINK.md) (RE-1): connected link, nonces, register access, negotiation, pairing initiation.
+> - [re/PERIPHERALS.md](re/PERIPHERALS.md) (RE-2): LEDs, IMU, input, haptics, calibration.
+> - [re/AUDIT.md](re/AUDIT.md) (AUDIT-1): corrections to Q1–Q6 and the tools.
+
 Status tags: **CONFIRMED** = read directly in code/data; **INFERRED** = strongly implied
 by code plus public prior work; **UNKNOWN** = not yet established.
 
@@ -699,7 +704,7 @@ Items 1–6 were the questions for a *listening* host. A *transmitting* host nee
 
 7. ~~**deerfly input map**~~ **CLOSED by RE-2** ([re/PERIPHERALS.md](re/PERIPHERALS.md) §4–5).
    Left open: ntf 0x20/0x21/0x2b and "trigger2" meanings, and the handedness field.
-8. **Connected-link bring-up + register access**: the connection-negotiation packets in both
+8. **Largely CLOSED by RE-1** ([re/LINK.md](re/LINK.md) §2–4): two register namespaces (command registers via TL read/write, with the full ID map; notification chunks for streaming); negotiation request/response layouts; slot assignment; nonces. Left for a live capture: the on-air TL/notification header bytes, the endpoint↔slot mapping, and the steady counter's start and increment. Also: the "HID descriptor" is command register 0xab (§3). Original text: **Connected-link bring-up + register access**: the connection-negotiation packets in both
    directions and the slot assignment; CL/TL framing; how the host reads, writes and subscribes to
    hreg registers (input, IMU) and receives notifications; the steady-state CCM nonce as the
    host must *produce* it; and the `FUN_00047604` pairing-vs-negotiation contradiction (Q3 note).
@@ -708,6 +713,6 @@ Items 1–6 were the questions for a *listening* host. A *transmitting* host nee
    strobe only, ≤75 µs, phase on the host clock (no always-on). IMU: ntf 1, 500 Hz, scales in
    cmd 0x32. Cal: cmd 0x2b. Haptics: 0x97/0xa0/0x9b/0x9d. Left open: the cmd 0x2b blob content
    (one live read) and the sync-buffer haptics rate.
-10. **Pairing-link initiation**: how the host opens the 2426 MHz DM link to an advertising
+10. **Largely CLOSED by RE-1** ([re/LINK.md](re/LINK.md) §5–6): on-air command bytes `0x25`/`0x22`; the post-0x11 state transition; **one host pairing record only** (§5.1), so pairing to the dongle overwrites the Quest bond; the default key and netaddr are all zeros. DM framing is still INFERRED, and the seek cadence after a power cycle is UNKNOWN. Original text: **Pairing-link initiation**: how the host opens the 2426 MHz DM link to an advertising
     controller, SPL-frame CRC byte order, what the controller does after 0x11. Optional: the
     default AES key in libsyncboss/syncboss. (RE-1)
