@@ -23,8 +23,21 @@ Pairing exchange (host = us):
      the FIRST 16 bytes of the 32-byte shared secret (plain truncation, no hash). We choose the key.
   0x14 WriteAESKey is a no-op stub in the controller SPL (Q2) — we never send it. 0x15 = Reset.
 
+Connected link (post-pairing), from docs/re/LINK.md:
+  - build/parse_conn_negotiation : the connection-negotiation packet the host emits to bring a
+    seeking controller onto a slot, built to the CONFIRMED device accept rules (type=1, endpoint
+    CONN_NEG/lock, 64-bit device id, slot 1..4, version 0x1701).
+  - build/parse_beacon_header    : beacon payload bytes 0..15 (channel map, unmapped channel,
+    session nonce, 48-bit timestamp, byte-14 downlink slot, byte-15 ack bitmap).
+  - CMD_REGS / describe_reg / check_{read,write}_request : the on-demand command-register namespace
+    (reg-id -> operation map, CONFIRMED from symbol-named libsyncboss callers) and its transport
+    limits. The on-air TL header bytes are still UNKNOWN (one live capture pins them).
+  - steady_state_nonce           : the CONFIRMED 13-byte connected-link CCM nonce packing.
+
   pulsar_host.py selftest     run all offline checks (X25519 RFC 7748 vector, pairing round-trip,
-                              CRC/framing round-trip); prints "selftest ok ...".
+                              CRC/framing round-trip, connection-negotiation accept-rules, beacon
+                              header, command-reg map/limits, steady-state nonce); prints
+                              "selftest ok ...".
 """
 import argparse
 import os
@@ -232,6 +245,219 @@ def parse_pairing_data(wrap_key, payload32):
     return pt[:4], pt[4:20]
 
 
+# ================================================================================================
+# Connected link (post-pairing). See docs/re/LINK.md. Everything below is OFFLINE byte
+# construction/parsing only — no radio. Tags CONFIRMED/INFERRED mirror LINK.md.
+# ================================================================================================
+
+# ---- Connected-link endpoints (CONFIRMED, elk-app accept handler fn 0x23aa8) -------------------
+EP_CONN_NEG = 2  # "CONN_NEG" endpoint (connection negotiation)
+EP_LOCK = 3      # "lock" endpoint (the follow-up that locks the link)
+CONN_PKT_TYPE = 1  # accept handler requires connection packet [0] == 1
+PULSAR_VERSION = 0x1701  # on-air bytes 01 17 = major 1 / pulsar_protocol_sub_version 23 (Q6)
+
+# Slots are transport endpoints 1..4 (CONFIRMED: TRANSPORT_ENDPOINT_START=1, < 5;
+# connection_tracker.c / endpoint_allocator.c). Device TX prefix = slot + 1 (Q1: 0x01..0x05).
+SLOT_MIN = 1
+SLOT_MAX = 4
+
+
+def device_tx_prefix(slot):
+    """Uplink radio prefix a device in `slot` transmits on = slot + 1 (CONFIRMED, Q1)."""
+    if not (SLOT_MIN <= slot <= SLOT_MAX):
+        raise ValueError(f"slot must be {SLOT_MIN}..{SLOT_MAX}")
+    return slot + 1
+
+
+# ---- Command-register map (CONFIRMED from symbol-named libsyncboss callers; see LINK.md §3) -----
+# The on-demand command-register namespace (request/response), DISTINCT from the streaming-input
+# hreg space (buttons/analog/IMU) in PROTOCOL Q4. 'R'/'W'/'RW' is the access seen in libsyncboss.
+CMD_REGS = {
+    0x05: ("W", "shutdown"),
+    0x06: ("W", "sleep/wake"),
+    0x0B: ("R", "platform_attachment_info"),
+    0x0C: ("RW", "platform_attachment_auth"),
+    0x13: ("W", "unpair"),
+    0x19: ("W", "console_cmd"),
+    0x1A: ("W", "console_cmd"),
+    0x1C: ("W", "set_carrier"),
+    0x28: ("R", "get_led_config"),
+    0x2B: ("R", "get_calibration_data"),  # request carries an 8-byte 'type' selector
+    0x2F: ("R", "get_battery_voltage"),
+    0x33: ("R", "get_imu_temp"),
+    0x34: ("R", "get_assert_info"),
+    0x38: ("R", "get_backtrace"),
+    0x3F: ("R", "get_build_hash"),
+    0x4C: ("RW", "thumbstick_user_calibration"),
+    0x4E: ("W", "clear_thumbstick_user_calibration"),
+    0x4F: ("RW", "thumbstick_user_deadband_percentage"),
+    0x50: ("RW", "adc_stream_enable"),
+    0x53: ("RW", "battery_pack / set_battery_pack_pollrate"),
+    0x9F: ("W", "imu_integration_uplink"),
+    0xAB: ("R", "hid_report_descriptor"),
+    0xAC: ("RW", "hid_feature_report"),
+    0xB4: ("W", "stream_rf_perf"),
+}
+
+# Transport limits (CONFIRMED, libsyncboss pulsar_{read,write}_nolock asserts).
+SPI_DATA_HDR_LEN = 0x14   # sizeof(spi_data_pulsar_data_t): 20-byte Android->MCU header
+READ_REQ_MAX = 0xEB       # read: in_len <= 235 (sizeof(*pdata)+in_len <= WIRELESS_MAX_PAYLOAD_SIZE)
+WRITE_LEN_MAX = 0xFF - SPI_DATA_HDR_LEN  # write: 0x14 + len <= 0xFF
+
+
+def describe_reg(reg_id):
+    """Return 'ACCESS name' for a command register id, or 'unknown' (CONFIRMED map)."""
+    acc, name = CMD_REGS.get(reg_id, (None, None))
+    return f"{acc} {name}" if name else "unknown"
+
+
+def check_read_request(reg_id, in_len):
+    """Validate a command-register READ request against the CONFIRMED transport limits.
+
+    We can pin the (reg_id, request-bytes) -> (response-bytes) contract statically; the exact
+    on-air TL *header* bytes are UNKNOWN (LINK.md §3) and are left for the first live capture,
+    so this is a semantic/limits check, not an on-air frame builder."""
+    if not (0 <= reg_id <= 0xFF):
+        raise ValueError("reg_id out of range")
+    if not (0 <= in_len <= READ_REQ_MAX):
+        raise ValueError(f"read request in_len must be 0..{READ_REQ_MAX}")
+    return True
+
+
+def check_write_request(reg_id, length):
+    """Validate a command-register WRITE request length (CONFIRMED transport limit)."""
+    if not (0 <= reg_id <= 0xFF):
+        raise ValueError("reg_id out of range")
+    if not (0 <= length <= WRITE_LEN_MAX):
+        raise ValueError(f"write length must be 0..{WRITE_LEN_MAX}")
+    return True
+
+
+# ---- Connection-negotiation packet (device-accept contract, LINK.md §4) ------------------------
+# The host emits this in the beacon CL-data area to bring a seeking controller onto a slot. Field
+# positions below are the CONFIRMED device-side accept rules (elk-app fn 0x23aa8: [0]==type,
+# [2]&7==endpoint, [3..10]==64-bit device id, [11]==slot), plus the version field the response
+# builder echoes (0x1701). Byte 1 and any trailing bytes of the 26-byte body are INFERRED (the
+# exact host-TX layout within the body needs one live capture); we place version at [12..13], the
+# first slot after the fixed header, and zero-pad the rest.
+CONN_NEG_PKT_LEN = 14  # the fixed, device-validated prefix we build (type..version)
+
+
+def build_conn_negotiation(device_id_64, slot, endpoint=EP_CONN_NEG, version=PULSAR_VERSION):
+    """Build the device-validated connection-negotiation packet the host transmits.
+
+    device_id_64 : the controller's 64-bit device ID (its FICR DEVICEID, from the advertisement).
+    slot         : the slot we assign (1..4). endpoint: EP_CONN_NEG then EP_LOCK on the follow-up.
+    Returns the 14-byte validated prefix: [type=1][0][endpoint][id:8 LE][slot][ver:2 LE].
+    """
+    if endpoint not in (EP_CONN_NEG, EP_LOCK):
+        raise ValueError("endpoint must be EP_CONN_NEG(2) or EP_LOCK(3)")
+    if not (SLOT_MIN <= slot <= SLOT_MAX):
+        raise ValueError(f"slot must be {SLOT_MIN}..{SLOT_MAX}")
+    pkt = bytearray(CONN_NEG_PKT_LEN)
+    pkt[0] = CONN_PKT_TYPE
+    pkt[1] = 0                                   # INFERRED (reserved/flags)
+    pkt[2] = endpoint & 0x07                     # accept handler masks [2] & 7
+    pkt[3:11] = int(device_id_64).to_bytes(8, "little")
+    pkt[11] = slot
+    pkt[12:14] = int(version).to_bytes(2, "little")  # 01 17 on air
+    return bytes(pkt)
+
+
+def parse_conn_negotiation(pkt):
+    """Parse/validate a connection-negotiation packet by the CONFIRMED device accept rules.
+
+    Returns dict(type, endpoint, device_id, slot, version). Raises if it would be rejected by the
+    controller (wrong type, endpoint not in {2,3}, slot out of range)."""
+    if len(pkt) < CONN_NEG_PKT_LEN:
+        raise ValueError("connection packet too short")
+    typ = pkt[0]
+    endpoint = pkt[2] & 0x07
+    device_id = int.from_bytes(pkt[3:11], "little")
+    slot = pkt[11]
+    version = int.from_bytes(pkt[12:14], "little")
+    if typ != CONN_PKT_TYPE:
+        raise ValueError(f"connection packet type {typ} != {CONN_PKT_TYPE} (would be rejected)")
+    if endpoint not in (EP_CONN_NEG, EP_LOCK):
+        raise ValueError(f"endpoint {endpoint} not CONN_NEG/lock (would be rejected)")
+    if not (SLOT_MIN <= slot <= SLOT_MAX):
+        raise ValueError(f"slot {slot} out of range (accept handler asserts)")
+    return {"type": typ, "endpoint": endpoint, "device_id": device_id,
+            "slot": slot, "version": version}
+
+
+# ---- Beacon header (host -> all; CONFIRMED layout, PROTOCOL Q1 + LINK.md §4) --------------------
+def build_beacon_header(channel_map_37, unmapped, session_nonce, timestamp_us,
+                        downlink_slot=None, ack_bitmap=0):
+    """Build beacon payload bytes 0..15 (the CL header; the <=34-byte CL data area follows).
+
+    channel_map_37 : 37-bit active-channel bitmap (LSB = logical channel 0).
+    unmapped       : current unmapped-channel value 0..36 (byte 5).
+    session_nonce  : 16-bit value (bytes 6..7).
+    timestamp_us   : 48-bit beacon timestamp on the sync clock (bytes 8..13, little-endian).
+    downlink_slot  : slot whose downlink data rides this beacon -> byte 14 = 1<<slot, else 0.
+    ack_bitmap     : byte 15 = rx/ack bitmap of slots heard since the last beacon.
+
+    Byte 0 bits 1..2 (periods-until-DM-beacon) and bit 0 (reserved) are left 0 here. Returns the
+    16-byte header; LENGTH on air = 14 + len(CL data) (the caller appends the CL data area)."""
+    if not (0 <= channel_map_37 < (1 << 37)):
+        raise ValueError("channel map must be a 37-bit value")
+    if not (0 <= unmapped <= 36):
+        raise ValueError("unmapped must be 0..36")
+    if not (0 <= session_nonce <= 0xFFFF):
+        raise ValueError("session_nonce must be 16-bit")
+    if not (0 <= timestamp_us < (1 << 48)):
+        raise ValueError("timestamp must be a 48-bit value")
+    b = bytearray(16)
+    # byte 0 bits3..7 = map bits 0..4; bytes 1..4 = map bits 5..36 (37-bit map, LSB first).
+    b[0] = (channel_map_37 & 0x1F) << 3
+    b[1] = (channel_map_37 >> 5) & 0xFF
+    b[2] = (channel_map_37 >> 13) & 0xFF
+    b[3] = (channel_map_37 >> 21) & 0xFF
+    b[4] = (channel_map_37 >> 29) & 0xFF   # byte4 bits3..7 = map bits 32..36
+    b[5] = unmapped
+    b[6:8] = session_nonce.to_bytes(2, "little")
+    b[8:14] = timestamp_us.to_bytes(6, "little")
+    if downlink_slot is not None:
+        if not (SLOT_MIN <= downlink_slot <= SLOT_MAX):
+            raise ValueError(f"downlink_slot must be {SLOT_MIN}..{SLOT_MAX}")
+        b[14] = 1 << downlink_slot
+    b[15] = ack_bitmap & 0xFF
+    return bytes(b)
+
+
+def parse_beacon_header(b):
+    """Inverse of build_beacon_header. Returns dict of the 16-byte header fields."""
+    if len(b) < 16:
+        raise ValueError("beacon header too short")
+    channel_map = ((b[0] >> 3) & 0x1F) | (b[1] << 5) | (b[2] << 13) | (b[3] << 21) | (b[4] << 29)
+    downlink = b[14]
+    downlink_slot = (downlink.bit_length() - 1) if downlink else None
+    return {
+        "channel_map": channel_map & ((1 << 37) - 1),
+        "dm_periods": (b[0] >> 1) & 0x3,
+        "unmapped": b[5],
+        "session_nonce": int.from_bytes(b[6:8], "little"),
+        "timestamp_us": int.from_bytes(b[8:14], "little"),
+        "downlink_slot": downlink_slot,
+        "ack_bitmap": b[15],
+    }
+
+
+# ---- Steady-state CCM nonce (host as producer, LINK.md §2) --------------------------------------
+def steady_state_nonce(counter, direction, iv):
+    """13-byte connected-link CCM nonce = PACKETCOUNTER[5 LE, incl. direction bit] || IV[8].
+
+    CONFIRMED structure (syncboss FUN_0001b1a4: counter@cfg+0x120 5B, direction@+0x128,
+    IV@+0x129 8B). The host advances `counter` per encrypted packet in each direction; `iv` is the
+    8 random bytes established in the clear at the connected-link negotiation (reuse is INFERRED —
+    confirm with tools/pulsar_crypto.py scan on one captured packet). direction: 0 = host->device,
+    1 = device->host."""
+    if len(iv) != 8:
+        raise ValueError("iv must be 8 bytes")
+    return nonce_from_fields(counter=counter, direction=direction, iv=bytes(iv))
+
+
 # ---- selftest ----------------------------------------------------------------------------------
 
 def _check_x25519_rfc7748():
@@ -343,13 +569,111 @@ def _check_crc_framing():
         pass
 
 
+def _check_conn_negotiation():
+    """Connection-negotiation packet round-trips and enforces the device accept rules."""
+    dev_id = 0x1122334455667788
+    for ep in (EP_CONN_NEG, EP_LOCK):
+        for slot in (SLOT_MIN, SLOT_MAX):
+            pkt = build_conn_negotiation(dev_id, slot, endpoint=ep)
+            got = parse_conn_negotiation(pkt)
+            assert got["type"] == CONN_PKT_TYPE
+            assert got["endpoint"] == ep
+            assert got["device_id"] == dev_id, hex(got["device_id"])
+            assert got["slot"] == slot
+            assert got["version"] == PULSAR_VERSION
+            # on-air version bytes are 01 17 (little-endian 0x1701)
+            assert pkt[12:14] == b"\x01\x17"
+            # device validates [0]==1 and [2]&7==endpoint
+            assert pkt[0] == 1 and (pkt[2] & 7) == ep
+            assert pkt[3:11] == dev_id.to_bytes(8, "little")
+    # device TX prefix = slot + 1
+    assert device_tx_prefix(1) == 2 and device_tx_prefix(4) == 5
+    # out-of-range slot/endpoint rejected both ways
+    for bad in (0, 5, 255):
+        try:
+            build_conn_negotiation(dev_id, bad)
+            raise AssertionError("bad slot accepted")
+        except ValueError:
+            pass
+    try:
+        parse_conn_negotiation(bytes([2, 0, EP_CONN_NEG]) + b"\x00" * 11)  # type!=1
+        raise AssertionError("bad type accepted")
+    except ValueError:
+        pass
+
+
+def _check_beacon_header():
+    """Beacon header bytes 0..15 round-trip, incl. map packing, byte-14 slot, byte-15 ack."""
+    cmap = 0x1555555555 & ((1 << 37) - 1)  # arbitrary 37-bit pattern
+    hdr = build_beacon_header(cmap, unmapped=19, session_nonce=0xBEEF,
+                              timestamp_us=0x0123456789AB, downlink_slot=3, ack_bitmap=0b01010)
+    assert len(hdr) == 16
+    got = parse_beacon_header(hdr)
+    assert got["channel_map"] == cmap, hex(got["channel_map"])
+    assert got["unmapped"] == 19
+    assert got["session_nonce"] == 0xBEEF
+    assert got["timestamp_us"] == 0x0123456789AB
+    assert got["downlink_slot"] == 3            # byte 14 == 1<<3
+    assert hdr[14] == (1 << 3)
+    assert got["ack_bitmap"] == 0b01010
+    assert hdr[6:8] == b"\xef\xbe"              # session nonce little-endian
+    assert hdr[8:14] == (0x0123456789AB).to_bytes(6, "little")
+    # no-downlink beacon has byte 14 == 0 and downlink_slot None
+    hdr2 = build_beacon_header(cmap, 0, 0, 0)
+    assert hdr2[14] == 0 and parse_beacon_header(hdr2)["downlink_slot"] is None
+
+
+def _check_reg_map_and_limits():
+    """Command-register map matches LINK.md and transport limits are enforced."""
+    assert describe_reg(0x2F).startswith("R ") and "battery" in describe_reg(0x2F)
+    assert describe_reg(0x28) == "R get_led_config"
+    assert describe_reg(0x13) == "W unpair"
+    assert describe_reg(0x99) == "unknown"
+    check_read_request(0x2F, 0)
+    check_read_request(0x2B, 8)        # calibration read carries an 8-byte type selector
+    check_write_request(0x13, 0)
+    for bad in (READ_REQ_MAX + 1, 0x1000):
+        try:
+            check_read_request(0x2F, bad)
+            raise AssertionError("over-long read accepted")
+        except ValueError:
+            pass
+    try:
+        check_write_request(0x13, WRITE_LEN_MAX + 1)
+        raise AssertionError("over-long write accepted")
+    except ValueError:
+        pass
+
+
+def _check_steady_state_nonce():
+    """Steady-state nonce = 5-byte LE counter (+dir bit 39) || 8-byte IV; TX/RX differ in bit 39."""
+    iv = bytes(range(0x10, 0x18))
+    n_tx = steady_state_nonce(counter=1, direction=0, iv=iv)
+    n_rx = steady_state_nonce(counter=1, direction=1, iv=iv)
+    assert len(n_tx) == 13 and n_tx[5:] == iv
+    assert n_tx[:5] == (1).to_bytes(5, "little")
+    assert n_rx[:5] == (1 | (1 << 39)).to_bytes(5, "little")  # direction bit = bit 39
+    assert n_tx != n_rx                                        # same counter, opposite direction
+    try:
+        steady_state_nonce(0, 0, b"\x00" * 7)
+        raise AssertionError("short IV accepted")
+    except ValueError:
+        pass
+
+
 def selftest():
     _check_x25519_rfc7748()
     _check_setup_x25519_frames()
     _check_pairing_roundtrip()
     _check_crc_framing()
+    _check_conn_negotiation()
+    _check_beacon_header()
+    _check_reg_map_and_limits()
+    _check_steady_state_nonce()
     print("selftest ok (X25519 RFC 7748 6.1 vector + 0x12/0x11 build/parse + "
-          "PairingData round-trip w/ MIC + length reject + CRC/framing round-trip)")
+          "PairingData round-trip w/ MIC + length reject + CRC/framing round-trip + "
+          "conn-negotiation accept-rules + beacon header 0..15 + command-reg map/limits + "
+          "steady-state CCM nonce)")
 
 
 def main():
