@@ -67,5 +67,7 @@ typedef struct platform {
     // loop calls it before changing state the ISR reads (identity, pairing <-> beacons).
     void (*radio_halt)(struct platform* p);
     uint64_t device_id;                // FICR DEVICEID
+    uint32_t events_dropped;           // emits the PC never got (port closed / not reading)
+    uint32_t radio_late_ops;           // ops the radio could not start in time
     void* user;
 } platform_t;

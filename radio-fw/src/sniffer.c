@@ -4,6 +4,7 @@
 
 #include <string.h>
 
+#include "clock.h"
 #include "nrf.h"
 #include "nrf52_erratas.h"
 #include "pulsar_hop.h"
@@ -70,22 +71,11 @@ void sniffer_init(void) {
     NRF_RADIO->POWER = 1;
     hfxo_request();
 
-    // 1 MHz free-running 32-bit timebase; PPI channel 26 (fixed) captures it into CC[1] on ADDRESS.
-    NRF_TIMER0->TASKS_STOP = 1;
-    NRF_TIMER0->MODE = TIMER_MODE_MODE_Timer;
-    NRF_TIMER0->BITMODE = TIMER_BITMODE_BITMODE_32Bit;
-    NRF_TIMER0->PRESCALER = 4;
-    NRF_TIMER0->TASKS_CLEAR = 1;
-    NRF_TIMER0->TASKS_START = 1;
-    NRF_PPI->CHENSET = PPI_CHENSET_CH26_Msk;
-
+    // TIMER0 (the 1 us clock, CC[1] = ADDRESS capture via PPI 26) is set up by clock_init().
     NVIC_SetPriority(RADIO_IRQn, 0);
 }
 
-uint32_t sniffer_now_us(void) {
-    NRF_TIMER0->TASKS_CAPTURE[0] = 1;
-    return NRF_TIMER0->CC[0];
-}
+uint32_t sniffer_now_us(void) { return clock_now32(); }
 
 bool sniffer_apply(const sniffer_config_t* c) {
     if (c->balen < 1 || c->balen > 4) return false;  // 1 is outside the spec (promiscuous experiments)
@@ -144,7 +134,7 @@ void sniffer_stop(void) {
 
 bool sniffer_running(void) { return running; }
 
-void RADIO_IRQHandler(void) {
+void sniffer_radio_irq(void) {
     if (!NRF_RADIO->EVENTS_END) return;
     NRF_RADIO->EVENTS_END = 0;
 

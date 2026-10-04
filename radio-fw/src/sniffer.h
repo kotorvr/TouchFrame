@@ -49,7 +49,8 @@ typedef struct {
     bool locked;            // heard a beacon within the last 250 periods
 } sniffer_follow_stats_t;
 
-void sniffer_init(void);
+void sniffer_init(void);  // after clock_init()
+void sniffer_radio_irq(void);  // RADIO interrupt while the sniffer owns the radio
 bool sniffer_apply(const sniffer_config_t* cfg);  // reconfigure and (re)start RX; false if cfg is invalid
 void sniffer_stop(void);
 bool sniffer_running(void);

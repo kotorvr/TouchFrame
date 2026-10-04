@@ -598,7 +598,8 @@ void host_fill_status(const host_t* h, link_host_status_t* s) {
     s->dm_beacons = h->dm_beacons;
     s->uplinks = h->uplinks;
     s->crc_errors = h->crc_errors;
-    s->late_beacons = h->late_beacons;
+    s->late_beacons = h->late_beacons + h->plat->radio_late_ops;
+    s->events_dropped = h->plat->events_dropped;
     s->channel_mhz = h->cur_freq;
     for (int i = 0; i < PULSAR_SLOTS; i++) {
         const host_slot_t* sl = &h->slot[i];

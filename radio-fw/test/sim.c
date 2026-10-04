@@ -111,7 +111,7 @@ static void node_init(node_t* n, const char* name, bool is_host, double offset, 
     n->offset_us = offset;
     n->ppm = ppm;
     n->rng = id * 2654435761u + 1;
-    n->plat = (platform_t){p_now, p_random, p_ccm, p_emit, p_kick, p_halt, id, n};
+    n->plat = (platform_t){p_now, p_random, p_ccm, p_emit, p_kick, p_halt, id, 0, 0, n};
     if (is_host) {
         n->host = calloc(1, sizeof(host_t));
         host_init(n->host, &n->plat);
