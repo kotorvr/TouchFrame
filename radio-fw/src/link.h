@@ -1,6 +1,16 @@
-// USB serial link between the dongle and the PC (tools/radio.py, the driver's RadioSource).
+// USB link between the dongle and the PC (tools/radio.py, the driver's RadioSource).
 //
 // Framing: every frame is COBS-encoded and ends with a 0x00 byte. Decoded frame = type byte + body.
+// The same byte stream runs over either interface of the composite USB device (VID:PID 1209:0001):
+// * CDC-ACM (interfaces 0-1): a serial port. "Open" = DTR set. Windows tools use this.
+// * HID (interface 2; the Frame has no cdc_acm, so its driver uses /dev/hidraw*): vendor usage
+//   page 0xFF00, no report IDs, 64-byte IN and OUT interrupt reports, 1 ms. Each report is
+//   [n (0..63)][n stream bytes][zero pad]; frames may span reports and share them; n = 0 is a
+//   keepalive. hidraw write()s are 65 bytes: a leading 0x00 report number, then the report.
+//   "Open" = an OUT report arrived in the last LINK_HID_OPEN_MS (send a keepalive every second
+//   when idle); when that lapses the dongle drops its pending HID output. Budget: 64 B/ms, ~63 KB/s
+//   of stream. Two controllers at 500 Hz fit only with LINK_HOST_COMPACT (EVT_SAMPLE, ~41 KB/s);
+//   EVT_INPUT + EVT_IMU need ~76 KB/s.
 // All multi-byte fields are little-endian; all structs are packed. Keep tools/radio.py in step with
 // this file: both sides assert the struct sizes (the _Static_asserts at the bottom, and
 // radio.py's FORMATS table).
@@ -24,10 +34,13 @@
 //   CMD_TIME_PING (see link_time_pong_t). Sniffer packets (link_packet_t) carry its low 32 bits.
 // * Controllers live in slots 0..4 (LINK_MAX_SLOTS). On air, slot s transmits with access-address
 //   prefix s+1 (docs/PROTOCOL.md Q1).
-// * Identity: the dongle stores nothing in flash. The driver owns the host identity (netaddr, link
-//   key, session nonce) and the list of paired controllers, persists them, and passes them in
-//   CMD_HOST_START / CMD_CONNECT after every dongle reset.
-// * Events go out only while the port is open (DTR set). Host mode keeps running with the port
+// * Identity, two ways:
+//   - Stored (LINK_HOST_STORED, normal): the dongle keeps its host identity (netaddr + link key,
+//     generated once at random) and its pairings in flash, so controllers reconnect after power
+//     cycles without the driver knowing any secrets. CMD_PAIR_LIST / CMD_PAIR_FORGET manage them.
+//   - Driver-owned: CMD_HOST_START carries netaddr + key and the driver CMD_CONNECTs each paired
+//     controller after every dongle reset. Nothing is written to flash.
+// * Events go out only while a port is open (see Framing). Host mode keeps running with the port
 //   closed (controllers stay connected across a driver restart); events are dropped and counted.
 // ------------------------------------------------------------------------------------------------
 #pragma once
@@ -40,6 +53,10 @@
 #define LINK_PCM_MAX 48      // largest PCM block in one CMD_HAPTIC
 #define LINK_UPLINK_MAX 130  // device-connected MAXLEN (PROTOCOL Q1)
 #define LINK_MAX_FRAME 300   // largest decoded frame either way (type byte + body)
+#define LINK_MAX_PAIRINGS 8  // pairings kept in flash
+#define LINK_HID_OPEN_MS 2000
+#define LINK_LED_MIN_PERIOD_US 700  // docs/re/PERIPHERALS.md (RE-2): never strobe faster
+#define LINK_LED_MAX_ON_US 75       // the controller clamps the on-time to this
 
 // host -> dongle
 enum {
@@ -66,6 +83,8 @@ enum {
     CMD_TIME_PING = 0x1B,    // link_time_ping_t          -> EVT_TIME (no EVT_RESULT: keep it lean)
     CMD_FAKE_START = 0x1C,   // link_fake_start_t         -> EVT_RESULT (loopback rig, second dongle)
     CMD_SELFTEST = 0x1D,     // link_tag_t                -> EVT_TEXT lines, EVT_RESULT (detail = failed-test bits)
+    CMD_PAIR_LIST = 0x1E,    // link_tag_t                -> EVT_PAIRINGS, EVT_RESULT (any mode)
+    CMD_PAIR_FORGET = 0x1F,  // link_pair_forget_t        -> EVT_RESULT (detail = pairings removed; any mode)
 };
 
 // dongle -> host
@@ -85,6 +104,9 @@ enum {
     EVT_IMU = 0x8D,          // link_imu_t
     EVT_TIME = 0x8E,         // link_time_pong_t
     EVT_UPLINK = 0x8F,       // link_uplink_t then `len` bytes (debug, LINK_HOST_RAW_UPLINKS)
+    EVT_SAMPLE = 0x90,       // link_sample_t: input + IMU in one event (LINK_HOST_COMPACT)
+    EVT_SOF = 0x91,          // link_sof_t, once a second: USB frame timing (informational)
+    EVT_PAIRINGS = 0x92,     // link_pairings_t then `count` link_pairing_t
 };
 
 enum link_mode { LINK_MODE_IDLE = 0, LINK_MODE_SNIFFER = 1, LINK_MODE_HOST = 2, LINK_MODE_FAKE_CTRL = 3 };
@@ -111,6 +133,8 @@ enum {
     LINK_CAP_HOST = 1u << 1,
     LINK_CAP_FAKE_CTRL = 1u << 2,
     LINK_CAP_PLACEHOLDER = 1u << 3,       // LINK_HOST_PLACEHOLDER formats available (loopback only)
+    LINK_CAP_STORE = 1u << 4,             // flash identity + pairings (LINK_HOST_STORED, CMD_PAIR_LIST/FORGET)
+    LINK_CAP_HID = 1u << 5,               // the HID interface is present
     // Set when the matching on-air format is pinned by RE and implemented for real controllers.
     LINK_CAP_REAL_PAIRING = 1u << 8,      // discovery + 0x12/0x11 exchange (PROTOCOL Q2)
     LINK_CAP_REAL_CONN_NEG = 1u << 9,     // connected-link negotiation / slot lock (RE-1)
@@ -130,6 +154,10 @@ enum {
     LINK_HOST_RAW_UPLINKS = 1u << 2,  // also report every uplink as EVT_UPLINK (debug, chatty)
     LINK_HOST_PLACEHOLDER = 1u << 3,  // use TouchFrame placeholder formats where RE is pending.
                                       // ONLY for loopback against our fake controller (CMD_FAKE_START).
+    LINK_HOST_COMPACT = 1u << 4,      // one EVT_SAMPLE per sample instead of EVT_INPUT + EVT_IMU (use on HID)
+    LINK_HOST_STORED = 1u << 5,       // use the flash identity (netaddr/link_key in the command are
+                                      // ignored), allow every stored pairing into its slot, and store
+                                      // new pairings. EVT_RESULT detail = pairings loaded.
 };
 
 //------------------------------------------------------------------ v2 sniffer structs (unchanged)
@@ -288,10 +316,43 @@ typedef struct __attribute__((packed)) {
     uint8_t state;      // link_pair_state
     uint8_t status;     // link_status_code (LINK_OK unless FAILED/STOPPED)
     uint8_t step;       // pairing-link packets exchanged so far (diagnostic)
-    uint8_t reserved;
+    uint8_t hand;       // link_hand (LINK_HAND_UNKNOWN until RE pins where it comes from)
     uint64_t device_id; // the controller being paired (0 while scanning)
     uint32_t netaddr;   // what it was given (DONE)
 } link_pair_event_t;
+
+enum link_hand { LINK_HAND_UNKNOWN = 0, LINK_HAND_LEFT = 1, LINK_HAND_RIGHT = 2 };
+
+// Pairing UX for a front end: CMD_PAIR_START {AUTO, timeout_s} -> EVT_PAIR(SCANNING) -> EVT_ADVERT
+// per controller heard ("found <id>") -> EVT_PAIR(LINKING, id) -> ... -> EVT_PAIR(DONE / FAILED /
+// STOPPED, status). With LINK_HOST_STORED a DONE pairing is already saved and allowed into a slot.
+
+// CMD_PAIR_FORGET: remove one stored pairing (device_id), or all (LINK_FORGET_ALL). A forgotten
+// controller that is connected or allowed in a slot is disconnected (EVT_CONN). LINK_FORGET_IDENTITY
+// (implies ALL) also replaces the stored netaddr + key, so no controller paired before can connect
+// until it is paired again; it takes effect at the next CMD_HOST_START with LINK_HOST_STORED.
+enum { LINK_FORGET_ALL = 1u << 0, LINK_FORGET_IDENTITY = 1u << 1 };
+
+typedef struct __attribute__((packed)) {
+    uint8_t tag;
+    uint8_t flags;        // LINK_FORGET_*
+    uint16_t reserved;
+    uint64_t device_id;
+} link_pair_forget_t;
+
+typedef struct __attribute__((packed)) {
+    uint32_t netaddr;     // the stored identity's netaddr (0 = none generated yet)
+    uint8_t count;        // link_pairing_t records that follow (<= LINK_MAX_PAIRINGS)
+    uint8_t flags;        // bit0: flash store present and readable
+    uint16_t writes_left; // records that fit before the store must compact (diagnostic)
+} link_pairings_t;
+
+typedef struct __attribute__((packed)) {
+    uint64_t device_id;
+    uint8_t slot;         // preferred slot (0..4)
+    uint8_t hand;         // link_hand
+    uint16_t reserved;
+} link_pairing_t;
 
 //------------------------------------------------------------------ connections
 
@@ -368,19 +429,21 @@ typedef struct __attribute__((packed)) {
 
 //------------------------------------------------------------------ typed streams
 
-// EVT_INPUT: one input sample. Values are the controller's RAW host-register contents (PROTOCOL
-// Q4); the dongle does not label or scale them, so the mapping can change in the driver without a
-// reflash. Labels (which bit is A, which analog is the trigger) come from RE-2 / pulsar_input.py.
+// EVT_INPUT: one input sample, raw values from the controller's notifications
+// (docs/re/PERIPHERALS.md; ntf = notification id). Not scaled, calibrated or deadzoned.
 typedef struct __attribute__((packed)) {
-    uint64_t t_us;        // sample time, dongle clock (uplink arrival until RE pins a sample stamp)
+    uint64_t t_us;        // sample time, dongle clock (see flags bit1)
     uint8_t slot;
-    uint8_t flags;        // bit0: placeholder format (loopback), bit1: sample time is the arrival time
+    uint8_t flags;        // bit0: placeholder format (loopback), bit1: t_us is the uplink arrival
+                          // time (no controller stamp), bit2: IMU scale is a guess (EVT_SAMPLE)
     uint16_t seq;         // per-slot counter, increments by 1 per event (gaps = lost samples)
-    uint16_t buttons;     // hreg 9, 12 bits
-    uint16_t analog[4];   // 12-bit ADCs: [0],[1] = hreg 3 (A, B); [2],[3] = hreg 0x17 (C, D)
-    uint8_t touch;        // bits0..3 = hreg 4, bit4 = hreg 0x2b
-    uint8_t reserved;
-    uint16_t battery;     // hreg 0x15, raw (mV INFERRED)
+    uint8_t buttons;      // ntf 4: b0 A/X, b1 B/Y, b2 stick click, b3 system/menu
+    uint8_t battery_pct;  // ntf 0, 0xFF = unknown
+    uint16_t touch;       // ntf 9, 12 bits (bit map: PERIPHERALS)
+    int16_t stick[2];     // ntf 2: x, y
+    uint16_t trigger;     // ntf 3 bits 0..11
+    uint16_t grip;        // ntf 3 bits 12..23
+    uint16_t pressure;    // ntf 0x15, 12 bits (trigger pressure)
 } link_input_t;
 
 // EVT_IMU: one IMU sample, raw counts. Scale: accel_g = accel / 2^(bits-1) * accel_fs_g, likewise
@@ -400,13 +463,34 @@ typedef struct __attribute__((packed)) {
     uint16_t reserved;
 } link_imu_t;
 
+// EVT_SAMPLE (LINK_HOST_COMPACT): link_input_t followed by the IMU sample of the same moment, raw
+// int16 counts (scale: register 0x32 imu_config, or link_imu_t's full-scale fields). seq counts
+// samples, as in EVT_INPUT.
+typedef struct __attribute__((packed)) {
+    link_input_t in;
+    int16_t accel[3];
+    int16_t gyro[3];
+} link_sample_t;
+
+// EVT_SOF: the dongle clock at a USB start-of-frame. Lets a host that can read USB frame numbers
+// tie the dongle clock to the bus clock; hidraw cannot, so CMD_TIME_PING stays the main method.
+typedef struct __attribute__((packed)) {
+    uint16_t usb_frame;   // 11-bit frame number
+    uint16_t reserved;
+    uint32_t sof_count;   // SOFs seen since boot
+    uint64_t t_us;
+} link_sof_t;
+
 //------------------------------------------------------------------ peripherals
 
 enum link_led_mode { LINK_LED_OFF = 0, LINK_LED_ON = 1, LINK_LED_STROBE = 2 };
 
-// CMD_LED: IR constellation LEDs. STROBE: on for on_us every period_us, the first edge at dongle
-// time phase_us (mod period_us); the controller runs it off the shared Pulsar clock. ON may be
-// refused if the controller caps the duty cycle (MASTER-PLAN G-LED): EVT_RESULT says.
+// CMD_LED: IR constellation LEDs (docs/re/PERIPHERALS.md). STROBE: a pulse of on_us every
+// period_us, CENTRED at dongle times phase_us + k * period_us; the controller runs it off the
+// shared Pulsar clock. period_us >= LINK_LED_MIN_PERIOD_US and on_us > 0, else LINK_ERR_ARGS;
+// on_us is clamped to LINK_LED_MAX_ON_US. Real controllers cannot hold the LEDs on: ON is for the
+// fake controller only. Cheap to repeat (a phase-search loop may send it at ~5 Hz): a newer CMD_LED
+// replaces one still queued for that slot.
 typedef struct __attribute__((packed)) {
     uint8_t tag;
     uint8_t slot;
@@ -420,8 +504,10 @@ typedef struct __attribute__((packed)) {
 
 enum link_haptic_mode { LINK_HAPTIC_STOP = 0, LINK_HAPTIC_SIMPLE = 1, LINK_HAPTIC_PCM = 2 };
 
-// CMD_HAPTIC: SIMPLE = a buzz of amplitude/freq_hz for duration_ms. PCM = `pcm_len` unsigned 8-bit
-// samples at freq_hz follow the struct (<= LINK_PCM_MAX), queued after any PCM already playing.
+// CMD_HAPTIC: SIMPLE = a buzz of amplitude at freq_hz (40..561) for duration_ms (controller cmd
+// 0xa0; it stops by itself after 2 s, so re-send for longer; for shorter buzzes the dongle sends the
+// stop at duration_ms). STOP = 0x97 amplitude 0. PCM = `pcm_len` unsigned 8-bit samples at freq_hz
+// follow the struct (<= LINK_PCM_MAX), queued after any PCM already playing (real: 0x9d, RE pending).
 typedef struct __attribute__((packed)) {
     uint8_t tag;
     uint8_t slot;
@@ -526,3 +612,8 @@ _Static_assert(sizeof(link_time_ping_t) == 16, "link_time_ping_t");
 _Static_assert(sizeof(link_time_pong_t) == 32, "link_time_pong_t");
 _Static_assert(sizeof(link_fake_start_t) == 32, "link_fake_start_t");
 _Static_assert(sizeof(link_uplink_t) == 13, "link_uplink_t");
+_Static_assert(sizeof(link_sample_t) == 38, "link_sample_t");
+_Static_assert(sizeof(link_sof_t) == 16, "link_sof_t");
+_Static_assert(sizeof(link_pair_forget_t) == 12, "link_pair_forget_t");
+_Static_assert(sizeof(link_pairings_t) == 8, "link_pairings_t");
+_Static_assert(sizeof(link_pairing_t) == 12, "link_pairing_t");

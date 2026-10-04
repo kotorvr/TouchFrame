@@ -9,9 +9,14 @@ controller exists:
   * pairing: a simulated controller advertises, then the real 0x12/0x11 exchange runs in memory
     (tools/pulsar_host.py builds the host side, the simulated controller decrypts it);
   * CONNECT -> WAITING -> NEGOTIATING -> CONNECTED, then EVT_INPUT and EVT_IMU streams at the
-    configured rates; DISCONNECT; link loss on request (drop_slot);
+    configured rates (EVT_SAMPLE with LINK_HOST_COMPACT); DISCONNECT; link loss on request (drop_slot);
+  * LINK_HOST_STORED: a "flash" identity + pairings that survive CMD_STOP and reboot(), pairings
+    saved and let in automatically, PAIR_LIST / PAIR_FORGET;
   * REG_READ / WRITE / SUBSCRIBE against a per-controller register table; LED and HAPTIC are
-    recorded (last_led / last_haptic) for tests to inspect.
+    recorded (last_led / last_haptic) for tests to inspect; EVT_SOF once a second;
+  * hid=True: the HID interface instead of the serial port. write() takes hidraw writes (65 bytes:
+    0x00 + a 64-byte report), read() returns one 64-byte IN report at a time, and the interface
+    is "open" only while an OUT report arrived in the last 2 s (else output is discarded).
 
 `pending_re=True` mimics today's firmware: without LINK_HOST_PLACEHOLDER, everything RE has not
 pinned answers LINK_ERR_PENDING_RE and controllers never get past WAITING.
@@ -42,7 +47,10 @@ class SimController:
         self.rng = random.Random(seed or device_id)
         self.paired = None   # (netaddr, key) once provisioned
         self.regs = {9: b"\x00\x00", 3: b"\x00\x00\x00", 0x17: bytes(8), 4: b"\x00", 0x2b: b"\x00",
-                     0x15: struct.pack("<H", 3900), 0x0B: bytes(12), 0x16: bytes(2), 0x02: bytes(4)}
+                     0x15: struct.pack("<H", 3900), 0x0B: bytes(12), 0x16: bytes(2), 0x02: bytes(4),
+                     # imu_config (docs/re/PERIPHERALS.md): accel +-32 g, gyro +-4000 dps, 500 Hz each,
+                     # g and dps per count
+                     0x32: struct.pack("<HHHHff", 32000, 4000, 500, 500, 1 / 1024, 1 / 8.192)}
 
     def advert(self):
         return bytes([ADVERT_TYPE]) + struct.pack("<HH", PULSAR_VERSION, 0x0301) + \
@@ -53,9 +61,13 @@ class FakeDongle:
     """Transport-compatible fake: write() feeds it commands, read() returns event bytes."""
 
     def __init__(self, controllers=None, pending_re=False, clock_offset_us=None, drift_ppm=None,
-                 input_hz=500, imu_hz=500, dongle_id=0xD0D0CAFE12345678, seed=1):
+                 input_hz=500, imu_hz=500, dongle_id=0xD0D0CAFE12345678, seed=1, hid=False):
         self.rng = random.Random(seed)
         self.dtr = True
+        self.hid = hid
+        self.hid_last_out = None  # time of the last OUT report (hid)
+        self.flash = dict(netaddr=0, key=bytes(16), pairs=[])  # survives CMD_STOP and reboot()
+        self.sof_count, self.next_sof = 0, 0
         self.timeout = 0.05
         self.out = bytearray()
         self.inbuf = bytearray()
@@ -85,8 +97,27 @@ class FakeDongle:
     def at(self, delay_us, fn):
         self.timers.append((self.now_us() + delay_us, fn))
 
+    def reboot(self):
+        """Power cycle: everything but the flash store is lost."""
+        flash = self.flash
+        self.__init__(self.controllers, self.pending_re, self.offset_us, self.drift * 1e6, self.input_hz,
+                      self.imu_hz, self.dongle_id, hid=self.hid)
+        self.flash = flash
+
     # ---- transport
+    def hid_open(self):
+        return self.hid_last_out is not None and time.monotonic() - self.hid_last_out < R.HID_OPEN_MS / 1000
+
     def write(self, data):
+        if self.hid:  # one hidraw write = report number 0 + one 64-byte report
+            if len(data) != R.HID_REPORT + 1 or data[0] != 0:
+                raise OSError("hidraw write must be 65 bytes starting with report number 0")
+            self.hid_last_out = time.monotonic()
+            self._feed(R.hid_payload(data[1:]))
+            return len(data)
+        return self._feed(data)
+
+    def _feed(self, data):
         for b in data:
             if b:
                 self.inbuf.append(b)
@@ -105,6 +136,11 @@ class FakeDongle:
         if not self.out:
             time.sleep(0.002)
             self.tick()
+        if self.hid:  # one IN report, or nothing
+            if not self.out:
+                return b""
+            chunk, self.out = bytes(self.out[:R.HID_REPORT - 1]), self.out[R.HID_REPORT - 1:]
+            return R.hid_reports(chunk)[0]
         chunk, self.out = bytes(self.out[:n]), self.out[n:]
         return chunk
 
@@ -112,8 +148,9 @@ class FakeDongle:
         pass
 
     def emit(self, evt, body):
-        if not self.dtr:
+        if not (self.hid_open() if self.hid else self.dtr):
             self.events_dropped += 1
+            self.out.clear()  # pending output is discarded while closed
             return
         self.out += R.cobs_encode(bytes([evt]) + body)
 
@@ -123,6 +160,11 @@ class FakeDongle:
     # ---- simulation
     def tick(self):
         now = self.now_us()
+        if now >= self.next_sof:  # one EVT_SOF a second (1 ms frames)
+            self.sof_count += 1000
+            self.emit(R.EVT_SOF, R.pack("link_sof_t", usb_frame=(now // 1000) & 0x7FF, sof_count=self.sof_count,
+                                        t_us=now))
+            self.next_sof = now + 1000000
         due = sorted([t for t in self.timers if t[0] <= now], key=lambda t: t[0])
         self.timers = [t for t in self.timers if t[0] > now]
         for _, fn in due:
@@ -135,7 +177,8 @@ class FakeDongle:
 
     def stream(self, s, slot, now):
         """Emit the input/IMU samples due since the last tick (capped so a stall can't flood)."""
-        for kind, hz in (("input", self.input_hz), ("imu", self.imu_hz)):
+        compact = self.host["flags"] & R.HOST_COMPACT
+        for kind, hz in (("input", self.input_hz), ("imu", 0 if compact else self.imu_hz)):
             if not hz:
                 continue
             period = 10 ** 6 // hz
@@ -145,16 +188,20 @@ class FakeDongle:
             while nxt <= now:
                 slot["seq_" + kind] = (slot["seq_" + kind] + 1) & 0xFFFF
                 ph = nxt / 1e6
-                if kind == "input":
-                    a = int(2048 + 2000 * math.sin(ph))
-                    self.emit(R.EVT_INPUT, R.pack("link_input_t", t_us=nxt, slot=s, flags=slot["fmt_flags"],
-                                                  seq=slot["seq_input"], buttons=(int(ph) & 1) << 0,
-                                                  analog=[a, 4095 - a, 2048, 2048], touch=0x01, battery=3900))
+                a = int(2048 + 2000 * math.sin(ph))
+                g = int(4096 * math.sin(ph * 2))
+                inp = dict(t_us=nxt, slot=s, flags=slot["fmt_flags"], seq=slot["seq_" + kind],
+                           buttons=(int(ph) & 1) << 0, battery_pct=87, touch=0x001, stick=[a - 2048, 0],
+                           trigger=a, grip=4095 - a, pressure=0)
+                if kind == "input" and compact:
+                    inp["flags"] |= 4
+                    self.emit(R.EVT_SAMPLE, R.pack("link_sample_t", **inp, accel=[0, 0, 1024], gyro=[g, 0, 0]))
+                elif kind == "input":
+                    self.emit(R.EVT_INPUT, R.pack("link_input_t", **inp))
                 else:
-                    g = int(4096 * math.sin(ph * 2))
                     self.emit(R.EVT_IMU, R.pack("link_imu_t", t_us=nxt, slot=s, flags=slot["fmt_flags"] | 4,
-                                                seq=slot["seq_imu"], accel=[0, 0, 2048], gyro=[g, 0, 0],
-                                                temp_raw=2500, bits=16, accel_fs_g=16, gyro_fs_dps=2000))
+                                                seq=slot["seq_imu"], accel=[0, 0, 1024], gyro=[g, 0, 0],
+                                                temp_raw=2500, bits=16, accel_fs_g=32, gyro_fs_dps=4000))
                 nxt += period
             slot["next_" + kind] = nxt
         for (ss, reg), period_ms in list(self.subs.items()):
@@ -249,10 +296,38 @@ class FakeDongle:
             except ImportError:  # no `cryptography`: skip the crypto, keep the event flow
                 c.paired = (self.host["netaddr"], self.host["key"])
             self.pair_event(4, step=2, device_id=c.device_id)
-            self.at(20000, lambda: (self.pair_event(5, step=3, device_id=c.device_id), self._pair_end()))
+            self.at(20000, lambda: (self.pair_event(5, step=3, device_id=c.device_id), self._pair_end(),
+                                    self._stored_pair(c.device_id)))
 
     def _pair_end(self):
         self.pair = None if self.pair is None else dict(self.pair, state=0)
+
+    # ---- flash store (LINK_HOST_STORED)
+    def _stored(self):
+        return self.mode == 2 and self.host["flags"] & R.HOST_STORED
+
+    def _allow(self, device_id, want):
+        """CMD_CONNECT's effect; returns the slot or None."""
+        for s, sl in enumerate(self.slots):
+            if sl and sl["device_id"] == device_id:
+                return s
+        if want is None or want >= R.MAX_SLOTS or self.slots[want]:
+            want = next((i for i, sl in enumerate(self.slots) if not sl), None)
+        if want is None:
+            return None
+        self.slots[want] = dict(state=1, device_id=device_id, seq_input=0, seq_imu=0, fmt_flags=0)
+        self.conn_event(want, 1)
+        self.at(50000, lambda: self._negotiate(want))
+        return want
+
+    def _stored_pair(self, device_id):
+        if not self._stored():
+            return
+        pairs = self.flash["pairs"]
+        old = next((p for p in pairs if p["device_id"] == device_id), None)
+        s = self._allow(device_id, old["slot"] if old else None)
+        pairs[:] = [p for p in pairs if p["device_id"] != device_id][-(R.MAX_PAIRINGS - 1):]
+        pairs.append(dict(device_id=device_id, slot=s if s is not None else 0, hand=0))
 
     # ---- commands
     def handle(self, cmd, body, rx_us):
@@ -288,11 +363,45 @@ class FakeDongle:
                 if self.slots[s] and self.slots[s]["state"] in (2, 3, 4):
                     self.conn_event(s, 1, reason=4)
             self.mode = 2
-            self.host = dict(netaddr=h["netaddr"], key=h["link_key"], flags=h["flags"], t_start=self.now_us())
-            self.result(tag, cmd)
+            netaddr, key = h["netaddr"], h["link_key"]
+            if h["flags"] & R.HOST_STORED:
+                if not self.flash["netaddr"]:
+                    self.flash.update(netaddr=self.rng.randrange(1, 0xFFFFFFFF), key=os.urandom(16), pairs=[])
+                netaddr, key = self.flash["netaddr"], self.flash["key"]
+            self.host = dict(netaddr=netaddr, key=key, flags=h["flags"], t_start=self.now_us())
+            loaded = 0
+            if h["flags"] & R.HOST_STORED:
+                for p in reversed(self.flash["pairs"]):
+                    if self._allow(p["device_id"], p["slot"]) is None:
+                        break
+                    loaded += 1
+            self.result(tag, cmd, 0, loaded)
             for s, slot in enumerate(self.slots):
                 if slot:
                     self.at(100000, lambda s=s: self._negotiate(s))
+        elif cmd == R.CMD_PAIR_LIST:
+            f = self.flash
+            self.emit(R.EVT_PAIRINGS, R.pack("link_pairings_t", netaddr=f["netaddr"], count=len(f["pairs"]), flags=1,
+                                             writes_left=100) +
+                      b"".join(R.pack("link_pairing_t", **p) for p in f["pairs"]))
+            self.result(tag, cmd, 0, len(f["pairs"]))
+        elif cmd == R.CMD_PAIR_FORGET:
+            if len(body) != R.sizeof("link_pair_forget_t"):
+                return bad()
+            c = R.unpack("link_pair_forget_t", body)
+            every = bool(c["flags"] & (R.FORGET_ALL | R.FORGET_IDENTITY))
+            if not every and not c["device_id"]:
+                return bad()
+            gone = [p for p in self.flash["pairs"] if every or p["device_id"] == c["device_id"]]
+            if self._stored():
+                for s, sl in enumerate(self.slots):
+                    if sl and any(p["device_id"] == sl["device_id"] for p in gone):
+                        self.conn_event(s, 0, reason=1)
+                        self.slots[s] = None
+            self.flash["pairs"] = [p for p in self.flash["pairs"] if p not in gone]
+            if c["flags"] & R.FORGET_IDENTITY:
+                self.flash.update(netaddr=0, key=bytes(16))
+            self.result(tag, cmd, 0, len(gone))
         elif cmd == R.CMD_HOST_STATUS:
             if self.mode != 2:
                 return self.result(tag, cmd, 2)
@@ -404,8 +513,11 @@ class FakeDongle:
                 self.subs[key] = f["period_ms"]
             self.result(tag, cmd)
         elif cmd == R.CMD_LED:
-            if f["mode"] > 2 or (f["mode"] == 2 and (not f["period_us"] or f["on_us"] > f["period_us"])):
+            real = not self.host["flags"] & R.HOST_PLACEHOLDER
+            if f["mode"] > 2 or (f["mode"] == 2 and (f["period_us"] < R.LED_MIN_PERIOD_US or not f["on_us"])) or \
+                    (f["mode"] == R.LED_ON and real):  # real controllers cannot hold the LEDs on
                 return self.result(tag, cmd, 1)
+            f["on_us"] = min(f["on_us"], R.LED_MAX_ON_US)
             self.last_led[f["slot"]] = f
             self.result(tag, cmd)
         elif cmd == R.CMD_HAPTIC:
@@ -467,10 +579,12 @@ def main():
     ap.add_argument("--pending-re", action="store_true", help="behave like today's firmware (RE-pending stubs)")
     ap.add_argument("--input-hz", type=int, default=500)
     ap.add_argument("--imu-hz", type=int, default=500)
+    ap.add_argument("--hid", action="store_true",
+                    help="model the HID interface: 65-byte writes, 64-byte reads (with --tcp: raw reports)")
     ap.add_argument("--paired", action="store_true",
                     help="simulated controllers start paired (to whatever identity HOST_START gives)")
     args = ap.parse_args()
-    fake = FakeDongle(pending_re=args.pending_re, input_hz=args.input_hz, imu_hz=args.imu_hz)
+    fake = FakeDongle(pending_re=args.pending_re, input_hz=args.input_hz, imu_hz=args.imu_hz, hid=args.hid)
     if args.paired:
         orig = fake.handle
 
