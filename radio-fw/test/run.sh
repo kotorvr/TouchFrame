@@ -14,5 +14,8 @@ fi
 mkdir -p build/test
 "$CC" -std=c11 -Wall -Wextra -O1 -static test/hop_test.c src/pulsar_hop.c -o build/test/hop_test.exe
 python test/test.py "$PWD/build/test/hop_test.exe"
+"$CC" -std=c11 -Wall -Wextra -Wconversion -O2 -static test/crypto_test.c src/crypto.c -o build/test/crypto_test.exe
+build/test/crypto_test.exe
+python test/test_crypto.py "$PWD/build/test/crypto_test.exe"
 python test/test_link.py
 echo "radio-fw host tests passed"
