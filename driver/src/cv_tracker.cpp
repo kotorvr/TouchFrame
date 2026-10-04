@@ -92,7 +92,8 @@ bool ParseControllerConfig(const std::string& text, ControllerConfig* out, std::
 // Interfaces and pose conversion
 
 IVRBlockQueue* BlockQueue() {
-    static IVRBlockQueue* bq = [] {
+    static IVRBlockQueue* bq = []() -> IVRBlockQueue* {
+        if (!vr::VRDriverContext()) return nullptr;  // not inside vrserver (host tests)
         vr::EVRInitError e = vr::VRInitError_None;
         auto* p = static_cast<IVRBlockQueue*>(vr::VRDriverContext()->GetGenericInterface(IVRBlockQueue_Version, &e));
         Log("cv: GetGenericInterface(%s) = %p (err %d)", IVRBlockQueue_Version, (void*)p, int(e));
@@ -102,7 +103,8 @@ IVRBlockQueue* BlockQueue() {
 }
 
 IVRPaths* Paths() {
-    static IVRPaths* paths = [] {
+    static IVRPaths* paths = []() -> IVRPaths* {
+        if (!vr::VRDriverContext()) return nullptr;
         vr::EVRInitError e = vr::VRInitError_None;
         auto* p = static_cast<IVRPaths*>(vr::VRDriverContext()->GetGenericInterface(IVRPaths_Version, &e));
         Log("cv: GetGenericInterface(%s) = %p (err %d)", IVRPaths_Version, (void*)p, int(e));
@@ -139,7 +141,9 @@ CvPose ConvertPoseBlock(const ControllerPoseBlock& b) {
 // CvTracker
 
 CvTracker::CvTracker(Options opt, PoseCallback cb) : opt_(std::move(opt)), cb_(std::move(cb)) {
-    if (!opt_.hardware_id) opt_.hardware_id = 0x5446000000000000ull | opt_.device_id;  // "TF"
+    derived_hwid_ = !opt_.hardware_id;
+    if (derived_hwid_) opt_.hardware_id = 0x5446000000000000ull | opt_.device_id;  // "TF"
+    device_id_ = opt_.device_id;
 }
 
 CvTracker::~CvTracker() { Stop(); }
@@ -166,17 +170,23 @@ void CvTracker::Stop() {
     if (setup_thread_.joinable()) setup_thread_.join();
     if (connected_.exchange(false)) {
         SendEvent(ControllerEvent_Disconnect);
-        Log("%s: sent disconnect for device %u", opt_.tag, opt_.device_id);
+        Log("%s: sent disconnect for device %u", opt_.tag, device_id_.load());
     }
     if (pose_thread_.joinable()) pose_thread_.join();
-    // Experiment: queues we created are ours to destroy (driver_cv destroys its own at shutdown).
-    if (created_event_ && event_q_) Log("%s: destroyed %s (err %d)", opt_.tag, kControllerEventQueue, int(bq_->Destroy(event_q_)));
-    if (created_data_ && data_q_) Log("%s: destroyed %s (err %d)", opt_.tag, kControllerDataQueue, int(bq_->Destroy(data_q_)));
+    // Queues we created are ours to destroy (driver_cv destroys its own at shutdown), unless the
+    // Touch-only setup keeps them for the rest of the SteamVR session.
+    if (opt_.destroy_created_queues) {
+        if (created_event_ && event_q_)
+            Log("%s: destroyed %s (err %d)", opt_.tag, kControllerEventQueue, int(bq_->Destroy(event_q_)));
+        if (created_data_ && data_q_)
+            Log("%s: destroyed %s (err %d)", opt_.tag, kControllerDataQueue, int(bq_->Destroy(data_q_)));
+    }
     created_event_ = created_data_ = false;
     event_q_ = data_q_ = 0;
+    std::lock_guard<std::mutex> lk(pose_mu_);
     if (pose_q_) {
         auto e = bq_->Destroy(pose_q_);
-        Log("%s: destroyed %s (err %d)", opt_.tag, PoseQueueName(opt_.device_id).c_str(), int(e));
+        Log("%s: destroyed %s (err %d)", opt_.tag, PoseQueueName(device_id_).c_str(), int(e));
         pose_q_ = 0;
     }
     pose_q_ready_ = false;
@@ -195,24 +205,19 @@ CvTracker::Stats CvTracker::stats() const {
 void CvTracker::SetupLoop() {
     const char* tag = opt_.tag;
     // 1. Our pose queue first, read before anything is announced.
-    std::string pose_name = PoseQueueName(opt_.device_id);
-    EBlockQueueError e = bq_->Create(&pose_q_, pose_name.c_str(), sizeof(ControllerPoseBlock),
-                                     kControllerQueueHeaderSize, kControllerQueueBlockCount,
-                                     BlockQueueFlag_OwnerIsReader);
-    if (e == BlockQueueError_QueueAlreadyExists) {
-        e = bq_->Connect(&pose_q_, pose_name.c_str());
-        Log("%s: %s already existed; connected instead (err %d)", tag, pose_name.c_str(), int(e));
+    {
+        std::lock_guard<std::mutex> lk(pose_mu_);
+        if (!CreatePoseQueue(device_id_, &pose_q_)) {
+            Log("%s: no pose queue; giving up", tag);
+            return;
+        }
     }
-    if (e != BlockQueueError_None) {
-        Log("%s: Create %s failed: %d; giving up", tag, pose_name.c_str(), int(e));
-        pose_q_ = 0;
-        return;
-    }
-    Log("%s: created %s (handle 0x%llx)", tag, pose_name.c_str(), (unsigned long long)pose_q_);
     pose_q_ready_ = true;
     pose_thread_ = std::thread(&CvTracker::PoseLoop, this);
 
     double last_wait_log = -1e9;
+    const double setup_start = NowSeconds();
+    bool caveat_logged = false;
     bool event_had_reader = false;
     double connect_time = 0;
     bool resent_for_silence = false;
@@ -225,25 +230,35 @@ void CvTracker::SetupLoop() {
             BlockQueueHandle_t h = 0;
             if (!event_q_ && (ee = bq_->Connect(&h, kControllerEventQueue)) == BlockQueueError_None) event_q_ = h;
             if (!data_q_ && (de = bq_->Connect(&h, kControllerDataQueue)) == BlockQueueError_None) data_q_ = h;
-            if (opt_.create_shared_queues) {
-                // Experiment: driver_cv's own Create parameters (FRAME-TRACKER §8.2).
+            if (opt_.create_shared_queues && now - setup_start >= opt_.create_after_s &&
+                (ee == BlockQueueError_QueueNotFound || de == BlockQueueError_QueueNotFound)) {
+                if (!caveat_logged) {
+                    caveat_logged = true;
+                    Log("%s: Touch-only: no Steam Frame controller created the shared queues in %.0f s; creating "
+                        "them ourselves. CAVEAT: the first Steam Frame controller turned on later in this SteamVR "
+                        "session gets no pose (buttons and haptics still work) until SteamVR restarts "
+                        "(docs/re/DEV-1.md). Turn one on before SteamVR starts to avoid this.",
+                        tag, now - setup_start);
+                }
+                // driver_cv's own Create parameters (FRAME-TRACKER §8.2).
                 if (!event_q_ && ee == BlockQueueError_QueueNotFound) {
                     ee = bq_->Create(&h, kControllerEventQueue, sizeof(ControllerEventBlock),
                                      kControllerQueueHeaderSize, kControllerQueueBlockCount, 0);
-                    Log("%s: experiment: Create %s -> err %d", tag, kControllerEventQueue, int(ee));
+                    Log("%s: Create %s -> err %d", tag, kControllerEventQueue, int(ee));
                     if (ee == BlockQueueError_None) event_q_ = h, created_event_ = true;
                 }
                 if (!data_q_ && de == BlockQueueError_QueueNotFound) {
                     de = bq_->Create(&h, kControllerDataQueue, sizeof(ControllerImuBlock),
                                      kControllerQueueHeaderSize, kControllerQueueBlockCount, 0);
-                    Log("%s: experiment: Create %s -> err %d", tag, kControllerDataQueue, int(de));
+                    Log("%s: Create %s -> err %d", tag, kControllerDataQueue, int(de));
                     if (de == BlockQueueError_None) data_q_ = h, created_data_ = true;
                 }
             }
             if (!event_q_ || !data_q_) {
                 if (now - last_wait_log > 30) {
                     Log("%s: waiting for a Steam Frame controller to create the shared queues "
-                        "(connect event err %d, data err %d); retrying every 1 s", tag, int(ee), int(de));
+                        "(connect event err %d, data err %d); retrying every 1 s%s", tag, int(ee), int(de),
+                        opt_.create_shared_queues ? ", creating them ourselves after the grace period" : "");
                     last_wait_log = now;
                 }
                 SleepS(1.0);
@@ -271,6 +286,13 @@ void CvTracker::SetupLoop() {
             SleepS(0.5);
             continue;
         }
+        // Re-announce under a fresh deviceId (a competing controller let go of our hand's slot).
+        if (uint32_t to = reannounce_to_.exchange(0)) {
+            if (to != device_id_ && DoReannounce(to)) {
+                event_had_reader = true;  // announce below as the new device
+                connected_ = false;
+            }
+        }
         // 4. Announce (again after an XRService restart, i.e. a new reader).
         if (!event_had_reader || !connected_) {
             event_had_reader = true;
@@ -279,7 +301,7 @@ void CvTracker::SetupLoop() {
                 connect_time = now;
                 resent_for_silence = false;
                 Log("%s: sent connect for device %u (hardware id 0x%016llx, %zu-byte config)", tag,
-                    opt_.device_id, (unsigned long long)opt_.hardware_id, opt_.config_json.size());
+                    device_id_.load(), (unsigned long long)opt_.hardware_id, opt_.config_json.size());
             } else {
                 SleepS(1.0);
                 continue;
@@ -296,20 +318,67 @@ void CvTracker::SetupLoop() {
     }
 }
 
+bool CvTracker::CreatePoseQueue(uint32_t id, BlockQueueHandle_t* out) {
+    std::string name = PoseQueueName(id);
+    EBlockQueueError e = bq_->Create(out, name.c_str(), sizeof(ControllerPoseBlock), kControllerQueueHeaderSize,
+                                     kControllerQueueBlockCount, BlockQueueFlag_OwnerIsReader);
+    if (e == BlockQueueError_QueueAlreadyExists) {
+        e = bq_->Connect(out, name.c_str());
+        Log("%s: %s already existed; connected instead (err %d)", opt_.tag, name.c_str(), int(e));
+    }
+    if (e != BlockQueueError_None) {
+        Log("%s: Create %s failed: %d", opt_.tag, name.c_str(), int(e));
+        *out = 0;
+        return false;
+    }
+    Log("%s: created %s (handle 0x%llx)", opt_.tag, name.c_str(), (unsigned long long)*out);
+    return true;
+}
+
+// Setup thread. Disconnect the old identity, then (SendEvent spaces it ≥ 1.1 s) the setup loop
+// connects the new one.
+bool CvTracker::DoReannounce(uint32_t new_id) {
+    const uint32_t old_id = device_id_;
+    BlockQueueHandle_t q = 0;
+    if (!CreatePoseQueue(new_id, &q)) return false;  // keep the old identity
+    if (connected_.exchange(false)) {
+        SendEvent(ControllerEvent_Disconnect);
+        Log("%s: re-announce: sent disconnect for device %u", opt_.tag, old_id);
+    }
+    BlockQueueHandle_t old_q;
+    {
+        std::lock_guard<std::mutex> lk(pose_mu_);
+        old_q = pose_q_;
+        pose_q_ = q;
+        device_id_ = new_id;
+        if (derived_hwid_) opt_.hardware_id = 0x5446000000000000ull | new_id;
+    }
+    if (old_q) Log("%s: destroyed %s (err %d)", opt_.tag, PoseQueueName(old_id).c_str(), int(bq_->Destroy(old_q)));
+    Log("%s: re-announcing as device %u (was %u)", opt_.tag, new_id, old_id);
+    return true;
+}
+
 void CvTracker::PoseLoop() {
     bool logged_first = false, logged_first_valid = false;
     while (running_ || connected_) {
         BlockHandle_t blk = 0;
         void* buf = nullptr;
-        EBlockQueueError e = bq_->WaitAndAcquireReadOnlyBlock(pose_q_, &blk, &buf, BlockQueueRead_New, 100);
+        ControllerPoseBlock b;
+        EBlockQueueError e;
+        {
+            std::lock_guard<std::mutex> lk(pose_mu_);  // DoReannounce swaps the queue
+            e = pose_q_ ? bq_->WaitAndAcquireReadOnlyBlock(pose_q_, &blk, &buf, BlockQueueRead_New, 50)
+                        : BlockQueueError_InvalidHandle;
+            if (e == BlockQueueError_None && buf) {
+                memcpy(&b, buf, sizeof(b));
+                bq_->ReleaseReadOnlyBlock(pose_q_, blk);
+            }
+        }
         if (e != BlockQueueError_None || !buf) {
             SleepS(e == BlockQueueError_BlockNotAvailable ? 0.001 : 0.05);
             if (!running_) break;
             continue;
         }
-        ControllerPoseBlock b;
-        memcpy(&b, buf, sizeof(b));
-        bq_->ReleaseReadOnlyBlock(pose_q_, blk);
         CvPose p = ConvertPoseBlock(b);
         p.recv_t = NowSeconds();
         last_pose_recv_ = p.recv_t;
@@ -330,6 +399,10 @@ void CvTracker::PoseLoop() {
 }
 
 bool CvTracker::SendEvent(uint32_t type) {
+    // XRService takes about one event a second from a 4-block ring (AUDIT-1 F2): space ours.
+    double wait = last_event_t_ + 1.1 - NowSeconds();
+    if (wait > 0) SleepS(wait);
+    last_event_t_ = NowSeconds();
     std::lock_guard<std::mutex> lk(write_mu_);
     if (!event_q_) return false;
     BlockHandle_t blk = 0;
@@ -345,7 +418,7 @@ bool CvTracker::SendEvent(uint32_t type) {
     }
     auto* ev = static_cast<ControllerEventBlock*>(buf);
     memset(ev, 0, sizeof(*ev));
-    ev->deviceId = opt_.device_id;
+    ev->deviceId = device_id_;
     ev->eventType = type;
     ev->hardwareId = opt_.hardware_id;
     uint64_t len = 0;
@@ -425,7 +498,7 @@ bool CvTracker::PushImu(double t, const float accel[3], const float gyro[3], uin
     }
     auto* s = static_cast<ControllerImuBlock*>(buf);
     memset(s, 0, sizeof(*s));
-    s->deviceId = opt_.device_id;
+    s->deviceId = device_id_;
     s->sampleTime = t;
     for (int i = 0; i < 3; i++) {
         s->accel[i] = accel[i];

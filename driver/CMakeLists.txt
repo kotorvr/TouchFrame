@@ -8,7 +8,9 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 
 add_library(driver_touchframe SHARED src/driver.cpp src/udp_source.cpp src/skeleton.cpp
-  src/cv_tracker.cpp src/cv_clone.cpp src/cv_source.cpp)
+  src/cv_tracker.cpp src/cv_clone.cpp src/cv_source.cpp
+  src/radio_backend.cpp src/radio_source.cpp src/radio_transport.cpp src/radio_link.cpp src/time_sync.cpp
+  src/radio_decode.cpp src/led_phase.cpp src/xr_log.cpp)
 target_include_directories(driver_touchframe PRIVATE src vendor)
 target_compile_options(driver_touchframe PRIVATE -Wall -Wextra -Wno-unused-parameter)
 target_link_libraries(driver_touchframe PRIVATE pthread)

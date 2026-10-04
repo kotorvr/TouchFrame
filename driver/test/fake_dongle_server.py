@@ -1,0 +1,122 @@
+#!/usr/bin/env python3
+"""tools/fake_dongle.py served over TCP for driver/test/radio_fake_test.cpp.
+
+Like `fake_dongle.py --tcp`, plus what the driver test needs:
+  --framing hid   the stream as hidraw sees it: the client writes 65-byte OUT writes (0x00 + report)
+                  and reads 64-byte IN reports. TCP may merge or split them; this server re-chunks.
+  --caps-store    advertise LINK_CAP_STORE | LINK_CAP_HID in HELLO (the flash store is modelled
+                  either way).
+  --drift-ppm / --offset-us   a known dongle clock, so the test can check the time sync.
+  --reboot-at S   power-cycle the dongle S seconds after the first host start (clock restarts,
+                  flash survives); --drop-at S drops slot 0's controller (it reconnects).
+Prints "ready PORT" when listening.
+"""
+import argparse
+import os
+import socket
+import sys
+import time
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.join(HERE, "..", "..", "tools"))
+import fake_dongle as F  # noqa: E402
+import radio as R  # noqa: E402
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--port", type=int, default=0)
+    ap.add_argument("--framing", choices=("raw", "hid"), default="raw")
+    ap.add_argument("--caps-store", action="store_true")
+    ap.add_argument("--drift-ppm", type=float, default=12.5)
+    ap.add_argument("--offset-us", type=int, default=123456789)
+    ap.add_argument("--reboot-at", type=float, default=0)
+    ap.add_argument("--drop-at", type=float, default=0)
+    ap.add_argument("--seconds", type=float, default=120, help="exit after this long")
+    args = ap.parse_args()
+
+    hid = args.framing == "hid"
+    fake = F.FakeDongle(clock_offset_us=args.offset_us, drift_ppm=args.drift_ppm, hid=hid)
+    events = {"host_t": None}
+
+    def patch(fk):
+        orig = fk.handle
+
+        def handle(cmd, body, rx_us):
+            if cmd == R.CMD_HELLO and args.caps_store:
+                saved = fk.emit
+
+                def emit(evt, b):
+                    if evt == R.EVT_HELLO:
+                        h = R.unpack("link_hello_t", b)
+                        h["caps"] |= 0x30  # LINK_CAP_STORE | LINK_CAP_HID
+                        b = R.pack("link_hello_t", **h)
+                    saved(evt, b)
+                fk.emit = emit
+                try:
+                    orig(cmd, body, rx_us)
+                finally:
+                    fk.emit = saved
+                return
+            orig(cmd, body, rx_us)
+            if cmd == R.CMD_HOST_START and events["host_t"] is None:
+                events["host_t"] = time.monotonic()
+        fk.handle = handle
+
+    patch(fake)
+    srv = socket.socket()
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", args.port))
+    srv.listen(1)
+    print(f"ready {srv.getsockname()[1]}", flush=True)
+    srv.settimeout(0.5)
+    t_end = time.monotonic() + args.seconds
+    rebooted = dropped = False
+    while time.monotonic() < t_end:
+        try:
+            conn, _ = srv.accept()
+        except socket.timeout:
+            continue
+        conn.settimeout(0.001)
+        fake.dtr = True
+        inbuf = b""
+        try:
+            while time.monotonic() < t_end:
+                try:
+                    data = conn.recv(65536)
+                    if not data:
+                        break
+                    if hid:
+                        inbuf += data
+                        while len(inbuf) >= R.HID_REPORT + 1:
+                            fake.write(inbuf[:R.HID_REPORT + 1])
+                            inbuf = inbuf[R.HID_REPORT + 1:]
+                    else:
+                        fake.write(data)
+                except socket.timeout:
+                    pass
+                ht = events["host_t"]
+                if ht and args.reboot_at and not rebooted and time.monotonic() - ht > args.reboot_at:
+                    rebooted = True
+                    print("fake: reboot", flush=True)
+                    fake.reboot()
+                    patch(fake)
+                if ht and args.drop_at and not dropped and time.monotonic() - ht > args.drop_at:
+                    dropped = True
+                    print("fake: drop slot 0", flush=True)
+                    fake.drop_slot(0)
+                # Drain everything due (HID: one report per read()).
+                for _ in range(64):
+                    out = fake.read()
+                    if not out:
+                        break
+                    conn.sendall(out)
+        except OSError as e:
+            print(f"fake: connection ended: {e}", flush=True)
+        fake.dtr = False
+        conn.close()
+        print("fake: client gone", flush=True)
+
+
+if __name__ == "__main__":
+    main()
