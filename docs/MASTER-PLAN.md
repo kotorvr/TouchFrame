@@ -209,7 +209,7 @@ decides.
 | RE-3b Frame tracker vs Touch Plus model | DEV-1's error flood ("Couldn't find any neighbor", ~300/s) | **chipped 2026-10-04**: model compatibility + exposure settings, static, no hooking |
 | RE-2 | the plan was written | **done, merged 31f35fd**: [re/PERIPHERALS.md](re/PERIPHERALS.md) |
 | BUILD-2 Driver radio backend | BUILD-1 reports link v3 committed | **running (started 2026-10-04)** (base e430b12; hidraw transport) |
-| REVIEW-RE | RE-1 and RE-2 are merged | waiting |
+| REVIEW-RE | RE-1 and RE-2 are merged | waiting. Scope also covers: handedness (cmd 1 `device_desc`, "Input MCU handedness"), how many hosts a controller remembers and how it reconnects (if RE-1 leaves them open), and the flash-erase stall vs `PULSAR_DEVICE_MISSED_BEACONS_BEFORE_DC` |
 | DEV-1 on-device bench | the Echo session releases the Quest + Frame | **done, merged 5a0b33d**: [re/DEV-1.md](re/DEV-1.md); devices handed back to Echo |
 | HW-1 Sniff & validate | the dongles arrive (the user says so) | waiting |
 | HW-2 Host bring-up | HW-1 done + BUILD-1 merged + REVIEW-RE has no blockers | waiting |
