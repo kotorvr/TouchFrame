@@ -157,6 +157,16 @@ hardware"):
 - HID throughput on the Frame;
 - whether pairings survive DFU.
 
+**HW-3 LED-timing checks** (driver/RADIO.md, docs/re/FRAME-MODEL.md §6 T3):
+- Does XRService keep logging "Not having enough IMU data for controller frame … Current timestamp"
+  once our IMU feed is healthy? If the line stops, the phase loop loses its direct drift measurement
+  and relies on pose-validity sentinels. Check that it still holds lock for 10+ minutes.
+- Record the logged `seed_offset_us`, i.e. which exposure point the stamp marks, and set
+  `radio_led_seed_offset_us`.
+- Time to first lock, seeded vs blind.
+- If lock keeps slipping, raise it with the user before going further. A direct exposure-schedule
+  feed was out of scope (RE-3 was blocked), and whether to revisit that is the user's call.
+
 Not implemented: PCM haptics (0x9d). No real "disconnect" message is known: a dropped controller's
 slot frees when it goes quiet.
 
