@@ -42,6 +42,9 @@ def test_link_h_matches_radio_py():
     c = c_constants()
     assert c["LINK_VERSION"] == R.LINK_VERSION
     assert (c["LINK_MAX_SLOTS"], c["LINK_REG_MAX"], c["LINK_PCM_MAX"]) == (R.MAX_SLOTS, R.REG_MAX, R.PCM_MAX)
+    assert (c["LINK_MAX_PAIRINGS"], c["LINK_HID_OPEN_MS"]) == (R.MAX_PAIRINGS, R.HID_OPEN_MS)
+    assert (c["LINK_LED_MIN_PERIOD_US"], c["LINK_LED_MAX_ON_US"]) == (R.LED_MIN_PERIOD_US, R.LED_MAX_ON_US)
+    assert {c["LINK_HAND_" + v.upper()]: v for v in R.HANDS.values()} == R.HANDS
     for k, v in c.items():
         if k.startswith(("CMD_", "EVT_")):
             assert getattr(R, k) == v, (k, v)
@@ -51,7 +54,8 @@ def test_link_h_matches_radio_py():
                 assert v in table, k
     caps = {k: v for k, v in c.items() if k.startswith("LINK_CAP_")}
     assert sorted(v.bit_length() - 1 for v in caps.values()) == sorted(R.CAPS), caps
-    for pyname in ("HOST_AUTO_ACCEPT", "HOST_DM_BEACONS", "HOST_RAW_UPLINKS", "HOST_PLACEHOLDER", "PAIR_AUTO",
+    for pyname in ("HOST_AUTO_ACCEPT", "HOST_DM_BEACONS", "HOST_RAW_UPLINKS", "HOST_PLACEHOLDER", "HOST_COMPACT",
+                   "HOST_STORED", "FORGET_ALL", "FORGET_IDENTITY", "PAIR_AUTO",
                    "FAKE_PAIRED", "FAKE_STREAM_INPUT", "FAKE_STREAM_IMU", "LED_OFF", "LED_ON", "LED_STROBE",
                    "HAPTIC_STOP", "HAPTIC_SIMPLE", "HAPTIC_PCM"):
         assert getattr(R, pyname) == c["LINK_" + pyname], pyname
@@ -149,7 +153,8 @@ def test_host_session():
     seqs = [e["seq"] for e in inputs]
     assert all(b == (a + 1) & 0xFFFF for a, b in zip(seqs, seqs[1:])), "input seq gaps"
     assert all(b["t_us"] > a["t_us"] for a, b in zip(inputs, inputs[1:]))
-    assert imus[0]["bits"] == 16 and imus[0]["accel_fs_g"] == 16
+    assert imus[0]["bits"] == 16 and imus[0]["accel_fs_g"] == 32 and imus[0]["gyro_fs_dps"] == 4000
+    assert 0 <= inputs[0]["trigger"] < 4096 and inputs[0]["battery_pct"] == 87
 
     # registers
     d.request(R.CMD_REG_READ, "link_reg_cmd_t", slot=slot, reg=0x15)
@@ -167,9 +172,11 @@ def test_host_session():
     # LED and haptics
     d.request(R.CMD_LED, "link_led_t", slot=slot, mode=R.LED_STROBE, intensity=200, period_us=11111,
               on_us=80, phase_us=-500)
-    assert fake.last_led[slot]["phase_us"] == -500
-    r, _ = d.request(R.CMD_LED, "link_led_t", slot=slot, mode=R.LED_STROBE, period_us=100, on_us=200, check=False)
-    assert r["status"] == 1
+    assert fake.last_led[slot]["phase_us"] == -500 and fake.last_led[slot]["on_us"] == R.LED_MAX_ON_US
+    r, _ = d.request(R.CMD_LED, "link_led_t", slot=slot, mode=R.LED_STROBE, period_us=699, on_us=50, check=False)
+    assert r["status"] == 1  # faster than LINK_LED_MIN_PERIOD_US
+    r, _ = d.request(R.CMD_LED, "link_led_t", slot=slot, mode=R.LED_ON, check=False)
+    assert r["status"] == 1  # real controllers cannot hold the LEDs on
     d.request(R.CMD_HAPTIC, "link_haptic_t", tail=bytes(range(10)), slot=slot, mode=R.HAPTIC_PCM,
               amplitude=255, freq_hz=2000, pcm_len=10)
     assert fake.last_haptic[slot]["pcm"] == bytes(range(10))
@@ -225,9 +232,86 @@ def test_pending_re_behaviour():
     print("pending-RE behaviour: PENDING_RE without placeholder, connects with it")
 
 
+def test_stored_and_compact():
+    """LINK_HOST_STORED: the dongle's flash identity, pairings saved + let in, kept across a reboot,
+    listed and forgotten; LINK_HOST_COMPACT: EVT_SAMPLE instead of EVT_INPUT + EVT_IMU."""
+    fake = FakeDongle(controllers=[SimController(0xC0FFEE)])
+    d = R.Dongle(transport=fake)
+    flags = R.HOST_DM_BEACONS | R.HOST_STORED | R.HOST_COMPACT
+    r = d.host_start(0, bytes(16), 7, flags=flags)
+    assert r["detail"] == 0
+    netaddr = d.host_status()["netaddr"]
+    assert netaddr and d.pairings() == dict(netaddr=netaddr, count=0, flags=1, writes_left=100, pairings=[])
+    d.request(R.CMD_PAIR_START, "link_pair_start_t", flags=R.PAIR_AUTO, timeout_s=10)
+    done, _ = wait(d, lambda n, e: n == "pair" and e["state"] == 5)
+    assert done["netaddr"] == netaddr and done["hand"] == 0
+    wait(d, lambda n, e: n == "conn" and e["state"] == 3)  # no CMD_CONNECT needed
+    smp, seen = wait(d, lambda n, e: n == "sample")
+    assert smp["accel"] == [0, 0, 1024] and smp["flags"] & 4 and not any(n in ("input", "imu") for n, _ in seen)
+    p = d.pairings()
+    assert p["count"] == 1 and p["pairings"][0]["device_id"] == 0xC0FFEE
+
+    fake.reboot()  # power cycle: the identity and the pairing survive
+    d = R.Dongle(transport=fake)
+    r = d.host_start(0, bytes(16), 8, flags=flags)
+    assert r["detail"] == 1 and d.host_status()["netaddr"] == netaddr
+    wait(d, lambda n, e: n == "conn" and e["state"] == 3)
+
+    assert d.forget(0xC0FFEE) == 1
+    wait(d, lambda n, e: n == "conn" and e["state"] == 0)
+    assert d.pairings()["count"] == 0
+    r, _ = d.request(R.CMD_PAIR_FORGET, "link_pair_forget_t", check=False)
+    assert r["status"] == 1  # neither an id nor ALL
+    d.forget(identity=True)
+    d.host_start(0, bytes(16), 9, flags=flags)
+    assert d.host_status()["netaddr"] not in (0, netaddr)
+    print("stored identity: pair -> saved + auto-connected, reboot -> reconnects, list / forget ok; compact samples ok")
+
+
+class _HidShim:
+    """hidapi's device interface over a FakeDongle(hid=True), for radio.HidTransport."""
+
+    def __init__(self, fake):
+        self.fake = fake
+
+    def write(self, data):
+        return self.fake.write(bytes(data))
+
+    def read(self, size, timeout_ms=0):
+        return list(self.fake.read())
+
+
+def test_hid_transport():
+    for stream in (b"", b"\x01", bytes(range(256)) * 3):
+        reps = R.hid_reports(stream)
+        assert all(len(x) == R.HID_REPORT for x in reps)
+        assert b"".join(R.hid_payload(x) for x in reps) == stream
+    fake = FakeDongle(hid=True, input_hz=500, imu_hz=500)
+    try:
+        fake.write(bytes(64))
+        raise AssertionError("64-byte hidraw write accepted")
+    except OSError:
+        pass
+    d = R.Dongle(transport=R.HidTransport(device=_HidShim(fake)))
+    assert d.hello()["version"] == R.LINK_VERSION  # a 28-byte event spans an IN report boundary
+    d.host_start(0x1234, bytes(16), 1, flags=R.HOST_DM_BEACONS | R.HOST_COMPACT)
+    fake.controllers[0].paired = (0x1234, bytes(16))
+    d.request(R.CMD_CONNECT, "link_connect_t", slot=0, device_id=fake.controllers[0].device_id)
+    wait(d, lambda n, e: n == "sample")
+    # nobody writes for longer than LINK_HID_OPEN_MS: the dongle discards its output
+    fake.hid_last_out -= R.HID_OPEN_MS / 1000 + 0.1
+    time.sleep(0.02)
+    fake.tick()
+    assert not fake.out and fake.events_dropped > 0
+    d.hello()  # the next OUT report reopens it
+    print("HID: report framing round-trips, hidraw 65-byte writes, events over 64-byte reports, 2 s open window ok")
+
+
 if __name__ == "__main__":
     test_link_h_matches_radio_py()
     test_cobs_and_pack()
     test_host_session()
     test_pending_re_behaviour()
+    test_stored_and_compact()
+    test_hid_transport()
     print("link tests passed")
