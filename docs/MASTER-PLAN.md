@@ -194,7 +194,7 @@ decides.
 | RE-1, RE-2, RE-3, BUILD-1, AUDIT-1 | the plan was written | **running (started 2026-10-04)** |
 | BUILD-2 Driver radio backend | BUILD-1 reports link v3 committed | waiting |
 | REVIEW-RE | RE-1 and RE-2 are merged | waiting |
-| DEV-1 on-device bench | the Echo session releases the Quest + Frame (it messages the planner) | **chipped 2026-10-04** (both released) |
+| DEV-1 on-device bench | the Echo session releases the Quest + Frame (it messages the planner) | **running (started 2026-10-04)**; EchoQuestCombat waits for the planner's all-clear |
 | HW-1 Sniff & validate | the dongles arrive (the user says so) | waiting |
 | HW-2 Host bring-up | HW-1 done + BUILD-1 merged + REVIEW-RE has no blockers | waiting |
 | HW-3 Gate B + tracking | HW-2 passes G-Link + BUILD-2 merged | waiting |
