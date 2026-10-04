@@ -190,16 +190,41 @@ the elk-app TL command dispatcher, which the stripped `ruby_prq` image does not 
 dongle host can match them from one sniffed register exchange. What is **CONFIRMED** is the
 semantic contract: `(reg_id, request-bytes) → (response-bytes)`, with the IDs above.
 
-### Notifications / subscribe (CONFIRMED mechanism, INFERRED framing)
+### Notifications / subscribe (CONFIRMED framing, using the `.gnu_debugdata` symbols)
 
-Device→host asynchronous notifications exist: libsyncboss `pulsar_host_get_notification`
-("Get the last notification the Host received"), `pulsar_notifications` / `pulsar_lp_notifications`
-counters, and a typed handler `controller_process_irled_config_ntf_data(…, const
-ntf_reg_irled_config_t *)` plus `controller_handle_sidechannel_chunk`. So the host receives
-register-change notifications (e.g. the IR-LED config) as a distinct message class, dispatched by
-register id — `"Unexpected controller notification register %i"` and `"Controller notification data
-length too small"` are the reject paths. The host-mode dongle must accept and surface these; the
-exact on-air notification header is the same UNKNOWN as the TL header above.
+`libsyncboss.so` carries a `.gnu_debugdata` (xz MiniDebugInfo) section = **1044 internal symbol
+names** (section [23], file off `0x9fe1c`; extract with `lzma.decompress`; Ghidra 12 reads it
+automatically, so the decomp is already named — RE-2 flagged this). With those names the
+device→host notification path is pinned, `controller_process_notification @ 0x57324`
+(`syncboss_hal_input_controller.c`):
+
+A received notification is `[0x14-byte header][optional sidechannel chunk][ntf chunk stream]`:
+
+- **0x14-byte header (host↔MCU wrapper, CONFIRMED).** `len >= 0x14` (else `"Controller
+  notification data length too small"`), and **byte `0x13` must be `0`** or the packet is not a
+  normal chunk notification. This is the MCU→Android `spi_data` wrapper — the **same 0x14-byte size
+  as the request-side `spi_data_pulsar_data_t`** (§3 transport) — **not** the over-air header; a
+  dongle host emits the over-air CL/TL header instead (still the UNKNOWN above). The header's
+  interior fields are MCU-side and not inspected here beyond `+0x13`.
+- **Optional sidechannel chunk (CONFIRMED present; inner ARQ framing INFERRED).** When the session
+  enables it (`(conn+0xd2)==0 && (state+0x47e & 1)==0`), a sidechannel chunk of
+  `sidechannel_client_get_chunk_size()` bytes (`@0x114fe8`, a configured fixed size, default 0 =
+  none) sits **right after** the 0x14 header and is consumed by `controller_handle_sidechannel_chunk
+  @ 0x58b0c` / `sidechannel_client_process_chunk @ 0x114d00` before the chunk stream. Its first byte
+  is flags (bit0 = start-of-message, bit1 = sequence parity), byte 1 = length — a fragmented-message
+  ARQ, used for blobs (host blob / attachment auth), not per-frame input.
+- **ntf chunk stream (end-to-end payload, CONFIRMED — the part a dongle host must produce/consume).**
+  `ntf_unpacker_start @ 0x12e60` / `ntf_unpacker_next @ 0x12e74` iterate little-endian **u16-header
+  chunks**; chunk **type = `(h>>6 & 0x20) | (h&0x1f)` = the ntf register id**, length =
+  `(h>>5)&0x3f` (0..63), with fragment seq in bits 12..14 and last-fragment in bit 15 (full table in
+  PERIPHERALS.md §1.1 — RE-2's; `pulsar_input.py unpack_chunks`). Type 1 = IMU (18 B), 0xb = 12 B,
+  3 = 3 B, etc. Unknown types are rate-limit-logged `"Unknown chunk type %d"` and skipped.
+
+So for host mode the **chunk stream framing is fully pinned** and travels end-to-end; only the
+over-air CL/TL header that *carries* the chunk stream (the MCU strips/adds it) is the residual
+UNKNOWN, decided by the same single capture as the read/write TL header. `tools/pulsar_host.py
+split_notification()` strips the 0x14 wrapper + sidechannel and hands the chunk stream to
+`pulsar_input.unpack_chunks`.
 
 ---
 
