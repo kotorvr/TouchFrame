@@ -57,7 +57,7 @@ typedef struct node {
 
 static double T;  // sim time, us
 static double loss;
-static bool outage;
+static bool outage, uplink_outage;  // uplink_outage: only the controller's packets are lost
 static uint64_t loss_rng = 0x9E3779B97F4A7C15ull;
 
 static uint64_t xorshift(uint64_t* s) {
@@ -200,7 +200,8 @@ static void step(node_t** nodes, int nn) {
         air_t* a = &air[k];
         if (!a->live || T < a->end) continue;
         a->live = false;
-        bool lost = outage || (loss > 0 && (double)(xorshift(&loss_rng) % 1000000) / 1e6 < loss);
+        bool lost = outage || (uplink_outage && !a->from->is_host) ||
+                    (loss > 0 && (double)(xorshift(&loss_rng) % 1000000) / 1e6 < loss);
         for (int i = 0; i < nn && !lost; i++) {
             node_t* r = nodes[i];
             if (r == a->from || !r->has_op || r->op.kind != RADIO_OP_RX) continue;
@@ -470,6 +471,18 @@ static void scenario_loss_and_outage(void) {
     CHECK(find(&H, EVT_CONN, mark, 9, LINK_SLOT_CONNECTED), "no reconnect after the outage");
 }
 
+static void scenario_uplink_loss(void) {
+    printf("scenario: 0.4 s of lost uplinks while the controller hears us: the host resyncs the counter\n");
+    size_t mark = H.nev, cmark = C.nev;
+    uplink_outage = true;
+    run(400000);
+    uplink_outage = false;
+    CHECK(find(&H, EVT_CONN, mark, 9, LINK_SLOT_LOST), "host never noticed the uplink loss");
+    CHECK(!find(&C, EVT_CONN, cmark, 9, LINK_SLOT_LOST), "fake lost the link (it should hear beacons)");
+    for (int i = 0; i < 100 && !find(&H, EVT_CONN, mark, 9, LINK_SLOT_CONNECTED); i++) run(10000);
+    CHECK(find(&H, EVT_CONN, mark, 9, LINK_SLOT_CONNECTED), "steady counter not resynced after lost uplinks");
+}
+
 static void scenario_disconnect_forget(void) {
     printf("scenario: disconnect + forget, the controller is then refused\n");
     size_t mark = H.nev;
@@ -523,7 +536,7 @@ static void scenario_real_conn(void) {
     for (int i = 0; i < PULSAR_SLOTS; i++)
         if (H.host->slot[i].device_id == FAKE_ID) s = i;
     CHECK(s >= 0 && C.ctrl->accepted && C.ctrl->slot == s, "real: fake slot %u vs host %d", C.ctrl->slot, s);
-    CHECK(s >= 0 && H.host->slot[s].dir == 1, "real: CCM direction not learned");
+    CHECK(H.host->ccm_dir == 1, "real: CCM direction not learned");
     run(500000);
     CHECK(s >= 0 && H.host->slot[s].state == LINK_SLOT_CONNECTED && H.host->slot[s].rx_bad_mic == 0,
           "real: link not held (%u bad MICs)", s >= 0 ? H.host->slot[s].rx_bad_mic : 0);
@@ -659,6 +672,7 @@ int main(int argc, char** argv) {
     T = 0;
     scenario_pair_connect_stream();
     scenario_loss_and_outage();
+    scenario_uplink_loss();
     scenario_disconnect_forget();
     scenario_real_formats();
     scenario_real_conn();

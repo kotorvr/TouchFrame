@@ -102,9 +102,12 @@ python tools/radio.py ping                       # dongle-clock <-> PC time sync
 
 ## Loopback rig (two dongles)
 ```bash
-python tools/radio.py --port COM_A host --placeholder --pair any   # host, placeholder CL formats
+python tools/radio.py --port COM_A host --placeholder --pair any   # host (flash identity), placeholder CL formats
 python tools/radio.py --port COM_B fake                            # plays a Touch Plus: pairs, connects, streams
-python tools/radio.py --port COM_B fake --paired --identity f.json --real-conn   # real negotiation, host without --placeholder
+
+# skip pairing: both sides take netaddr + key from the same file
+python tools/radio.py --port COM_A host --identity f.json --auto-accept   # real formats (no --placeholder)
+python tools/radio.py --port COM_B fake --paired --identity f.json --real-conn   # real request + negotiation
 ```
 The fake speaks the real pairing exchange and, with `--real-conn`, the real connection request and
 negotiation. The placeholder formats are TouchFrame's own invention for everything after that.

@@ -342,7 +342,7 @@ class FakeDongle:
             self.emit(R.EVT_STATUS, struct.pack(R.STATUS_FMT, R.LINK_VERSION, 0, self.now_us() & 0xFFFFFFFF, 0, 0,
                                                 0, 0, 0) + R.pack_config(R.config()))
         elif cmd == R.CMD_HELLO:
-            caps = 0x3F | 0x700 | (0 if self.pending_re else 0xF800)
+            caps = 0x3F | 0x700 | (0 if self.pending_re else 0xF800)  # incl. STORE (bit 4), HID (bit 5)
             self.emit(R.EVT_HELLO, R.pack("link_hello_t", version=R.LINK_VERSION, mode=self.mode, caps=caps,
                                           build=20261004, dongle_id=self.dongle_id, now_us=self.now_us(),
                                           max_slots=R.MAX_SLOTS))
@@ -369,16 +369,16 @@ class FakeDongle:
                     self.flash.update(netaddr=self.rng.randrange(1, 0xFFFFFFFF), key=os.urandom(16), pairs=[])
                 netaddr, key = self.flash["netaddr"], self.flash["key"]
             self.host = dict(netaddr=netaddr, key=key, flags=h["flags"], t_start=self.now_us())
-            loaded = 0
+            for s, slot in enumerate(self.slots):  # slots allowed before this start seek us again
+                if slot:
+                    self.at(100000, lambda s=s: self._negotiate(s))
+            loaded = 0  # (_allow schedules its own negotiation)
             if h["flags"] & R.HOST_STORED:
                 for p in reversed(self.flash["pairs"]):
                     if self._allow(p["device_id"], p["slot"]) is None:
                         break
                     loaded += 1
             self.result(tag, cmd, 0, loaded)
-            for s, slot in enumerate(self.slots):
-                if slot:
-                    self.at(100000, lambda s=s: self._negotiate(s))
         elif cmd == R.CMD_PAIR_LIST:
             f = self.flash
             self.emit(R.EVT_PAIRINGS, R.pack("link_pairings_t", netaddr=f["netaddr"], count=len(f["pairs"]), flags=1,
@@ -553,13 +553,20 @@ def serve_tcp(fake, port):
         conn, _ = srv.accept()
         conn.settimeout(0.002)
         fake.dtr = True
+        pending = b""  # --hid: TCP does not keep the 65-byte hidraw writes apart
         try:
             while True:
                 try:
                     data = conn.recv(4096)
                     if not data:
                         break
-                    fake.write(data)
+                    if fake.hid:
+                        pending += data
+                        while len(pending) >= R.HID_REPORT + 1:
+                            fake.write(pending[:R.HID_REPORT + 1])
+                            pending = pending[R.HID_REPORT + 1:]
+                    else:
+                        fake.write(data)
                 except socket.timeout:
                     pass
                 out = fake.read()

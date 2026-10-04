@@ -21,6 +21,8 @@
 #define PULSAR_ENDPOINT_OFFSET 1
 #endif
 #define PULSAR_SLOT_BIT(slot) ((uint8_t)(1u << ((slot) + PULSAR_ENDPOINT_OFFSET)))
+// Slots whose endpoint is in 1..4: the host assigns only these (offset 1: slots 0..3).
+#define PULSAR_SLOT_USABLE(slot) ((slot) + PULSAR_ENDPOINT_OFFSET >= 1 && (slot) + PULSAR_ENDPOINT_OFFSET <= 4)
 #define PULSAR_SLOT_BASE_US 350        // first uplink slot starts this long after the beacon anchor
 #define PULSAR_VERSION 0x1701          // Q6: on air 01 17
 #define PULSAR_S0 0x04                 // connected-link S0 byte

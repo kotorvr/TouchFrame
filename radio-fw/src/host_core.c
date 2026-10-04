@@ -107,7 +107,9 @@ static int find_allowed(const host_t* h, uint64_t device_id) {
     return -1;
 }
 
-static bool slot_free(const host_t* h, int s) { return !h->slot[s].allowed && h->slot[s].state == LINK_SLOT_FREE; }
+static bool slot_free(const host_t* h, int s) {
+    return PULSAR_SLOT_USABLE(s) && !h->slot[s].allowed && h->slot[s].state == LINK_SLOT_FREE;
+}
 
 // The slot for a controller: where it is already allowed, else `want` if free, else the first free
 // one. -1 if none.
@@ -364,7 +366,7 @@ static void pair_on_reply(host_t* h, const host_rx_t* r) {
     } else if (h->pair_cmd == PAIR_CMD_PAIRING_DATA) {
         uint64_t id = h->pair_device;
         pair_finish(h, LINK_PAIR_DONE, LINK_OK);
-        if (stored(h)) {  // saved, and allowed in a slot: it connects when it seeks us
+        if (stored(h) && h->store->netaddr == h->netaddr) {  // saved, and allowed in a slot
             const store_pair_t* p = store_find(h->store, id);
             int s = pick_slot(h, id, p ? p->slot : 0xFF);
             if (!store_add_pair(h->store, id, (uint8_t)(s >= 0 ? s : 0), LINK_HAND_UNKNOWN))
@@ -460,10 +462,7 @@ static void on_conn_req(host_t* h, uint8_t rx_slot, const cl_msg_t* m) {
     int s = find_allowed(h, m->u.conn.device_id);
     // auto-accept anyone (LINK_HOST_AUTO_ACCEPT), or a stored pairing that found no slot at start
     if (s < 0 && ((h->flags & LINK_HOST_AUTO_ACCEPT) || (stored(h) && store_find(h->store, m->u.conn.device_id)))) {
-        uint8_t want = m->u.conn.slot < PULSAR_SLOTS ? m->u.conn.slot : rx_slot;
-        if (!h->slot[want].allowed) s = want;
-        for (uint8_t i = 0; s < 0 && i < PULSAR_SLOTS; i++)
-            if (!h->slot[i].allowed) s = i;
+        s = pick_slot(h, m->u.conn.device_id, m->u.conn.slot < PULSAR_SLOTS ? m->u.conn.slot : rx_slot);
         if (s >= 0) {
             h->slot[s].allowed = true;
             h->slot[s].device_id = m->u.conn.device_id;
@@ -504,7 +503,7 @@ static void on_conn_req(host_t* h, uint8_t rx_slot, const cl_msg_t* m) {
     }
     if (sl->accept_queued) {  // the controller restarts its counter when the accept arrives
         memcpy(sl->iv, m->u.conn.iv, 8);
-        sl->dir = h->slot[rx_slot].dir;  // learned from this request, which may have come in on another slot
+        sl->ctr_period = h->plat->now_us(h->plat) / PULSAR_BEACON_PERIOD_US;
         sl->ctr = 0;
         sl->steady = true;
     }
@@ -540,29 +539,49 @@ static void on_stream(host_t* h, uint8_t s, const host_rx_t* r, const cl_msg_t* 
     emit(h, EVT_IMU, &imu, sizeof imu, NULL, 0);
 }
 
-// Steady-state nonce first (counters from the expected one on, to ride over lost uplinks), then the
-// legacy nonce of this period's beacon (a request, or a controller that has not seen the accept),
-// in both directions (pulsar_nonce_dir). 0 = no MIC matched, 1 = steady, 2 = legacy.
-static int decrypt_uplink(host_t* h, host_slot_t* sl, const host_rx_t* r, uint8_t* pt) {
+static bool try_steady(host_t* h, host_slot_t* sl, const host_rx_t* r, uint32_t ctr, uint64_t period, uint8_t* pt) {
     uint8_t nonce[PULSAR_NONCE_LEN];
-    if (sl->steady) {
-        for (uint32_t i = 0; i < HOST_CTR_WINDOW; i++) {
-            pulsar_nonce_steady(sl->ctr + i, sl->iv, nonce);
-            pulsar_nonce_dir(nonce, sl->dir);
-            if (h->plat->ccm(h->plat, false, h->key, nonce, r->data, r->len, pt)) {
-                sl->ctr += i + 1;
-                return 1;
+    pulsar_nonce_steady(ctr, sl->iv, nonce);
+    pulsar_nonce_dir(nonce, h->ccm_dir);
+    if (!h->plat->ccm(h->plat, false, h->key, nonce, r->data, r->len, pt)) return false;
+    sl->ctr = ctr + 1;
+    sl->ctr_period = period;
+    return true;
+}
+
+// The steady nonce (after the accept) or the legacy nonce of this period's beacon (a request, or a
+// controller that has not taken the accept yet); whichever the slot's state makes likelier goes
+// first. Each try is a busy-waiting HW CCM pass, so the candidates are few: the next counters, and
+// the counters the elapsed beacon periods predict (one uplink per period) for when uplinks were lost
+// while the controller kept hearing us. 0 = no MIC matched, 1 = steady, 2 = legacy.
+static int decrypt_uplink(host_t* h, host_slot_t* sl, const host_rx_t* r, uint8_t* pt) {
+    uint64_t period = r->t_us / PULSAR_BEACON_PERIOD_US;
+    bool legacy_first = sl->state != LINK_SLOT_CONNECTED && sl->state != LINK_SLOT_LOST;
+    for (int pass = 0; pass < 2; pass++) {
+        if ((pass == 0) == legacy_first) {
+            uint8_t nonce[PULSAR_NONCE_LEN];
+            for (uint8_t k = 0; k < 2; k++) {  // both CCM directions (AUDIT A17 vs pulsar_host)
+                uint8_t dir = (uint8_t)(h->ccm_dir ^ k);
+                pulsar_nonce_legacy(h->session_nonce, period * PULSAR_BEACON_PERIOD_US, nonce);
+                pulsar_nonce_dir(nonce, dir);
+                if (h->plat->ccm(h->plat, false, h->key, nonce, r->data, r->len, pt)) {
+                    h->ccm_dir = dir;
+                    return 2;
+                }
             }
-        }
-    }
-    uint64_t beacon_ts = r->t_us / PULSAR_BEACON_PERIOD_US * PULSAR_BEACON_PERIOD_US;  // beacons are aligned
-    for (uint8_t k = 0; k < 2; k++) {
-        uint8_t dir = (uint8_t)(sl->dir ^ k);
-        pulsar_nonce_legacy(h->session_nonce, beacon_ts, nonce);
-        pulsar_nonce_dir(nonce, dir);
-        if (h->plat->ccm(h->plat, false, h->key, nonce, r->data, r->len, pt)) {
-            sl->dir = dir;
-            return 2;
+        } else if (sl->steady) {
+            for (uint32_t i = 0; i < HOST_CTR_NEAR; i++)
+                if (try_steady(h, sl, r, sl->ctr + i, period, pt)) return 1;
+            uint32_t ahead = (uint32_t)(period > sl->ctr_period ? period - sl->ctr_period : 1);
+            for (uint32_t i = 0; i <= HOST_CTR_BACK && ahead > i + HOST_CTR_NEAR; i++)
+                if (try_steady(h, sl, r, sl->ctr + ahead - 1 - i, period, pt)) return 1;
+            // the controller skips uplinks in periods it missed our beacon, so the counter can also be
+            // anywhere in between: one probe per packet sweeps that gap
+            if (ahead > HOST_CTR_NEAR + HOST_CTR_BACK + 1) {
+                uint32_t span = ahead - HOST_CTR_NEAR - HOST_CTR_BACK - 1;
+                sl->probe = sl->probe % span;
+                if (try_steady(h, sl, r, sl->ctr + HOST_CTR_NEAR + sl->probe++, period, pt)) return 1;
+            }
         }
     }
     return 0;
@@ -595,12 +614,13 @@ static void on_uplink(host_t* h, const host_rx_t* r) {
         emit(h, EVT_UPLINK, &u, sizeof u, ok ? pt : r->data, ok ? n : r->len);
     }
     // The controller uses the steady nonce only after it took our accept: it is on the link.
-    if (how == 1 && sl->allowed && (sl->state == LINK_SLOT_NEGOTIATING || sl->state == LINK_SLOT_LOST)) {
-        sl->accept_queued = false;
+    if (how == 1) {
         sl->last_rx_us = r->t_us;
-        conn_event(h, s, LINK_SLOT_CONNECTED, LINK_REASON_NONE);
+        if (sl->allowed && (sl->state == LINK_SLOT_NEGOTIATING || sl->state == LINK_SLOT_LOST)) {
+            sl->accept_queued = false;
+            conn_event(h, s, LINK_SLOT_CONNECTED, LINK_REASON_NONE);
+        }
     }
-    if (how == 1 && sl->state == LINK_SLOT_CONNECTED) sl->last_rx_us = r->t_us;
     cl_msg_t m;
     if (!ok || !h->fmt->decode(pt, n, CL_DIR_UP, &m)) return;
     sl->last_rx_us = r->t_us;
@@ -859,6 +879,8 @@ bool host_command(host_t* h, uint8_t cmd, const uint8_t* body, uint32_t len) {
         BODY(link_pair_start_t);
         if (!h->running) { result(h, tag, cmd, LINK_ERR_STATE, 0); return true; }
         if (pairing_active(h)) { result(h, tag, cmd, LINK_ERR_BUSY, 0); return true; }
+        // after LINK_FORGET_IDENTITY the running identity is no longer the stored one: restart first
+        if (stored(h) && h->store->netaddr != h->netaddr) { result(h, tag, cmd, LINK_ERR_STATE, 0); return true; }
         h->plat->radio_halt(h->plat);
         drop_all(h, LINK_REASON_HOST_RESTART);  // beacons pause while pairing owns the radio
         h->pair_flags = c.flags;

@@ -21,7 +21,8 @@
 #define HOST_LOST_US 250000   // a connected slot with no uplink this long is LOST
 #define HOST_DL_RETRY_PERIODS 3
 #define HOST_DL_MAX_TRIES 60
-#define HOST_CTR_WINDOW 32    // uplink counters tried past the expected one (lost uplinks)
+#define HOST_CTR_NEAR 4       // steady counters tried from the next expected one on
+#define HOST_CTR_BACK 4       // ... and back from where elapsed beacon periods put it (lost uplinks)
 #define HOST_TX_LEAD_US 150   // a beacon is planned at least this long before it goes out
 #define HOST_REAL_DL_REPEATS 4 // real formats: no CL ack is known, so each downlink goes out this often
 
@@ -51,7 +52,8 @@ typedef struct {
     uint16_t input_seq, imu_seq;
     uint8_t last_ul_seq;
     bool steady;             // steady-state CCM: iv + per-slot counter (after the accept was queued)
-    uint8_t dir;             // CCM direction bit this controller uses (learned from its request)
+    uint64_t ctr_period;     // beacon period of the last steady-nonce uplink (or of the accept)
+    uint32_t probe;          // sweeps the counters between "next" and "elapsed periods" after losses
     uint8_t iv[8];
     uint32_t ctr;            // next expected uplink counter
     host_dl_t dlq[HOST_DLQ];
@@ -80,6 +82,7 @@ typedef struct {
     uint32_t netaddr;
     uint8_t key[16];
     uint16_t session_nonce;
+    uint8_t ccm_dir;  // CCM direction bit the controllers use (AUDIT A17: 0); learned from requests
     uint64_t chmap;
     int8_t tx_power;
 

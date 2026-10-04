@@ -158,23 +158,24 @@ static bool link_room(size_t n) {
 }
 
 // Queue one frame for the PC on every open interface (CDC with DTR set, HID while open). False
-// (frame dropped) if none could take the whole frame: a partial frame would corrupt the stream.
+// (counted as dropped) if no interface is open, or an open one could not take the whole frame (a
+// partial frame would corrupt the stream); the others still get it.
 static bool send_frame(uint8_t type, const void* body, size_t len, const void* tail, size_t tail_len) {
     if (1 + len + tail_len > sizeof tx_raw) return false;
     tx_raw[0] = type;
     memcpy(tx_raw + 1, body, len);
     if (tail_len) memcpy(tx_raw + 1 + len, tail, tail_len);
     size_t n = cobs_encode(tx_raw, 1 + len + tail_len, tx_enc);
-    bool sent = false;
-    if (tud_cdc_connected() && tud_cdc_write_available() >= n) {
-        tud_cdc_write(tx_enc, n);
-        sent = true;
+    bool sent = false, lost = false;
+    if (tud_cdc_connected()) {
+        if (tud_cdc_write_available() >= n) tud_cdc_write(tx_enc, n), sent = true;
+        else lost = true;
     }
-    if (hid_is_open() && hid_free() >= n) {
-        hid_put(tx_enc, n);
-        sent = true;
+    if (hid_is_open()) {
+        if (hid_free() >= n) hid_put(tx_enc, n), sent = true;
+        else lost = true;
     }
-    return sent;
+    return sent && !lost;
 }
 
 static void send_text(const char* s) { send_frame(EVT_TEXT, s, strlen(s), NULL, 0); }

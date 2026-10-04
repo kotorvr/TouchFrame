@@ -331,7 +331,8 @@ enum link_hand { LINK_HAND_UNKNOWN = 0, LINK_HAND_LEFT = 1, LINK_HAND_RIGHT = 2 
 // CMD_PAIR_FORGET: remove one stored pairing (device_id), or all (LINK_FORGET_ALL). A forgotten
 // controller that is connected or allowed in a slot is disconnected (EVT_CONN). LINK_FORGET_IDENTITY
 // (implies ALL) also replaces the stored netaddr + key, so no controller paired before can connect
-// until it is paired again; it takes effect at the next CMD_HOST_START with LINK_HOST_STORED.
+// until it is paired again; it takes effect at the next CMD_HOST_START with LINK_HOST_STORED, and
+// until then CMD_PAIR_START answers LINK_ERR_STATE.
 enum { LINK_FORGET_ALL = 1u << 0, LINK_FORGET_IDENTITY = 1u << 1 };
 
 typedef struct __attribute__((packed)) {
@@ -359,7 +360,8 @@ typedef struct __attribute__((packed)) {
 
 // CMD_CONNECT: allow a paired controller into a slot. It connects when it next seeks (it does so
 // on its own after pairing and after every link loss). slot 0xFF = first free slot; the EVT_RESULT
-// detail byte carries the slot chosen.
+// detail byte carries the slot chosen. Slot 4 is not assigned (LINK_ERR_NO_SLOT) while its CL
+// endpoint would be 5 (src/pulsar_ll.h PULSAR_ENDPOINT_OFFSET; docs/re/LINK.md §4: endpoints 1..4).
 typedef struct __attribute__((packed)) {
     uint8_t tag;
     uint8_t slot;        // 0..4, or 0xFF
