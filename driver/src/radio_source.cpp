@@ -269,6 +269,7 @@ void RadioSource::Session(Transport* t) {
     dec_.Reset();
     sync_.Reset();
     pending_.clear();
+    parked_.clear();
     int64_t now = HostNowNs();
     last_pong_ns_ = last_status_ns_ = now;
     state_ = kHello;
@@ -323,6 +324,7 @@ void RadioSource::Session(Transport* t) {
         }
         ServiceHands(now);
     }
+    parked_.clear();
     for (int h = 0; h < 2; h++) {
         bool was;
         {
@@ -669,13 +671,19 @@ void RadioSource::OnResult(const ResultEvt& r) {
 }
 
 void RadioSource::MoveToReportedHands() {
-    // A connected controller now known to be the other hand moves there (unless that hand is
-    // taken: then it stays until it disconnects, and comes back on the right hand).
+    // A connected controller now known to be the other hand moves there, unless that hand's own
+    // controller is on it: then it stays until it disconnects, and comes back on the right hand.
+    // A controller that only borrowed that hand gives way (OnConn), so two controllers on each
+    // other's hand swap.
+    auto own_hand = [&](int hd) {
+        auto it = id_.hand.find(hands_[hd].device_id);
+        return it == id_.hand.end() ? -1 : it->second;
+    };
     for (int hd = 0; hd < 2; hd++) {
         if (!hands_[hd].connected) continue;
-        auto it = id_.hand.find(hands_[hd].device_id);
-        if (it == id_.hand.end() || it->second == hd) continue;
-        if (hands_[1 - hd].connected) {
+        int want = own_hand(hd);
+        if (want < 0 || want == hd) continue;
+        if (hands_[1 - hd].connected && own_hand(1 - hd) != hd) {
             Logf("radio: controller %016" PRIx64 " is a %s controller, but that hand is in use; keeping it %s for now",
                  hands_[hd].device_id, kHandName[1 - hd], kHandName[hd]);
             continue;
@@ -686,7 +694,7 @@ void RadioSource::MoveToReportedHands() {
         c.device_id = hands_[hd].device_id;
         Disconnected(hd, ("it is the " + std::string(kHandName[1 - hd]) + " controller").c_str());
         OnConn(c);
-        return;  // hands_ changed under the loop; one move covers it (two controllers swap one at a time)
+        return;  // hands_ changed under the loop; one move is enough (a swap completes inside OnConn)
     }
 }
 
@@ -775,22 +783,42 @@ void RadioSource::ConnectPaired() {
 
 void RadioSource::OnConn(const ConnEvt& c) {
     if (c.state == SLOT_CONNECTED) {
+        parked_.erase(c.slot);
         int hand = c.device_id ? HandForDevice(c.device_id) : HandOfSlot(c.slot);
         if (hand < 0) {
             Logf("radio: controller %016" PRIx64 " connected in slot %u but isn't one of ours", c.device_id, c.slot);
             return;
         }
         if (hands_[hand].connected && hands_[hand].device_id != c.device_id) {
-            // Two controllers for one hand (e.g. cmd 1 said otherwise than the pairing): the other
-            // hand if it is free, else wait for one to go.
-            if (hands_[1 - hand].connected) {
+            const uint64_t there = hands_[hand].device_id;
+            auto own = id_.hand.find(there);
+            if (own != id_.hand.end() && own->second != hand) {
+                // The controller there only borrowed this hand (below): it gives way, back to its
+                // own hand if that is free now, else it waits for a free hand.
+                ConnEvt back{};
+                back.slot = uint8_t(hands_[hand].slot);
+                back.state = SLOT_CONNECTED;
+                back.device_id = there;
+                Disconnected(hand, "it gives way to this hand's own controller");
+                if (hands_[1 - hand].connected) {
+                    Logf("radio: controller %016" PRIx64 " (slot %u) is a %s controller and both hands are in use; "
+                         "it waits for a free hand", there, back.slot, kHandName[1 - hand]);
+                    parked_[back.slot] = back;
+                } else {
+                    OnConn(back);
+                }
+            } else if (hands_[1 - hand].connected) {
+                // Two controllers for one hand (e.g. cmd 1 said otherwise than the pairing): the
+                // other hand if it is free, else wait for one to go.
                 Logf("radio: controller %016" PRIx64 " (slot %u) is a %s controller and both hands are in use; "
-                     "ignoring it", c.device_id, c.slot, kHandName[hand]);
+                     "it waits for a free hand", c.device_id, c.slot, kHandName[hand]);
+                parked_[c.slot] = c;
                 return;
+            } else {
+                Logf("radio: controller %016" PRIx64 " is a %s controller, but that hand is in use; using it as %s for now",
+                     c.device_id, kHandName[hand], kHandName[1 - hand]);
+                hand = 1 - hand;
             }
-            Logf("radio: controller %016" PRIx64 " is a %s controller, but that hand is in use; using it as %s for now",
-                 c.device_id, kHandName[hand], kHandName[1 - hand]);
-            hand = 1 - hand;
         }
         {
             std::lock_guard<std::mutex> lk(mu_);
@@ -822,9 +850,15 @@ void RadioSource::OnConn(const ConnEvt& c) {
         return;
     }
     // By slot: a controller may sit on the other hand than its own for now (above).
+    auto parked = parked_.find(c.slot);
+    if (parked != parked_.end() && (!c.device_id || parked->second.device_id == c.device_id)) parked_.erase(parked);
     int hand = HandOfSlot(c.slot);
     if (hand >= 0 && (!c.device_id || hands_[hand].device_id == c.device_id)) {
         Disconnected(hand, (std::string(SlotStateName(c.state)) + (c.reason ? std::string(", ") + ReasonName(c.reason) : "")).c_str());
+        if (!parked_.empty()) {  // a controller waiting for a free hand takes it
+            ConnEvt next = parked_.begin()->second;
+            OnConn(next);
+        }
         return;
     }
     Logf("radio: slot %u %s (controller %016" PRIx64 ")", c.slot, SlotStateName(c.state), c.device_id);

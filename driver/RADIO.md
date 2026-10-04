@@ -55,4 +55,14 @@ at P with sentinel probes. The sim in `driver/test/radio_unit_test.cpp` covers c
 `driver/test/run.sh` builds and runs everything on the PC: config parsing, `link_check_test`
 (this mirror against `radio-fw/src/link.h`), the unit tests (COBS/HID, time sync, decode, the
 LED loop against a camera model), RadioSource against `tools/fake_dongle.py` over raw and HID
-framing plus a dongle reboot, and RadioBackend in both modes. `QUICK=1` skips the fake-dongle runs.
+framing plus a dongle reboot, handedness (`hands`, `swap`: cmd 1 left/right/unconf, the second
+EVT_PAIR(DONE), two controllers claiming one hand, disconnects by slot, a third controller waiting
+for a free hand), the XRService log watcher, and RadioBackend in both modes. `QUICK=1` skips the
+fake-dongle runs.
+
+## Hands
+Each controller's hand comes from the controller itself (cmd 1, docs/re/REVIEW-RE.md R11), else
+from the pairing request, else the first free hand (right first). A controller whose hand is taken
+borrows the free one and gives it back when that hand's own controller connects; two controllers
+on each other's hand swap; a controller that finds both hands taken waits and takes the first hand
+that frees up.

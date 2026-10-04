@@ -73,6 +73,12 @@ serve hid --framing hid --drift-ppm -20
 ./$B/radio_fake_test tcphid:127.0.0.1:$PORT basic -20 $scratch/state_hid.json
 serve reboot --framing raw --reboot-at 4
 ./$B/radio_fake_test tcp:127.0.0.1:$PORT reboot 12.5 $scratch/state_reboot.json
+# Handedness (cmd 1), hand collisions, disconnects by slot; real formats, the flash store.
+serve hands --framing raw --hands left,right,right,unconf,unconf --stored 4 --control
+CPORT=$(sed -n 's/^control \([0-9]*\).*/\1/p' "$scratch/fake_hands.log" | head -1)
+./$B/radio_fake_test tcp:127.0.0.1:$PORT hands 12.5 $scratch/state_hands.json "$CPORT"
+serve swap --framing raw --hands left,right --stored 1,2
+./$B/radio_fake_test tcp:127.0.0.1:$PORT swap 12.5 $scratch/state_swap.json
 serve backend --framing raw
 ./$B/radio_backend_test $scratch tcp:127.0.0.1:$PORT $scratch/state_backend.json
 echo "driver host tests passed"
