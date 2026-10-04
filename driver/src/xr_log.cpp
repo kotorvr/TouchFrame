@@ -113,7 +113,7 @@ void XrLogWatcher::Open(const std::string& path, bool from_start) {
     tracker_hand_.clear();
     // Old lines (a log that was there before we looked): only the tracker mapping counts, the
     // stamps and hits are stale. Read in Poll's chunks: the log can be hundreds of MB.
-    catching_up_ = !from_start;
+    catching_up_ = f_ && !from_start;
     if (f_ && cb_.log) cb_.log("xrlog: reading " + path + (from_start ? "" : " (mapping trackers from what is there)"));
 }
 

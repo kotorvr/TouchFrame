@@ -456,6 +456,8 @@ void RadioSource::HandleFrame(const uint8_t* f, size_t n, int64_t now) {
                         ConnEvt c{};
                         c.slot = uint8_t(s);
                         c.state = SLOT_CONNECTED;
+                        c.rssi = int8_t(st[1]);
+                        memcpy(&c.pulsar_version, st + 2, 2);
                         memcpy(&c.device_id, st + 4, 8);
                         OnConn(c);
                     }
@@ -688,10 +690,7 @@ void RadioSource::MoveToReportedHands() {
                  hands_[hd].device_id, kHandName[1 - hd], kHandName[hd]);
             continue;
         }
-        ConnEvt c{};
-        c.slot = uint8_t(hands_[hd].slot);
-        c.state = SLOT_CONNECTED;
-        c.device_id = hands_[hd].device_id;
+        ConnEvt c = hands_[hd].conn;
         Disconnected(hd, ("it is the " + std::string(kHandName[1 - hd]) + " controller").c_str());
         OnConn(c);
         return;  // hands_ changed under the loop; one move is enough (a swap completes inside OnConn)
@@ -792,17 +791,15 @@ void RadioSource::OnConn(const ConnEvt& c) {
         if (hands_[hand].connected && hands_[hand].device_id != c.device_id) {
             const uint64_t there = hands_[hand].device_id;
             auto own = id_.hand.find(there);
-            if (own != id_.hand.end() && own->second != hand) {
-                // The controller there only borrowed this hand (below): it gives way, back to its
-                // own hand if that is free now, else it waits for a free hand.
-                ConnEvt back{};
-                back.slot = uint8_t(hands_[hand].slot);
-                back.state = SLOT_CONNECTED;
-                back.device_id = there;
+            if (own == id_.hand.end() || own->second != hand) {
+                // The controller there only borrowed this hand (below), or was just replaced (its
+                // FREE is on the way): it gives way, back to its own hand if that is free now, else
+                // it waits for a free hand.
+                ConnEvt back = hands_[hand].conn;
                 Disconnected(hand, "it gives way to this hand's own controller");
                 if (hands_[1 - hand].connected) {
-                    Logf("radio: controller %016" PRIx64 " (slot %u) is a %s controller and both hands are in use; "
-                         "it waits for a free hand", there, back.slot, kHandName[1 - hand]);
+                    Logf("radio: controller %016" PRIx64 " (slot %u): both hands are in use; it waits for a free hand",
+                         there, back.slot);
                     parked_[back.slot] = back;
                 } else {
                     OnConn(back);
@@ -826,6 +823,7 @@ void RadioSource::OnConn(const ConnEvt& c) {
             h.connected = true;
             h.slot = c.slot;
             h.device_id = c.device_id;
+            h.conn = c;
             h.have_seq_input = h.have_seq_imu = false;
             h.scale = ImuScale();
             h.scale_from_controller = false;

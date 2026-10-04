@@ -84,7 +84,9 @@ class Control:
                     return "err not connected"
                 fake.drop_slot(s)
                 return f"ok {s}"
-            if words[0] == "hand" and ctrl:
+            if words[0] == "hand":
+                if not ctrl:
+                    return "err no such controller"
                 ctrl.set_hand(words[2])
                 return "ok"
         except (IndexError, ValueError) as e:

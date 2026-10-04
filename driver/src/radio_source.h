@@ -128,6 +128,7 @@ private:
         ImuScale scale;
         bool scale_from_controller = false;
         int scale_reads = 0;
+        ConnEvt conn{};  // the event it connected with (radio thread): re-placed on a move
         Rectifier rect;
         HapticScheduler haptic;
         std::unique_ptr<LedPhaseLoop> led;
