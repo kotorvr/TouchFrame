@@ -1,5 +1,6 @@
-// TouchFrame radio dongle (nRF52840 Dongle, PCA10059) over USB CDC: a raw-radio sniffer, a Pulsar
-// host for Touch Plus controllers, or (loopback rig) a fake controller. Wire format: link.h.
+// TouchFrame radio dongle (nRF52840 Dongle, PCA10059) over USB (CDC-ACM and HID, same stream): a
+// raw-radio sniffer, a Pulsar host for Touch Plus controllers, or (loopback rig) a fake controller.
+// Wire format: link.h.
 #include <stddef.h>
 #include <stdio.h>
 #include <string.h>
@@ -13,6 +14,7 @@
 #include "nrf.h"
 #include "radio_engine.h"
 #include "sniffer.h"
+#include "store.h"
 #include "tusb.h"
 
 #ifndef BUILD_ID
@@ -37,7 +39,21 @@ static void led(uint32_t pin, bool on) {
 
 extern void tusb_hal_nrf_power_event(uint32_t event);  // 0 detected, 1 removed, 2 ready
 
-void USBD_IRQHandler(void) { tud_int_handler(0); }
+// USB start-of-frame, stamped here (TinyUSB's own SOF callback runs later, in tud_task)
+static volatile uint64_t sof_us;
+static volatile uint32_t sof_count;
+static volatile uint16_t sof_frame;
+
+void USBD_IRQHandler(void) {
+    if (NRF_USBD->EVENTS_SOF) {
+        sof_us = clock_now64();
+        sof_frame = (uint16_t)NRF_USBD->FRAMECNTR;
+        sof_count++;
+    }
+    tud_int_handler(0);
+}
+
+void tud_sof_cb(uint32_t frame_count) { (void)frame_count; }
 
 void POWER_CLOCK_IRQHandler(void) {
     if (NRF_POWER->EVENTS_USBDETECTED) {
@@ -89,20 +105,76 @@ static size_t cobs_encode(const uint8_t* in, size_t len, uint8_t* out) {
     return o;
 }
 
+//------------------------------------------------------------------ HID transport (link.h "Framing")
+// The stream goes out in 64-byte IN reports [n][n bytes][pad] from a ring; OUT reports carry the
+// PC's stream the same way. "Open" = an OUT report within LINK_HID_OPEN_MS; when that lapses the
+// ring is dropped, so a reader that comes back starts on fresh events.
+
+#define HID_RING 8192  // power of two
+static uint8_t hid_ring[HID_RING];
+static uint32_t hid_head, hid_tail;  // main loop only (tud_task callbacks included)
+static uint32_t hid_out_ms;
+static bool hid_seen;
+
+static bool hid_is_open(void) { return hid_seen && tud_mounted() && ms_ticks - hid_out_ms < LINK_HID_OPEN_MS; }
+static uint32_t hid_used(void) { return (hid_head - hid_tail) & (HID_RING - 1); }
+static uint32_t hid_free(void) { return HID_RING - 1 - hid_used(); }
+
+static void hid_put(const uint8_t* p, size_t n) {
+    for (size_t i = 0; i < n; i++) {
+        hid_ring[hid_head] = p[i];
+        hid_head = (hid_head + 1) & (HID_RING - 1);
+    }
+}
+
+static void hid_pump(void) {
+    if (!hid_seen) return;
+    if (!hid_is_open()) {  // the reader went away: drop what it did not take
+        hid_tail = hid_head;
+        hid_seen = false;
+        return;
+    }
+    if (!hid_used() || !tud_hid_ready()) return;
+    uint8_t rep[64] = {0};
+    uint32_t n = hid_used() < 63 ? hid_used() : 63;
+    rep[0] = (uint8_t)n;
+    for (uint32_t i = 0; i < n; i++) rep[1 + i] = hid_ring[(hid_tail + i) & (HID_RING - 1)];
+    if (tud_hid_report(0, rep, sizeof rep)) hid_tail = (hid_tail + n) & (HID_RING - 1);
+}
+
+void tud_hid_report_complete_cb(uint8_t instance, const uint8_t* report, uint16_t len) {
+    (void)instance, (void)report, (void)len;
+    hid_pump();
+}
+
+//------------------------------------------------------------------ frames out
+
 // worst case for a 300-byte frame: 300 + 2 overhead + 1 delimiter
 static uint8_t tx_raw[LINK_MAX_FRAME + 20], tx_enc[LINK_MAX_FRAME + 30];
 
-// Queue one frame for the PC. False (frame dropped) while the port is closed or the CDC buffer
-// cannot take the whole frame: a partial frame would corrupt the stream.
+// Room for an encoded frame of n bytes on some open interface.
+static bool link_room(size_t n) {
+    return (tud_cdc_connected() && tud_cdc_write_available() >= n) || (hid_is_open() && hid_free() >= n);
+}
+
+// Queue one frame for the PC on every open interface (CDC with DTR set, HID while open). False
+// (frame dropped) if none could take the whole frame: a partial frame would corrupt the stream.
 static bool send_frame(uint8_t type, const void* body, size_t len, const void* tail, size_t tail_len) {
-    if (1 + len + tail_len > sizeof tx_raw || !tud_cdc_connected()) return false;
+    if (1 + len + tail_len > sizeof tx_raw) return false;
     tx_raw[0] = type;
     memcpy(tx_raw + 1, body, len);
     if (tail_len) memcpy(tx_raw + 1 + len, tail, tail_len);
     size_t n = cobs_encode(tx_raw, 1 + len + tail_len, tx_enc);
-    if (tud_cdc_write_available() < n) return false;
-    tud_cdc_write(tx_enc, n);
-    return true;
+    bool sent = false;
+    if (tud_cdc_connected() && tud_cdc_write_available() >= n) {
+        tud_cdc_write(tx_enc, n);
+        sent = true;
+    }
+    if (hid_is_open() && hid_free() >= n) {
+        hid_put(tx_enc, n);
+        sent = true;
+    }
+    return sent;
 }
 
 static void send_text(const char* s) { send_frame(EVT_TEXT, s, strlen(s), NULL, 0); }
@@ -176,6 +248,42 @@ static void send_status(void) {
 
 //------------------------------------------------------------------ modes
 
+//------------------------------------------------------------------ flash store (host identity + pairings)
+// Two pages at the top of the application area, below the bootloader at 0xE0000. The PCA10059 open
+// bootloader leaves the top NRF_DFU_APP_DATA_AREA_SIZE bytes of the app area (3 pages, the SDK
+// default; INFERRED for this bootloader build, check that pairings survive a DFU) out of updates;
+// pca10059.ld ends the firmware below them.
+#define STORE_PAGE0 0xDE000u
+#define STORE_PAGE1 0xDF000u
+#define STORE_SLICE_MS 1      // partial erase slice (ERASEPAGEPARTIALCFG)
+#define STORE_SLICES 90       // tERASEPAGE is 85 ms max
+#define STORE_STEP_MS 20      // at most one slice (1 ms CPU stall) per 20 ms: no two missed beacons in a row
+
+static store_t store;
+
+static void nvmc_ready(void) {
+    while (!NRF_NVMC->READY) {}
+}
+static void f_write(void* u, uint32_t* a, uint32_t v) {
+    (void)u;
+    NRF_NVMC->CONFIG = NVMC_CONFIG_WEN_Wen;
+    *(volatile uint32_t*)a = v;  // ~41 us; interrupts run between words
+    nvmc_ready();
+    NRF_NVMC->CONFIG = NVMC_CONFIG_WEN_Ren;
+}
+static void f_erase_slice(void* u, uint32_t* page) {
+    (void)u;
+    NRF_NVMC->CONFIG = NVMC_CONFIG_WEN_Een;
+    NRF_NVMC->ERASEPAGEPARTIALCFG = STORE_SLICE_MS;
+    NRF_NVMC->ERASEPAGEPARTIAL = (uint32_t)page;
+    nvmc_ready();
+    NRF_NVMC->CONFIG = NVMC_CONFIG_WEN_Ren;
+}
+static const store_flash_t store_flash = {{(uint32_t*)STORE_PAGE0, (uint32_t*)STORE_PAGE1}, NULL, f_write,
+                                          f_erase_slice, STORE_SLICES};
+
+//------------------------------------------------------------------ modes
+
 static uint8_t mode = LINK_MODE_IDLE;
 static host_t host;
 static ctrl_t ctrl;
@@ -243,7 +351,8 @@ static void send_hello(uint8_t tag) {
     memset(&h, 0, sizeof h);
     h.version = LINK_VERSION;
     h.mode = mode;
-    h.caps = LINK_CAP_SNIFFER | LINK_CAP_HOST | LINK_CAP_FAKE_CTRL | LINK_CAP_PLACEHOLDER | LINK_CAP_REAL_PAIRING;
+    h.caps = LINK_CAP_SNIFFER | LINK_CAP_HOST | LINK_CAP_FAKE_CTRL | LINK_CAP_PLACEHOLDER | LINK_CAP_HID |
+             LINK_CAP_REAL_PAIRING | (store.ok ? LINK_CAP_STORE : 0);
     h.build = BUILD_ID;
     h.dongle_id = hal_device_id();
     h.now_us = clock_now64();
@@ -267,6 +376,7 @@ static void time_ping(const uint8_t* body, size_t len) {
     r.dongle_tx_us = clock_now64();
     send_frame(EVT_TIME, &r, sizeof r, NULL, 0);
     tud_cdc_write_flush();
+    hid_pump();
 }
 
 //------------------------------------------------------------------ self-test (hardware day, no controller needed)
@@ -405,6 +515,7 @@ static void handle_command(const uint8_t* f, size_t len) {
         if (mode != LINK_MODE_HOST) {
             stop_all();
             host_init(&host, &plat);
+            host.store = &store;
             engine_attach(&host_engine);
         }
         if (body_len == sizeof(link_host_start_t)) engine_set_tx_power(((const link_host_start_t*)body)->tx_power_dbm);
@@ -424,6 +535,10 @@ static void handle_command(const uint8_t* f, size_t len) {
             mode = LINK_MODE_IDLE;
         }
         break;
+    case CMD_PAIR_LIST:
+    case CMD_PAIR_FORGET:  // the flash store: any mode
+        host_command(&host, f[0], body, (uint32_t)body_len);
+        break;
     default:
         if (f[0] >= CMD_HOST_STATUS && f[0] <= CMD_HAPTIC) {
             if (mode != LINK_MODE_HOST) result(tag, f[0], LINK_ERR_STATE, 0);
@@ -436,34 +551,57 @@ static void handle_command(const uint8_t* f, size_t len) {
     }
 }
 
-// COBS decoder fed byte by byte from the CDC RX stream
-static uint8_t rx_buf[LINK_MAX_FRAME + 8];
-static size_t rx_len;
-static bool rx_overflow;
+// COBS decoders fed byte by byte, one per interface (frames must not interleave)
+typedef struct {
+    uint8_t buf[LINK_MAX_FRAME + 8];
+    size_t len;
+    bool overflow;
+} rx_t;
 
-static void rx_byte(uint8_t b) {
+static rx_t cdc_rx, hid_rx;
+
+static void rx_byte(rx_t* r, uint8_t b) {
     if (b) {
-        if (rx_len < sizeof(rx_buf)) rx_buf[rx_len++] = b;
-        else rx_overflow = true;
+        if (r->len < sizeof(r->buf)) r->buf[r->len++] = b;
+        else r->overflow = true;
         return;
     }
-    if (!rx_overflow && rx_len) {
-        static uint8_t dec[sizeof(rx_buf)];
+    if (!r->overflow && r->len) {
+        static uint8_t dec[sizeof(r->buf)];
         size_t i = 0, o = 0;
         bool ok = true;
-        while (i < rx_len) {
-            uint8_t code = rx_buf[i++];
-            if (i + code - 1 > rx_len) {
+        while (i < r->len) {
+            uint8_t code = r->buf[i++];
+            if (i + code - 1 > r->len) {
                 ok = false;
                 break;
             }
-            for (uint8_t k = 1; k < code; k++) dec[o++] = rx_buf[i++];
-            if (code != 0xFF && i < rx_len) dec[o++] = 0;
+            for (uint8_t k = 1; k < code; k++) dec[o++] = r->buf[i++];
+            if (code != 0xFF && i < r->len) dec[o++] = 0;
         }
         if (ok) handle_command(dec, o);
     }
-    rx_len = 0;
-    rx_overflow = false;
+    r->len = 0;
+    r->overflow = false;
+}
+
+//------------------------------------------------------------------ HID callbacks (tud_task context)
+
+uint16_t tud_hid_get_report_cb(uint8_t instance, uint8_t report_id, hid_report_type_t type, uint8_t* buf,
+                               uint16_t reqlen) {
+    (void)instance, (void)report_id, (void)type, (void)buf, (void)reqlen;
+    return 0;  // no GET_REPORT: the stream is on the interrupt endpoints
+}
+
+void tud_hid_set_report_cb(uint8_t instance, uint8_t report_id, hid_report_type_t type, const uint8_t* buf,
+                           uint16_t len) {
+    (void)instance, (void)report_id;
+    if (type != HID_REPORT_TYPE_OUTPUT && type != HID_REPORT_TYPE_INVALID) return;
+    if (!len || buf[0] > 63 || buf[0] + 1u > len) return;
+    hid_out_ms = ms_ticks;
+    hid_seen = true;
+    rx_stamp_us = clock_now64();
+    for (uint8_t i = 0; i < buf[0]; i++) rx_byte(&hid_rx, buf[1 + i]);
 }
 
 //------------------------------------------------------------------ main
@@ -482,9 +620,13 @@ int main(void) {
     sniffer_init();
     engine_init();
     plat = (platform_t){p_now, p_random, p_ccm, p_emit, p_kick, p_halt, hal_device_id(), 0, 0, NULL};
+    store_init(&store, &store_flash);  // may erase a page synchronously: before the radio and USB start
     host_init(&host, &plat);
+    host.store = &store;
     ctrl_init(&ctrl, &plat);
     usb_init();
+    tud_sof_cb_enable(true);
+    uint32_t store_ms = 0, sof_ms = 0, sof_seen = 0;
 
     static sniffer_packet_t pkt;
     for (;;) {
@@ -495,7 +637,20 @@ int main(void) {
             uint8_t buf[64];
             uint32_t n = tud_cdc_read(buf, sizeof(buf));
             rx_stamp_us = clock_now64();
-            for (uint32_t i = 0; i < n; i++) rx_byte(buf[i]);
+            for (uint32_t i = 0; i < n; i++) rx_byte(&cdc_rx, buf[i]);
+        }
+        if (store_busy(&store) && ms_ticks - store_ms >= STORE_STEP_MS) {
+            store_step(&store);
+            store_ms = ms_ticks;
+        }
+        if (ms_ticks - sof_ms >= 1000 && sof_count != sof_seen) {
+            link_sof_t s;
+            __disable_irq();
+            s = (link_sof_t){sof_frame, 0, sof_count, sof_us};
+            __enable_irq();
+            send_frame(EVT_SOF, &s, sizeof s, NULL, 0);
+            sof_seen = s.sof_count;
+            sof_ms = ms_ticks;
         }
 
         if (!(NRF_CLOCK->HFCLKSTAT & CLOCK_HFCLKSTAT_SRC_Msk)) NRF_CLOCK->TASKS_HFCLKSTART = 1;  // USB suspend stops it
@@ -507,8 +662,8 @@ int main(void) {
             sniffer_poll();
             // Forward packets while the PC has the port open; otherwise let the ring fill
             // (overflow shows up as `dropped`).
-            if (tud_cdc_connected()) {
-                while (tud_cdc_write_available() >= sizeof(tx_enc) && sniffer_pop(&pkt)) {
+            if (link_room(sizeof tx_enc)) {
+                while (link_room(sizeof tx_enc) && sniffer_pop(&pkt)) {
                     link_packet_t h = {pkt.timestamp_us, pkt.frequency, pkt.rssi, pkt.crc_ok, pkt.rxmatch,
                                        pkt.length};
                     p_emit(&plat, EVT_PACKET, &h, sizeof(h), pkt.data, pkt.length);
@@ -525,5 +680,6 @@ int main(void) {
             break;
         }
         tud_cdc_write_flush();
+        hid_pump();
     }
 }
