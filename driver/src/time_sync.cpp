@@ -77,22 +77,28 @@ void TimeSync::Fit() {
         // bound clouds) beats least squares.
         b = MaxMarginSlope(1 - m, 1 + m);
     } else if (win_.size() >= 3 && win_.back().rx_us - d0 > 2e6) {
-        // Short span: least squares of the ping midpoints (each good to ~±RTT/2, independent
-        // errors); a max-margin slope locks onto 2-3 extreme pings while there are few of them.
-        // But only a slope every ping's bounds allow: with asymmetric delays (a busy host, TCP)
-        // least squares can be off by 100+ ppm, and then the max-margin slope is the honest one.
-        double n = 0, mx = 0, my = 0;
-        for (const Sample& s : win_) mx += (s.rx_us + s.tx_us) / 2 - d0, my += (s.send_us + s.recv_us) / 2, n++;
-        mx /= n, my /= n;
-        double sxx = 0, sxy = 0;
-        for (const Sample& s : win_) {
-            double x = (s.rx_us + s.tx_us) / 2 - d0 - mx, y = (s.send_us + s.recv_us) / 2 - my;
-            sxx += x * x, sxy += x * y;
+        // Short span: ms of USB/host jitter over a few seconds allows slopes hundreds of ppm
+        // apart, and neither least squares nor the max-margin slope is better than noise there.
+        // Crystals are near nominal, so take the slope every ping's bounds allow that is closest
+        // to 0 ppm (the feasible slopes form an interval: gap(b) is concave).
+        double best = MaxMarginSlope(1 - m, 1 + m), lo, hi;
+        Band(best, &lo, &hi);
+        if (hi < lo) {
+            b = best;  // nothing is consistent (an outlier): the least inconsistent slope
+        } else {
+            Band(1.0, &lo, &hi);
+            if (hi >= lo) {
+                b = 1.0;
+            } else {  // bisect between 1 (infeasible) and best (feasible) for the boundary
+                double x0 = 1.0, x1 = best;
+                for (int it = 0; it < 60; it++) {
+                    double mid = (x0 + x1) / 2;
+                    Band(mid, &lo, &hi);
+                    (hi >= lo ? x1 : x0) = mid;
+                }
+                b = x1;
+            }
         }
-        double ls = sxx > 0 ? sxy / sxx : b_, lo, hi;
-        Band(ls, &lo, &hi);
-        if (std::fabs(ls - 1.0) <= m && hi >= lo) b = ls;
-        else b = MaxMarginSlope(1 - m, 1 + m);
     }
     // The intercept from recent pings only: a small slope error then tilts it by little.
     double lo, hi;

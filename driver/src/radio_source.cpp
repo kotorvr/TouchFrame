@@ -420,25 +420,7 @@ void RadioSource::HandleFrame(const uint8_t* f, size_t n, int64_t now) {
             if (changed) SaveIdentity();
             Logf("radio: dongle flash: netaddr 0x%08x, %u pairing(s), %u writes left", ps.netaddr, ps.count,
                  ps.writes_left);
-            // A connected controller the dongle now places on the other hand moves there (unless
-            // that hand is taken: then the identity file's choice stands until it disconnects).
-            for (int hd = 0; hd < 2; hd++) {
-                if (!hands_[hd].connected) continue;
-                auto it = id_.hand.find(hands_[hd].device_id);
-                if (it == id_.hand.end() || it->second == hd) continue;
-                if (hands_[1 - hd].connected) {
-                    Logf("radio: controller %016" PRIx64 " reports %s hand, but that hand is in use; keeping it %s",
-                         hands_[hd].device_id, kHandName[1 - hd], kHandName[hd]);
-                    continue;
-                }
-                ConnEvt c{};
-                c.slot = uint8_t(hands_[hd].slot);
-                c.state = SLOT_CONNECTED;
-                c.device_id = hands_[hd].device_id;
-                Disconnected(hd, ("the controller reports the " + std::string(kHandName[1 - hd]) + " hand").c_str());
-                OnConn(c);
-                break;  // one move per listing; hands_ changed under the loop
-            }
+            MoveToReportedHands();
             if (state_ == kListing) StartHost(now);
             return;
         }
@@ -546,9 +528,29 @@ void RadioSource::HandleFrame(const uint8_t* f, size_t n, int64_t now) {
         case EVT_REG: {
             RegEvt r;
             if (!Body(b, bn, &r) || bn < sizeof(RegEvt) + r.len) return;
-            if (r.reg != kRegImuConfig || r.kind != REG_READ) return;
+            if (r.kind != REG_READ) return;
             int hand = HandOfSlot(r.slot);
             if (hand < 0) return;
+            if (r.reg == kRegDeviceDesc) {
+                // Handedness from the controller itself (REVIEW-RE R11); "unconf" keeps our choice.
+                std::string s;
+                if (r.status == LINK_OK && r.len >= kDeviceDescLen) {
+                    const char* p = reinterpret_cast<const char*>(b + sizeof(RegEvt) + 16);
+                    s.assign(p, strnlen(p, 8));
+                }
+                int said = s == "left" ? 0 : s == "right" ? 1 : -1;
+                uint64_t dev = hands_[hand].device_id;
+                Logf("radio: %s controller %016" PRIx64 " says it is %s", kHandName[hand], dev,
+                     r.status != LINK_OK ? ("unknown (" + std::string(StatusName(r.status)) + ")").c_str()
+                     : s.empty() ? "unknown" : s.c_str());
+                if (said >= 0 && said != hand) {
+                    id_.hand[dev] = said;
+                    SaveIdentity();
+                    MoveToReportedHands();
+                }
+                return;
+            }
+            if (r.reg != kRegImuConfig) return;
             ImuScale s;
             std::lock_guard<std::mutex> lk(mu_);
             if (r.status == LINK_OK && ParseImuConfig(b + sizeof(RegEvt), r.len, &s)) {
@@ -649,6 +651,28 @@ void RadioSource::OnResult(const ResultEvt& r) {
             return;
         default:
             return;
+    }
+}
+
+void RadioSource::MoveToReportedHands() {
+    // A connected controller now known to be the other hand moves there (unless that hand is
+    // taken: then it stays until it disconnects, and comes back on the right hand).
+    for (int hd = 0; hd < 2; hd++) {
+        if (!hands_[hd].connected) continue;
+        auto it = id_.hand.find(hands_[hd].device_id);
+        if (it == id_.hand.end() || it->second == hd) continue;
+        if (hands_[1 - hd].connected) {
+            Logf("radio: controller %016" PRIx64 " is a %s controller, but that hand is in use; keeping it %s for now",
+                 hands_[hd].device_id, kHandName[1 - hd], kHandName[hd]);
+            continue;
+        }
+        ConnEvt c{};
+        c.slot = uint8_t(hands_[hd].slot);
+        c.state = SLOT_CONNECTED;
+        c.device_id = hands_[hd].device_id;
+        Disconnected(hd, ("it is the " + std::string(kHandName[1 - hd]) + " controller").c_str());
+        OnConn(c);
+        return;  // hands_ changed under the loop; one move covers it (two controllers swap one at a time)
     }
 }
 
@@ -760,6 +784,10 @@ void RadioSource::OnConn(const ConnEvt& c) {
         rc.slot = c.slot;
         rc.reg = kRegImuConfig;
         rc.len = 16;
+        Send(CMD_REG_READ, &rc, sizeof(rc));
+        rc.tag = Tag(Pending{CMD_REG_READ, hand, 0, kRegDeviceDesc});
+        rc.reg = kRegDeviceDesc;
+        rc.len = kDeviceDescLen;
         Send(CMD_REG_READ, &rc, sizeof(rc));
         // The dongle learns the controller's hand from cmd 1 after connecting (REVIEW-RE R11):
         // read the pairings again once it has, so the hand can be corrected.

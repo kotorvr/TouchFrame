@@ -106,6 +106,10 @@ enum { SAMPLE_PLACEHOLDER = 1u << 0, SAMPLE_ARRIVAL_TIME = 1u << 1, SAMPLE_SCALE
 
 // Controller command register 0x32 imu_config (docs/re/PERIPHERALS.md §3.2).
 constexpr uint8_t kRegImuConfig = 0x32;
+// Controller command register 1, device_desc: bytes 16..23 = handedness, NUL-terminated "left",
+// "right" or "unconf" (docs/re/REVIEW-RE.md R11).
+constexpr uint8_t kRegDeviceDesc = 0x01;
+constexpr uint8_t kDeviceDescLen = 24;
 
 #pragma pack(push, 1)
 struct ResultEvt { uint8_t tag, cmd, status, detail; };

@@ -4,8 +4,9 @@
 // Every ping bounds the mapping from both sides: the dongle received it after the host sent it
 // (host(rx) ≥ send) and replied before the host got the reply (host(tx) ≤ recv). USB full speed
 // polls every 1 ms, so one ping's bounds are ~1 ms apart. The fit:
-//   * slope b (crystal drift, ±20 ppm) over the last 60 s: least squares of the ping midpoints
-//     while the span is short, then the maximum-margin slope (widest band between the clouds);
+//   * slope b (crystal drift, ±20 ppm) over the last 60 s: while the span is short (< 20 s), the
+//     slope closest to 0 ppm that every ping's bounds allow (jitter makes any short-span estimate
+//     noise); then the maximum-margin slope (widest band between the clouds);
 //   * intercept: the middle of the band left between the two bound clouds over the last 15 s at
 //     that slope. That uses the fastest ping in each direction rather than the fastest round
 //     trip, and slow pings drop out by construction.

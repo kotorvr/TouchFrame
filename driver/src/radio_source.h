@@ -156,6 +156,8 @@ private:
     void Send(uint8_t cmd, const void* body, size_t n, const void* tail = nullptr, size_t tail_n = 0);
     uint8_t Tag(const Pending& p);
     int HandOfSlot(int slot) const;
+    // Moves a connected controller whose identity-file hand changed (the controller said so).
+    void MoveToReportedHands();
     int HandForDevice(uint64_t device_id);
     void Disconnected(int hand, const char* why);
     void LoadIdentity();

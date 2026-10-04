@@ -113,13 +113,17 @@ static void TestTimeSync() {
         DongleClock dc{3.7e9, ppm};
         TimeSync ts;
         double host0 = 5e9;  // µs, arbitrary host clock origin
-        double worst = 0;
+        double worst = 0, worst_short = 0;
         for (int i = 0; i < 400; i++) {  // 40 s at 10 Hz
             double send = host0 + i * 1e5;
             double rx = send + usb(rng);
             double tx = rx + 30;
             double recv = tx + usb(rng);
             ts.AddPing(int64_t(send * 1000), int64_t(recv * 1000), dc.at(rx), dc.at(tx));
+            if (i >= 30 && i < 200) {  // 3..20 s: the short-span slope; IMU stamps need ≲ 1 ms
+                double t = send + 50000;
+                worst_short = std::max(worst_short, std::fabs(ts.ToHostNs(dc.at(t)) / 1000.0 - t));
+            }
             if (i > 250) {  // the LED loop waits for a 20 s span; IMU stamps tolerate more
                 double t = send + 50000;
                 double err = ts.ToHostNs(dc.at(t)) / 1000.0 - t;
@@ -130,9 +134,11 @@ static void TestTimeSync() {
             }
         }
         CHECKF(worst < 40, "ppm %.0f: worst mapping error %.1f us", ppm, worst);
+        CHECKF(worst_short < 600, "ppm %.0f: worst mapping error %.1f us before the 20 s span", ppm, worst_short);
         CHECKF(std::fabs(ts.DriftPpm() - ppm) < 1.5, "drift %.2f ppm vs %.0f", ts.DriftPpm(), ppm);
-        printf("ok   timesync %+5.0f ppm: worst %.1f us, drift est %+.2f ppm, best rtt %.0f us, band %.1f us\n",
-               ppm, worst, ts.DriftPpm(), ts.best_rtt_us(), ts.uncertainty_us());
+        printf("ok   timesync %+5.0f ppm: worst %.1f us (%.0f us in 3..20 s), drift est %+.2f ppm, best rtt %.0f us, "
+               "band %.1f us\n",
+               ppm, worst, worst_short, ts.DriftPpm(), ts.best_rtt_us(), ts.uncertainty_us());
     }
     // Dongle reboot: its clock restarts near 0. The filter must start over, not average it in.
     TimeSync ts;
