@@ -17,6 +17,20 @@ and the framing builders are in `tools/pulsar_host.py` (run `python tools/pulsar
 
 ---
 
+
+> **Planner note (2026-10-04): [REVIEW-RE.md](REVIEW-RE.md) corrects this report and takes
+> precedence.**
+> - R0: the TL header is pinned.
+> - R1: the accept slot `[11]` is 1..4.
+> - R2: accept endpoint 3 = reject, so send one accept.
+> - R3: accept `[12]` = IV flag and `[13]` = slot count, not the version.
+> - R4: beacon bit = `1<<S` with TX prefix S+1, no offset.
+> - R5: SPL reply `[LEN][status][seq][data]`.
+> - R6: Reset `0x2a` after PairingData.
+> - R7: the steady counter advances per beacon period.
+> - R8: direction 0.
+> - R10: seek on channel indices 0/17/36.
+
 ## 0. Executive summary — what blocks host mode
 
 | Item | State |

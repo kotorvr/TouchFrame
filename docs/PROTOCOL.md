@@ -12,6 +12,7 @@ prose, addresses, and small struct tables. Reproduce the analysis with
 > - [re/LINK.md](re/LINK.md) (RE-1): connected link, nonces, register access, negotiation, pairing initiation.
 > - [re/PERIPHERALS.md](re/PERIPHERALS.md) (RE-2): LEDs, IMU, input, haptics, calibration.
 > - [re/AUDIT.md](re/AUDIT.md) (AUDIT-1): corrections to Q1–Q6 and the tools.
+> - [re/REVIEW-RE.md](re/REVIEW-RE.md) (REVIEW-RE): **the TL header (R0)**, corrections to LINK/PERIPHERALS (accept packet, slot/endpoint, SPL reply, Reset after pairing, steady counter per beacon, direction 0), plus handedness, the disconnect threshold and seek cadence. Takes precedence over LINK.md and PERIPHERALS.md where they conflict.
 
 Status tags: **CONFIRMED** = read directly in code/data; **INFERRED** = strongly implied
 by code plus public prior work; **UNKNOWN** = not yet established.
