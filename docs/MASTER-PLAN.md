@@ -176,6 +176,15 @@ Rules for every session:
 - Static RE tags stay **CONFIRMED / INFERRED / UNKNOWN**, with addresses. No Meta/Valve bytes in the
   repo (README "Legal").
 - Commit small. Run `/code-review` on build branches before merging.
+- **A session stopped by a safety check gets one honest retry** (user rule, adopted 2026-10-04
+  after RE-3c succeeded). The planner re-chips it once and tells the user. The new prompt:
+  - states the context plainly: the user's own project, interoperability with their own hardware,
+    binaries copied from their own devices, the user's request to retry;
+  - narrows the scope to what's still open;
+  - keeps the guardrails: no modifying vendor files, no bypassing signature/integrity/anti-tamper
+    checks, design-only where possible;
+  - tells the chat to stop and report if it's blocked again.
+  Never reword a task just to get past a check.
 - **Report to the planner, always (mandatory).** The planner chat is named **"Touchframe project
   planning and roadmap"**. Every TouchFrame session must message it with `SendMessage` (load
   it with ToolSearch `select:SendMessage`; find the name with `ListAgents`):
@@ -214,7 +223,7 @@ decides.
 | BUILD-1b firmware + tool fixes | REVIEW-RE's BUILD-1 checklist | **done, merged c06d4bb**: all REVIEW-RE fixes; real controllers get input/IMU/LED/haptics (PCM pending). Build clean, all tests pass |
 | DEV-1 on-device bench | the Echo session releases the Quest + Frame | **done, merged 5a0b33d**: [re/DEV-1.md](re/DEV-1.md); devices handed back to Echo |
 | CLEANUP-1 | the planner's final offline check | **running (started 2026-10-04)**: test the driver's handedness/hand-collision paths against the fake dongle, consolidate PROTOCOL.md, refresh the FEASIBILITY verdict |
-| RE-3c Frame exposure timing (retry of RE-3 goal 2) | the user judged RE-3's block a false positive and asked for a narrowly scoped retry | **running (started 2026-10-04)**: design-only report `docs/re/FRAME-TIMING.md`. If blocked again: stop, report, no rewording |
+| RE-3c Frame exposure timing (retry of RE-3 goal 2) | the user judged RE-3's block a false positive and asked for a narrowly scoped retry | **done, merged f345f63; NOT blocked on retry**: [re/FRAME-TIMING.md](re/FRAME-TIMING.md). The schedule is the just-completed frame's window (not a look-ahead). Recommendation: keep BUILD-2's loop + log seed; optional read-only XRIPC-ring snoop as a fast-lock, default off, built only if HW-3 needs it |
 | Plan B research (position from Frame hand tracking) | HW-3 fails G-B | deferred. RE-3's goal 4 was never done. First check: whether the Frame's hand tracking shows up as OpenVR devices a driver can read through the public API |
 | HW-1 Sniff & validate | the dongles arrive (the user says so) | **waiting on hardware. All offline work is done (2026-10-04)** |
 | HW-2 Host bring-up | HW-1 done + BUILD-1 merged + REVIEW-RE has no blockers | waiting |

@@ -190,6 +190,21 @@ default object captured from a real Frame controller (XRService log 2026-10-02 2
 
 ## 3. LED sync / strobe (Q3)
 
+> **Corrected by RE-3c ([re/FRAME-TIMING.md](re/FRAME-TIMING.md), 2026-10-04):**
+> - **The schedule is not a look-ahead.** XRService's `onTrackingCameraFrameComplete`
+>   (`FUN_00f67790`) reports the **just-completed** controller frame's exposure window. That is two
+>   doubles, start/end, in seconds on CLOCK_MONOTONIC_RAW: end − start = the 10 µs exposure, and Δstart
+>   ≈ 33.333 ms. It goes over XRIPC client fn 20. driver_cv extrapolates from it, arms a free-running
+>   strobe (~2 s of pulses) and re-phases every frame (≥10 ms apart).
+> - **The LED-timing radio command is `0x64`** (`FUN_001f4b78`). `0x66` is LED brightness
+>   (`FUN_001f5660`). The 14-byte buffer below is otherwise right.
+> - **Ways for our driver to get the schedule:**
+>   - no public OpenVR route exists;
+>   - XRService's logged frame stamps: the current seed, coarse but robust;
+>   - optional: a read-only snoop of the XRIPC request ring, behind validation and off by default.
+>     Its record framing still needs a device to pin.
+>   - Hooking driver_cv is rejected.
+
 - **CONFIRMED: the exposure schedule is pushed from XRService to the driver, not published on a
   queue.** XRService calls its OpenVR *client* back over XRIPC with
   `XRIPCServer::callClient_AddFutureControllerCameraExposureTimings(double startExposure, double
