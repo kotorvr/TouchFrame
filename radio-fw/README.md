@@ -17,10 +17,10 @@ It links at `0x1000`, so the dongle's MBR and its open USB bootloader stay intac
 | `src/main.c` | USB (TinyUSB: CDC-ACM + vendor HID on one device), command dispatch, the modes, self-test, NVMC flash glue |
 | `src/sniffer.c` | v2 sniffer: RADIO packets into a ring by EasyDMA, TIMER0 stamps, beacon-follow hop |
 | `src/host_core.c` | **portable** host: 2000 µs beacon scheduler with the CSA#1 hop, DM beacons, uplink slots, pairing, connections, downlink queue/ARQ, the v3 commands |
-| `src/ctrl_core.c` | **portable** fake controller: advertising, the pairing exchange, seek/follow, uplinks in its slot |
+| `src/ctrl_core.c` | **portable** fake controller: advertising, the SPL pairing exchange, seek/follow, uplinks in its slot; real or placeholder connected-link formats |
 | `src/pulsar_ll.c`, `pulsar_hop.c` | beacon header, DM schedule, CSA#1 hop, CCM nonces, slot offsets |
 | `src/pulsar_pair.c` | discovery advert, pairing frames, PairingData wrap/unwrap |
-| `src/pulsar_cl.c` | connected-link messages: `cl_real` (real formats where pinned, stubs elsewhere) and `cl_placeholder` (ours, loopback only) |
+| `src/pulsar_cl.c` | connected-link messages: `cl_real` (accept, TL header, LED / haptic payloads, notification chunks) and `cl_placeholder` (ours, loopback only) |
 | `src/crypto.c` | portable AES-128, Pulsar AES-CCM, X25519 (no Nordic closed libraries) |
 | `src/store.c` | **portable** flash log: the host identity and up to 8 pairings |
 | `src/radio_engine.c`, `clock.c`, `hal.c` | the nRF52840 side: PPI-triggered TX/RX ops, the 64-bit µs clock, HW CCM, RNG |
@@ -50,12 +50,15 @@ radio-fw/test/run.sh
 Uses clang or gcc from PATH, or the LLVM-MinGW that `build.sh` finds. It runs:
 - hop rule and beacon parsing against an independent Python model;
 - AES / CCM / X25519 against RFC vectors and the `cryptography` package;
-- byte formats against `tools/pulsar_host.py`: beacon header, DM countdown, advert, nonces,
-  PairingData, connection negotiation and request;
-- the flash store: a model test plus power cuts after any word;
+- byte formats against `tools/pulsar_host.py` / `pulsar_input.py`: beacon header, DM countdown,
+  advert, nonces, PairingData, the accept and request, TL packets, LED / haptic payloads, and
+  fragmented notification chunk streams;
+- the flash store: a model test, power cuts after any word, and no synchronous erase while linked;
 - the simulator at drift 15/-15, 0/0 and 100/-100 ppm. It covers pair, connect, stream, registers,
-  LED, haptics, 10% loss, outage, real negotiation, stored pairings across a dongle reboot, and
-  argument checks;
+  LED, haptics, 10% loss, outage, stored pairings across a dongle reboot, argument checks, and the
+  real formats end to end: a refused PairingData, Reset, the accept in slot 1..4, TL reads / writes /
+  failures, notification input and IMU, a fragmented LED echo, the hand, and the LED re-sent after
+  a reconnect;
 - link v3: link.h against radio.py, then full sessions against `tools/fake_dongle.py`, including HID
   framing.
 
@@ -98,7 +101,11 @@ python tools/radio.py ping                       # dongle-clock <-> PC time sync
   record (docs/re/LINK.md §5.1). Re-pair to go back.
 - **Flash store.** It uses pages `0xDE000`/`0xDF000`, inside the bootloader's app-data area, so it
   should survive DFU (the SDK default; check this on hardware). Erases run as 1 ms partial-erase
-  slices, at most one per 20 ms, so connected controllers miss at most one beacon in a row.
+  slices, at most one per 20 ms, so connected controllers miss at most one beacon in a row. While
+  any controller is linked a write that would need a synchronous erase fails instead (a controller
+  drops after 25 missed beacons = 50 ms, docs/re/REVIEW-RE.md R9).
+- **Slots** are 1..4. Slot 0 (TX prefix 1) is where seeking controllers ask to connect; it is never
+  assigned (R1).
 
 ## Loopback rig (two dongles)
 ```bash
@@ -109,34 +116,41 @@ python tools/radio.py --port COM_B fake                            # plays a Tou
 python tools/radio.py --port COM_A host --identity f.json --auto-accept   # real formats (no --placeholder)
 python tools/radio.py --port COM_B fake --paired --identity f.json --real-conn   # real request + negotiation
 ```
-The fake speaks the real pairing exchange and, with `--real-conn`, the real connection request and
-negotiation. The placeholder formats are TouchFrame's own invention for everything after that.
-They are only ever used between our two dongles.
+The fake speaks the real pairing exchange and, with `--real-conn`, the real connected link all the
+way (request, accept, TL registers, notification input / IMU). Without it, the placeholder formats:
+TouchFrame's own invention, only ever used between our two dongles.
 
 ## What is real, what is a stub, what needs hardware
-**Implemented to the pinned formats** (docs/PROTOCOL.md, docs/re/AUDIT.md, docs/re/LINK.md,
-docs/re/PERIPHERALS.md):
-- beacon header and 2000 µs scheduling;
+**Implemented to the pinned formats** (docs/PROTOCOL.md, docs/re/LINK.md, docs/re/PERIPHERALS.md,
+and docs/re/REVIEW-RE.md, which takes precedence):
+- beacon header and 2000 µs scheduling; channels 0/17/36 always in the map (seek, R10);
 - CSA#1 hop and DM beacons on 2402 (5..24-period spacing, announced 3/2/1 periods ahead);
-- uplink slots: prefixes 0x01..0x05 at 350 + {0, 225, 525, 825, 1125} µs;
-- discovery listen and the pairing exchange on 2426: SetupX25519Keys `0x25`, PairingData `0x22`;
-- uplink-only CCM (in hardware) with the legacy and steady-state nonces;
-- the connection request and negotiation (CONN_NEG, then LOCK);
-- the LED and haptic limits (period ≥ 700 µs, on-time ≤ 75 µs).
+- uplink slots: prefixes 0x01..0x05 at 350 + {0, 225, 525, 825, 1125} µs; beacon bit `1 << S` (R4);
+- discovery listen and the pairing exchange on 2426: SetupX25519Keys `0x25`, PairingData `0x22`,
+  then Reset `0x2a` (R6); replies `[status][seq][data]` matched by seq, bit 7 = failed (R5); a
+  refused `0x22` redoes `0x25` (R15);
+- uplink-only CCM (in hardware) with the legacy and steady-state nonces; the steady counter counts
+  beacon periods since the accept (R7), direction 0 (R8);
+- the connection request and ONE accept: `[2] = (fmt << 3) | 2`, `[11] = S`, `[12]` = IV flag,
+  `[13]` = 1 (R1-R3);
+- the TL header (R0): register reads / writes with per-controller seq, re-sent every beacon until
+  answered (1 s timeout), implicit write acks, reg 0 notifications reassembled across uplinks (R13)
+  into EVT_INPUT / EVT_IMU; reg 0x2a ignored;
+- on connect: cmd 1 (the hand, R11), cmd 0x32 (IMU scale), cmd 9, and the last LED config again
+  (R16). Never cmd 0xa1 (R12);
+- LED cmd 0x28 and haptics 0xa0 / 0x97, with the limits (period ≥ 700 µs, on-time ≤ 75 µs).
 
-**Stubs** (answer `LINK_ERR_PENDING_RE`, marked `TODO(RE-1)` / `TODO(RE-2)` in `src/pulsar_cl.c`):
-- the TL header that carries register read/write/subscribe and notifications. Without it there is
-  no input or IMU from a real controller, and no LED or haptics;
-- the controller-side peripheral payloads, which are known (PERIPHERALS.md) but ride that header.
+**Stubs** (answer `LINK_ERR_PENDING_RE`): PCM haptics (0x9d, 3-bit ADPCM). No real disconnect
+message is known: CMD_DISCONNECT stops handling a real controller, which stays on the link until
+CMD_CONNECT takes it back or it loses the beacons.
 
 **Needs hardware** (docs/HARDWARE-DAY.md):
 - the TX-to-ADDRESS timing constant;
 - HW CCM equivalence (`selftest`);
-- how the pairing link is opened, and the reply command byte;
-- slot ↔ CL-endpoint mapping (`PULSAR_ENDPOINT_OFFSET`, INFERRED 1);
-- whether the 14-byte negotiation packet alone suffices, without the 26-byte record body;
-- the steady counter's start and increment, and the CCM direction bit (learned automatically);
-- the TL header bytes;
+- how the pairing link is opened;
+- whether the 14-byte accept alone suffices, without the 26-byte record body;
+- the period the steady counter starts in (searched around), and the direction bit (learned);
+- whether controllers need the idle TL packet on empty beacons (`host --tl-idle`);
 - HID throughput on the Frame;
 - that flash pairings survive DFU.
 

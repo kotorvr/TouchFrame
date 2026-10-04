@@ -11,7 +11,7 @@
 static uint32_t flash[2][STORE_PAGE_BYTES / 4];
 static int slices_done[2];
 static long budget = -1;  // word writes left before "power loss"; -1 = unlimited
-static long writes, erases;
+static long writes, erases, slices_total;
 
 static int page_of(uint32_t* p) { return p >= flash[1]; }
 
@@ -28,6 +28,7 @@ static void w_erase(void* u, uint32_t* page) {
     (void)u;
     if (budget == 0) return;
     int p = page_of(page);
+    slices_total++;
     if (++slices_done[p] >= SLICES) {  // erased; more slices keep it erased
         memset(flash[p], 0xFF, sizeof flash[p]);
         erases += slices_done[p] == SLICES;
@@ -154,5 +155,35 @@ int main(void) {
         cases++;
     }
     printf("store: %d power cuts mid-write: always the old or the new state\n", cases);
+
+    // R9: while controllers are linked (no_sync_erase) a write never erases synchronously. With the
+    // background erase running between writes nothing fails; without it a write fails instead.
+    memset(flash, 0xFF, sizeof flash);
+    slices_done[0] = slices_done[1] = 0;
+    store_init(&s, &F);
+    store_set_identity(&s, 0x1234, (const uint8_t*)"0123456789abcdef");
+    s.no_sync_erase = true;
+    int ok = 0;
+    for (int i = 0; i < 3 * STORE_RECS; i++) {
+        ok += store_add_pair(&s, 1, (uint8_t)(i % 4 + 1), (uint8_t)(i & 1));
+        for (int k = 0; k < SLICES; k++) store_step(&s);  // the main loop's paced slices
+    }
+    if (ok != 3 * STORE_RECS) {
+        printf("FAIL: %d of %d writes with background erases\n", ok, 3 * STORE_RECS);
+        return 1;
+    }
+    long slices0 = slices_total;
+    int failed = 0;
+    for (int i = 0; i < 3 * STORE_RECS; i++) failed += !store_add_pair(&s, 2, (uint8_t)(i % 4 + 1), (uint8_t)(i & 1));
+    if (slices_total != slices0 || !failed) {
+        printf("FAIL: %ld erase slices while linked, %d writes refused\n", slices_total - slices0, failed);
+        return 1;
+    }
+    s.no_sync_erase = false;
+    if (!store_add_pair(&s, 2, 3, 1) || !store_find(&s, 2) || store_find(&s, 2)->slot != 3) {
+        printf("FAIL: write after the link went idle\n");
+        return 1;
+    }
+    printf("store: linked (R9): no synchronous erase, writes refused instead; fine again when idle\n");
     return 0;
 }

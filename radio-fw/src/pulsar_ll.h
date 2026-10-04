@@ -13,16 +13,14 @@
 #define PULSAR_UPLINK_MAX_LEN 126      // LL_DEV_MAX_PAYLOAD_LEN
 #define PULSAR_SLOTS 5
 
-// Beacon byte 14 (whose downlink rides this beacon) and byte 15 (ack bitmap) are indexed by CL
-// endpoint, 1 << endpoint, endpoints 1..4 (docs/re/LINK.md §4, CONFIRMED). Radio slots are 0..4
-// (TX prefix slot + 1). Which endpoint a slot has is INFERRED: endpoint = slot + this offset (1:
-// endpoints start at TRANSPORT_ENDPOINT_START = 1). One capture settles it; rebuild with -D to try 0.
-#ifndef PULSAR_ENDPOINT_OFFSET
-#define PULSAR_ENDPOINT_OFFSET 1
-#endif
-#define PULSAR_SLOT_BIT(slot) ((uint8_t)(1u << ((slot) + PULSAR_ENDPOINT_OFFSET)))
-// Slots whose endpoint is in 1..4: the host assigns only these (offset 1: slots 0..3).
-#define PULSAR_SLOT_USABLE(slot) ((slot) + PULSAR_ENDPOINT_OFFSET >= 1 && (slot) + PULSAR_ENDPOINT_OFFSET <= 4)
+// One number S per controller (docs/re/REVIEW-RE.md R1/R4, CONFIRMED on both sides): the accept's
+// [11], TX prefix S + 1, beacon byte 14 (whose downlink rides this beacon) and byte 15 (ack bitmap)
+// bit 1 << S, and uplink CL[0]. S is 1..4: slot 0 (prefix 1) is the negotiation slot a seeking
+// controller requests in, and an accept with [11] = 0 trips a fatal assert in the controller.
+#define PULSAR_SLOT_BIT(slot) ((uint8_t)(1u << (slot)))
+// Slots the host assigns: 1..4.
+#define PULSAR_SLOT_USABLE(slot) ((slot) >= 1 && (slot) <= 4)
+#define PULSAR_NEG_SLOT 0              // CONN_NEG_SLOT: requests and the accept that answers them
 #define PULSAR_SLOT_BASE_US 350        // first uplink slot starts this long after the beacon anchor
 #define PULSAR_VERSION 0x1701          // Q6: on air 01 17
 #define PULSAR_S0 0x04                 // connected-link S0 byte
@@ -33,6 +31,12 @@
 #define PULSAR_DISCOVERY_BASE 0xFACEB00Cu
 #define PULSAR_DISCOVERY_PREFIX 0xAA   // adverts, and the pairing link (base = device id low word)
 #define PULSAR_HOST_PREFIX 0xF0        // host beacons / downlink on the connected link
+// A seeking controller listens 75.25 ms on each of these logical channels in turn (REVIEW-RE R10):
+// the host's channel map must contain all three.
+#define PULSAR_SEEK_CHANNELS {0, 17, 36}
+#define PULSAR_SEEK_MAP ((1ull << 0) | (1ull << 17) | (1ull << 36))
+#define PULSAR_SEEK_DWELL_US 75250
+#define PULSAR_MISSED_BEACONS_DC 25    // PULSAR_DEVICE_MISSED_BEACONS_BEFORE_DC (R9): > 24 missed -> seek
 // device in slot s transmits with prefix s + 1 (0x01..0x05)
 
 // Slot s uplink starts at anchor + pulsar_slot_offset_us(s) (350 + {0, 225, 525, 825, 1125}).
@@ -44,8 +48,8 @@ typedef struct {
     uint8_t dm_in;           // periods until the DM beacon, 0 = none announced (byte 0 bits 1..2)
     uint16_t session_nonce;  // bytes 6..7
     uint64_t timestamp_us;   // bytes 8..13, 48-bit sync-clock time of this beacon
-    uint8_t cl_slot_mask;    // byte 14: 1 << slot addressed by the CL data (INFERRED meaning)
-    uint8_t ack_mask;        // byte 15: slots heard since the last beacon
+    uint8_t cl_slot_mask;    // byte 14: 1 << S of the controller the CL data is for (0 = broadcast)
+    uint8_t ack_mask;        // byte 15: 1 << S for each slot heard since the last beacon
 } pulsar_beacon_t;
 
 // Builds the 16-byte header into out[0..15]; returns 16. CL data, if any, goes after it.
@@ -70,11 +74,13 @@ bool pulsar_dm_next(pulsar_dm_t* dm, uint8_t* announce);
 // Legacy / negotiation nonce: packet counter 0, IV = session_nonce << 48 | beacon_ts48 (u64 LE), the
 // timestamp of the beacon that starts the period the uplink is sent in. Used until the accept.
 void pulsar_nonce_legacy(uint16_t session_nonce, uint64_t beacon_ts, uint8_t nonce[13]);
-// Steady state: per-slot u32 counter (0 after the accept) and the 8-byte IV the controller sent in
-// its connection request.
+// Steady state: per-slot u32 counter and the 8-byte IV the controller sent in its connection
+// request. The counter is 0 at the accept and advances once per beacon period, skipped periods
+// included, whether or not the period carried an uplink (REVIEW-RE R7). Which period counts as 0 is
+// a live-capture item, so the host searches around its prediction.
 void pulsar_nonce_steady(uint32_t counter, const uint8_t iv[8], uint8_t nonce[13]);
-// The CCM direction bit (nonce bit 39). AUDIT A17: never written, so 0; tools/pulsar_host.py's
-// steady_state_nonce defaults to 1. The host learns it per controller from the first request.
+// The CCM direction bit (nonce bit 39). Always 0 on the uplink (REVIEW-RE R8, AUDIT A17). The host
+// still learns it per controller from the first request, in case a capture says otherwise.
 static inline void pulsar_nonce_dir(uint8_t nonce[13], uint8_t dir) {
     nonce[4] = (uint8_t)((nonce[4] & 0x7F) | (dir ? 0x80 : 0));
 }

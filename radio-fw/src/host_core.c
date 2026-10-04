@@ -4,14 +4,35 @@
 #include <string.h>
 
 #include "crypto.h"
+#include "le.h"
 #include "pulsar_pair.h"
 
 #define BEACON_RX_START_US 250     // listen for uplinks from here ...
 #define BEACON_RX_END_US 1800      // ... to here (slot 4 starts at 1475), then retune for the next beacon
 #define PAIR_SCAN_WINDOW_US 5000   // discovery RX chunk while scanning
 #define PAIR_TX_LEAD_US 200
+#define PAIR_MAX_RETRIES 3         // 0x25 rounds after failed replies before pairing fails
+#define PAIR_RESET_POLLS 5         // ~10 ms: wait this many polls for the Reset reply (R6)
 #define NEGOTIATE_TIMEOUT_US 1000000
 #define FULL_MAP ((1ull << PULSAR_NUM_CHANNELS) - 1)
+#define HAPTIC_AUTO_STOP_MS 2000   // the controller stops a 0xa0 buzz by itself after this
+#define IMU_TS_MAX_SKEW_US 50000   // an IMU timestamp further than this from the arrival is not trusted
+
+// cmd ids the dongle uses itself (docs/re/PERIPHERALS.md, REVIEW-RE)
+#define REG_DEVICE_DESC 0x01   // read, 32 B: "oculus", "rubyprq", hand at 16..23, board (R11)
+#define REG_DATA_READY 0x09    // write {0}: optional, the controller streams 100 ms after link-up anyway (R12)
+#define REG_IMU_CONFIG 0x32    // read, 16 B: u16 accel mg, u16 gyro dps, u16 odr x2, f32 scales x2
+// Never sent: cmd 0xa1, a battery load test that pulses the motor (R12).
+
+// ntf ids (PERIPHERALS §4.1)
+#define NTF_BATTERY 0x00
+#define NTF_IMU 0x01
+#define NTF_STICK 0x02
+#define NTF_TRIGGERS 0x03
+#define NTF_BUTTONS 0x04
+#define NTF_TOUCH 0x09
+#define NTF_PRESSURE 0x15
+#define NTF_IMU_TEMP 0x28
 
 static void barrier(void) { __sync_synchronize(); }
 
@@ -38,7 +59,7 @@ static void conn_event(host_t* h, uint8_t s, uint8_t state, uint8_t reason) {
 
 static void pair_event(host_t* h, uint8_t state, uint8_t status) {
     h->pair_state = state;
-    link_pair_event_t e = {h->plat->now_us(h->plat), state, status, h->pair_step, 0,
+    link_pair_event_t e = {h->plat->now_us(h->plat), state, status, h->pair_step, LINK_HAND_UNKNOWN,
                            state == LINK_PAIR_SCANNING ? 0 : h->pair_device,
                            state == LINK_PAIR_DONE ? h->netaddr : 0};
     emit(h, EVT_PAIR, &e, sizeof e, NULL, 0);
@@ -69,6 +90,8 @@ static void dlq_clear(host_slot_t* sl) {
     sl->dlq_len = 0;
     sl->head_sent = false;
     sl->accept_queued = false;
+    sl->haptic_stop_us = 0;
+    sl->ntf.active = false;
 }
 
 // Every connected / negotiating slot goes back to WAITING (or FREE if it was never allowed).
@@ -107,19 +130,38 @@ static int find_allowed(const host_t* h, uint64_t device_id) {
     return -1;
 }
 
+// A real controller CMD_DISCONNECT let go of is still on the link in its slot (no disconnect
+// message is known): that slot is not free while it is heard.
+static bool slot_heard(const host_t* h, int s) {
+    return h->slot[s].steady && h->plat->now_us(h->plat) - h->slot[s].last_rx_us < HOST_LOST_US;
+}
+
 static bool slot_free(const host_t* h, int s) {
-    return PULSAR_SLOT_USABLE(s) && !h->slot[s].allowed && h->slot[s].state == LINK_SLOT_FREE;
+    return PULSAR_SLOT_USABLE(s) && !h->slot[s].allowed && h->slot[s].state == LINK_SLOT_FREE && !slot_heard(h, s);
 }
 
 // The slot for a controller: where it is already allowed, else `want` if free, else the first free
-// one. -1 if none.
+// one (1..4: slot 0 is the negotiation slot, REVIEW-RE R1). -1 if none.
 static int pick_slot(const host_t* h, uint64_t device_id, uint8_t want) {
     int s = find_allowed(h, device_id);
     if (s >= 0) return s;
+    for (int i = 1; i < PULSAR_SLOTS; i++)  // still on the link there: take it back
+        if (!h->slot[i].allowed && h->slot[i].steady_id == device_id && slot_heard(h, i)) return i;
     if (want < PULSAR_SLOTS && slot_free(h, want)) return want;
     for (int i = 0; i < PULSAR_SLOTS; i++)
         if (slot_free(h, i)) return i;
     return -1;
+}
+
+// Per-controller state that belongs to the device, not the connection.
+static void slot_new_device(host_slot_t* sl, uint64_t device_id) {
+    sl->device_id = device_id;
+    sl->version = 0;
+    sl->hand = LINK_HAND_UNKNOWN;
+    sl->led_set = false;
+    sl->ntf_fwd = 0;
+    sl->accel_fs_g = 0;
+    sl->gyro_fs_dps = 0;
 }
 
 // CMD_CONNECT's effect: the controller may connect into slot s (which pick_slot chose).
@@ -127,8 +169,8 @@ static void allow(host_t* h, int s, uint64_t device_id) {
     host_slot_t* sl = &h->slot[s];
     if (sl->allowed && sl->device_id == device_id) return;
     sl->allowed = true;
-    sl->device_id = device_id;
-    sl->version = 0;
+    sl->held = false;
+    slot_new_device(sl, device_id);
     dlq_clear(sl);
     conn_event(h, (uint8_t)s, LINK_SLOT_WAITING, LINK_REASON_NONE);
 }
@@ -140,6 +182,9 @@ static void disconnect(host_t* h, uint8_t s, bool forget) {
     host_slot_t* sl = &h->slot[s];
     bool was = sl->state != LINK_SLOT_FREE || sl->allowed;
     dlq_clear(sl);
+    sl->held = true;
+    // TODO(RE): no real disconnect message is pinned; a real controller stays on the link (its
+    // uplinks are no longer handled) until it misses beacons
     if (sl->state == LINK_SLOT_CONNECTED && !h->fmt->real) dl_push_disconnect(h, s);  // best effort
     if (forget) sl->allowed = false;
     if (was) conn_event(h, s, sl->allowed ? LINK_SLOT_WAITING : LINK_SLOT_FREE, LINK_REASON_REQUESTED);
@@ -186,6 +231,7 @@ static bool beacon_op(host_t* h, uint64_t now, radio_op_t* op) {
         op->start_us = h->next_beacon_us;
         addr_connected(h, &op->addr, h->cur_dm ? RADIO_PROFILE_DM : RADIO_PROFILE_CONNECTED, h->cur_freq);
         uint8_t n = pulsar_beacon_build(&b, op->payload);
+        bool cl = false;
         if (h->prep.ready) {
             barrier();
             if (h->prep.period == period) {
@@ -193,9 +239,14 @@ static bool beacon_op(host_t* h, uint64_t now, radio_op_t* op) {
                 memcpy(op->payload + n, h->prep.data, h->prep.len);
                 n = (uint8_t)(n + h->prep.len);
                 h->prep.ready = false;
+                cl = true;
             } else if (h->prep.period < period) {
                 h->prep.ready = false;  // missed its beacon; the main loop prepares it again
             }
+        }
+        if (!cl && (h->flags & LINK_HOST_TL_IDLE) && h->fmt->real) {  // the idle TL packet (R0 rule 2)
+            op->payload[n++] = TL_REG_NTF;
+            op->payload[n++] = h->idle_seq & TL_SEQ_MASK;
         }
         op->len = n;
         h->beacons++;
@@ -259,7 +310,9 @@ bool host_next_op(host_t* h, uint64_t now, radio_op_t* op) {
 }
 
 void host_on_rx(host_t* h, const radio_rx_t* rx) {
-    if (rx->crc_ok && rx->rxmatch >= 1 && rx->rxmatch <= PULSAR_SLOTS && !pairing_active(h))
+    // a real controller CMD_DISCONNECT let go of is not acked: we no longer want it on the link
+    if (rx->crc_ok && rx->rxmatch >= 1 && rx->rxmatch <= PULSAR_SLOTS && !pairing_active(h) &&
+        !(h->fmt->real && h->slot[rx->rxmatch - 1].held))
         h->ack_mask |= PULSAR_SLOT_BIT(rx->rxmatch - 1);
     if (pairing_active(h) && h->pair_state != LINK_PAIR_SCANNING && rx->crc_ok) h->pair_tx_ready = false;
     uint32_t head = h->ring_head, next = (head + 1) & (HOST_RX_RING - 1);
@@ -289,7 +342,11 @@ void host_on_done(host_t* h, const radio_op_t* op, uint64_t now) {
 
 //------------------------------------------------------------------ pairing (main loop)
 
+// Every new SPL command gets a new seq: a repeat of the last one is a retransmit the SPL answers
+// from its old buffer without executing it, and its "last" starts at 0 (REVIEW-RE R5/R15).
 static void pair_send(host_t* h, uint8_t cmd, const uint8_t* data, uint8_t len) {
+    h->pair_seq = (uint8_t)(h->pair_seq + 1);
+    if (!h->pair_seq) h->pair_seq = 1;
     h->pair_cmd = cmd;
     h->pair_tx_len = pair_frame(cmd, h->pair_seq, data, len, h->pair_tx);
     h->pair_misses = 0;
@@ -310,16 +367,23 @@ static void pair_finish(host_t* h, uint8_t state, uint8_t status) {
     h->plat->kick(h->plat);
 }
 
+static void pair_setup(host_t* h) {
+    pair_event(h, LINK_PAIR_KEY_EXCHANGE, LINK_OK);
+    pair_send(h, PAIR_CMD_SETUP_X25519, h->pair_pub, 32);
+}
+
 static void pair_link(host_t* h, uint64_t device_id) {
     h->plat->radio_halt(h->plat);
     h->pair_device = device_id;
     h->pair_step = 0;
+    h->pair_retries = 0;
     pair_event(h, LINK_PAIR_LINKING, LINK_OK);
     // Our ephemeral X25519 key pair (~70 ms on the dongle; the radio is idle meanwhile).
     h->plat->random(h->plat, h->pair_priv, sizeof h->pair_priv);
     x25519_base(h->pair_pub, h->pair_priv);
-    h->pair_seq = 1;
-    pair_send(h, PAIR_CMD_SETUP_X25519, h->pair_pub, 32);
+    // a random first seq: never 0, and unlikely to repeat what an earlier attempt left in the SPL
+    h->plat->random(h->plat, &h->pair_seq, 1);
+    pair_setup(h);
 }
 
 static void pair_on_advert(host_t* h, const host_rx_t* r) {
@@ -341,45 +405,60 @@ static void pair_on_advert(host_t* h, const host_rx_t* r) {
         pair_link(h, a.device_id);
 }
 
+static void pair_done(host_t* h) {
+    uint64_t id = h->pair_device;
+    pair_finish(h, LINK_PAIR_DONE, LINK_OK);
+    h->pair_last_id = id;
+    h->pair_last_hand_sent = false;
+    if (stored(h) && h->store->netaddr == h->netaddr) {  // saved, and allowed in a slot
+        const store_pair_t* p = store_find(h->store, id);
+        int s = pick_slot(h, id, p ? p->slot : 0xFF);
+        if (!store_add_pair(h->store, id, (uint8_t)(s >= 0 ? s : 0), p ? p->hand : LINK_HAND_UNKNOWN))
+            text(h, "pairing done but not stored: flash write failed");
+        if (s >= 0) allow(h, s, id);
+    }
+}
+
+// SPL reply = [status][seq][data] (the radio LENGTH before it; REVIEW-RE R5): matched by seq only.
+// status bit 7 = the command failed; bits 1..6 are stale.
 static void pair_on_reply(host_t* h, const host_rx_t* r) {
-    if (!r->crc_ok || r->len < 2 || PAIR_CMD_NUM(r->data[0]) != PAIR_CMD_NUM(h->pair_cmd) ||
-        r->data[1] != h->pair_seq) {
+    if (!r->crc_ok || r->len < 2 || r->data[1] != h->pair_seq ||
+        (h->pair_cmd == PAIR_CMD_SETUP_X25519 && !(r->data[0] & 0x80) && r->len < 2 + 32)) {
         h->pair_tx_ready = true;  // not ours: keep polling
         h->plat->kick(h->plat);
         return;
     }
     h->pair_step++;
-    if (h->pair_cmd == PAIR_CMD_SETUP_X25519) {
-        if (r->len < 2 + 32) {
-            h->pair_tx_ready = true;
-            h->plat->kick(h->plat);
+    bool failed = r->data[0] & 0x80;
+    if (h->pair_cmd == PAIR_CMD_RESET) {
+        pair_done(h);  // failed or not: the pairing data is in; the SPL boots the app 500 ms after a Reset
+    } else if (failed) {
+        // a failed PairingData wipes the SPL's keys (R15): start again from SetupX25519Keys
+        if (++h->pair_retries > PAIR_MAX_RETRIES) {
+            pair_finish(h, LINK_PAIR_FAILED, h->pair_cmd == PAIR_CMD_PAIRING_DATA ? LINK_ERR_CRYPTO : LINK_ERR_REJECTED);
             return;
         }
-        pair_event(h, LINK_PAIR_KEY_EXCHANGE, LINK_OK);
+        text(h, h->pair_cmd == PAIR_CMD_PAIRING_DATA ? "pairing: PairingData refused, redoing the key exchange"
+                                                     : "pairing: SetupX25519Keys refused, retrying");
+        pair_setup(h);
+    } else if (h->pair_cmd == PAIR_CMD_SETUP_X25519) {
         x25519(h->pair_shared, h->pair_priv, r->data + 2);
         uint8_t iv[8], payload[PAIR_DATA_LEN];
         h->plat->random(h->plat, iv, sizeof iv);
         pair_data_build(h->pair_shared, h->netaddr, h->key, iv, payload);
-        h->pair_seq++;
         pair_event(h, LINK_PAIR_PROVISION, LINK_OK);
         pair_send(h, PAIR_CMD_PAIRING_DATA, payload, sizeof payload);
     } else if (h->pair_cmd == PAIR_CMD_PAIRING_DATA) {
-        uint64_t id = h->pair_device;
-        pair_finish(h, LINK_PAIR_DONE, LINK_OK);
-        if (stored(h) && h->store->netaddr == h->netaddr) {  // saved, and allowed in a slot
-            const store_pair_t* p = store_find(h->store, id);
-            int s = pick_slot(h, id, p ? p->slot : 0xFF);
-            if (!store_add_pair(h->store, id, (uint8_t)(s >= 0 ? s : 0), LINK_HAND_UNKNOWN))
-                text(h, "pairing done but not stored: flash write failed");
-            if (s >= 0) allow(h, s, id);
-        }
+        pair_send(h, PAIR_CMD_RESET, NULL, 0);  // R6: the SPL only leaves for the app on a Reset
     }
 }
 
 static void pair_poll(host_t* h) {
     if (!pairing_active(h)) return;
     uint64_t now = h->plat->now_us(h->plat);
-    if (now > h->pair_deadline_us) {
+    if (h->pair_state != LINK_PAIR_SCANNING && h->pair_cmd == PAIR_CMD_RESET && h->pair_misses >= PAIR_RESET_POLLS) {
+        pair_done(h);  // the Reset reply is optional (R6: wait for it or poll ~10 ms)
+    } else if (now > h->pair_deadline_us) {
         pair_finish(h, h->pair_state == LINK_PAIR_SCANNING ? LINK_PAIR_STOPPED : LINK_PAIR_FAILED, LINK_ERR_TIMEOUT);
     } else if (h->pair_state != LINK_PAIR_SCANNING && h->pair_misses > PAIR_MAX_MISSES) {
         pair_finish(h, LINK_PAIR_FAILED, LINK_ERR_TIMEOUT);
@@ -388,7 +467,7 @@ static void pair_poll(host_t* h) {
 
 //------------------------------------------------------------------ connected link (main loop)
 
-static bool dl_push(host_t* h, uint8_t s, const cl_msg_t* m, uint8_t addr_slot) {
+static bool dl_push_why(host_t* h, uint8_t s, const cl_msg_t* m, uint8_t addr_slot, uint8_t why) {
     host_slot_t* sl = &h->slot[s];
     if (sl->dlq_len >= HOST_DLQ) return false;
     host_dl_t* d = &sl->dlq[(sl->dlq_head + sl->dlq_len) % HOST_DLQ];
@@ -396,8 +475,14 @@ static bool dl_push(host_t* h, uint8_t s, const cl_msg_t* m, uint8_t addr_slot) 
     d->msg.seq = sl->next_dl_seq;
     sl->next_dl_seq = (uint8_t)(sl->next_dl_seq % 255 + 1);
     d->addr_slot = addr_slot;
+    d->why = why;
+    d->tl_reg = 0;
     sl->dlq_len++;
     return true;
+}
+
+static bool dl_push(host_t* h, uint8_t s, const cl_msg_t* m, uint8_t addr_slot) {
+    return dl_push_why(h, s, m, addr_slot, DL_USER);
 }
 
 static void dl_pop(host_slot_t* sl) {
@@ -406,6 +491,44 @@ static void dl_pop(host_slot_t* sl) {
     sl->dlq_len--;
     sl->head_sent = false;
     sl->head_tries = 0;
+}
+
+static bool is_reg(const cl_msg_t* m) { return m->type == CL_REG_READ || m->type == CL_REG_WRITE; }
+
+// The head command ended without an answer.
+static void dl_give_up(host_t* h, uint8_t s, uint64_t now, uint8_t status) {
+    host_slot_t* sl = &h->slot[s];
+    host_dl_t* d = &sl->dlq[sl->dlq_head];
+    if (is_reg(&d->msg) && d->why == DL_USER)
+        reg_event(h, now, d->msg.u.reg.tag, s, d->msg.u.reg.reg,
+                  d->msg.type == CL_REG_READ ? LINK_REG_READ : LINK_REG_WRITE_ACK, status, NULL, 0);
+    if (d->msg.type == CL_CONN_ACCEPT) sl->accept_queued = false;
+    dl_pop(sl);
+}
+
+// Real formats: what may go on air for this slot now. The accept answers a request (any state);
+// TL commands go only to a connected controller, one at a time, re-sent in every beacon until
+// answered or timed out (REVIEW-RE R0 rule 1).
+static bool real_ready(host_t* h, uint8_t s, uint64_t now) {
+    host_slot_t* sl = &h->slot[s];
+    host_dl_t* d = &sl->dlq[sl->dlq_head];
+    if (d->msg.type == CL_CONN_ACCEPT) {
+        if (sl->head_tries >= HOST_ACCEPT_TRIES) {
+            dl_give_up(h, s, now, LINK_ERR_TIMEOUT);
+            return false;
+        }
+        return true;
+    }
+    if (sl->state != LINK_SLOT_CONNECTED) return false;
+    if (!sl->head_sent) {  // a new command: the next seq
+        sl->tl_seq = (uint8_t)((sl->tl_seq + 1) & TL_SEQ_MASK);
+        d->msg.seq = sl->tl_seq;
+        sl->tl_deadline_us = now + HOST_TL_TIMEOUT_US;
+    } else if (now > sl->tl_deadline_us) {
+        dl_give_up(h, s, now, LINK_ERR_TIMEOUT);
+        return false;
+    }
+    return true;
 }
 
 // Fill h->prep with the next downlink, for the beacon two periods from now.
@@ -417,19 +540,17 @@ static void dl_prepare(host_t* h) {
         uint8_t s = (uint8_t)((h->dl_rr + i) % PULSAR_SLOTS);
         host_slot_t* sl = &h->slot[s];
         if (!sl->dlq_len) continue;
-        if (sl->head_sent && period < sl->head_sent_period + HOST_DL_RETRY_PERIODS) continue;
         host_dl_t* d = &sl->dlq[sl->dlq_head];
-        if (h->fmt->real && sl->head_tries >= HOST_REAL_DL_REPEATS) {  // sent often enough
-            dl_pop(sl);
-            continue;
-        }
-        if (sl->head_tries >= HOST_DL_MAX_TRIES) {  // never acknowledged: give up on it
-            if (d->msg.type == CL_REG_READ || d->msg.type == CL_REG_WRITE)
-                reg_event(h, now, d->msg.u.reg.tag, s, d->msg.u.reg.reg,
-                          d->msg.type == CL_REG_READ ? LINK_REG_READ : LINK_REG_WRITE_ACK, LINK_ERR_TIMEOUT, NULL, 0);
-            if (d->msg.type == CL_CONN_ACCEPT) sl->accept_queued = false;
-            dl_pop(sl);
-            continue;
+        if (h->fmt->real) {
+            if (sl->head_sent && period <= sl->head_sent_period) continue;  // already in a beacon to come
+            if (!real_ready(h, s, now) || !sl->dlq_len) continue;
+            d = &sl->dlq[sl->dlq_head];
+        } else {
+            if (sl->head_sent && period < sl->head_sent_period + HOST_DL_RETRY_PERIODS) continue;
+            if (sl->head_tries >= HOST_DL_MAX_TRIES) {  // never acknowledged: give up on it
+                dl_give_up(h, s, now, LINK_ERR_TIMEOUT);
+                continue;
+            }
         }
         // downlink CL data is plaintext (docs/re/AUDIT.md A4)
         int n = h->fmt->encode(&d->msg, h->prep.data, PULSAR_BEACON_CL_MAX);
@@ -437,12 +558,18 @@ static void dl_prepare(host_t* h) {
             dl_pop(sl);  // cannot be sent in this format (checked at enqueue; defensive)
             continue;
         }
+        if (d->msg.type == CL_CONN_ACCEPT && !sl->head_sent) sl->accept_period = period;
+        if (h->fmt->real && d->msg.type != CL_CONN_ACCEPT) {
+            d->tl_reg = h->prep.data[0];
+            h->idle_seq = d->msg.seq;
+            if (!sl->head_sent) sl->tl_sent_period = period;
+        }
         h->prep.len = (uint8_t)n;
         h->prep.slot = d->addr_slot;
         h->prep.period = period;
         sl->head_sent = true;
         sl->head_sent_period = period;
-        sl->head_tries++;
+        if (sl->head_tries < 255) sl->head_tries++;
         h->dl_rr = (uint8_t)(s + 1);
         barrier();
         h->prep.ready = true;
@@ -465,7 +592,7 @@ static void on_conn_req(host_t* h, uint8_t rx_slot, const cl_msg_t* m) {
         s = pick_slot(h, m->u.conn.device_id, m->u.conn.slot < PULSAR_SLOTS ? m->u.conn.slot : rx_slot);
         if (s >= 0) {
             h->slot[s].allowed = true;
-            h->slot[s].device_id = m->u.conn.device_id;
+            slot_new_device(&h->slot[s], m->u.conn.device_id);
         }
     }
     if (s < 0) {
@@ -492,28 +619,28 @@ static void on_conn_req(host_t* h, uint8_t rx_slot, const cl_msg_t* m) {
     acc.type = CL_CONN_ACCEPT;
     acc.u.conn.device_id = sl->device_id;
     acc.u.conn.slot = (uint8_t)s;
-    acc.u.conn.version = PULSAR_VERSION;  // never anything else (PROTOCOL Q6)
-    if (h->fmt->real) {  // LINK.md §4: CONN_NEG, then LOCK
-        acc.u.conn.endpoint = CL_EP_CONN_NEG;
-        sl->accept_queued = dl_push(h, (uint8_t)s, &acc, rx_slot);
-        acc.u.conn.endpoint = CL_EP_LOCK;
-        sl->accept_queued = sl->accept_queued && dl_push(h, (uint8_t)s, &acc, rx_slot);
-    } else {
-        sl->accept_queued = dl_push(h, (uint8_t)s, &acc, rx_slot);
-    }
+    acc.u.conn.version = PULSAR_VERSION;  // placeholder only (PROTOCOL Q6)
+    acc.u.conn.fmt = m->u.conn.fmt;
+    memcpy(acc.u.conn.iv, m->u.conn.iv, 8);
+    // one accept (R2), addressed to the slot the request came in (the negotiation slot for a real one)
+    sl->accept_queued = dl_push(h, (uint8_t)s, &acc, rx_slot);
     if (sl->accept_queued) {  // the controller restarts its counter when the accept arrives
         memcpy(sl->iv, m->u.conn.iv, 8);
-        sl->ctr_period = h->plat->now_us(h->plat) / PULSAR_BEACON_PERIOD_US;
-        sl->ctr = 0;
+        sl->steady_id = sl->device_id;
+        sl->held = false;
+        sl->accept_period = 0;
+        sl->ctr_locked = false;
+        sl->probe = 0;
         sl->steady = true;
     }
 }
 
-static uint64_t unwrap32(uint64_t ref, uint32_t low) {
-    // the 64-bit time with these low 32 bits closest to (and normally just before) ref
-    uint64_t t = (ref & ~0xFFFFFFFFull) | low;
-    if (t > ref + (1ull << 31)) t -= 1ull << 32;
-    else if (ref > t + (1ull << 31)) t += 1ull << 32;
+static uint64_t unwrap(uint64_t ref, uint64_t low, unsigned bits) {
+    // the 64-bit time with these low bits closest to ref
+    uint64_t span = 1ull << bits, mask = span - 1;
+    uint64_t t = (ref & ~mask) | (low & mask);
+    if (t > ref + span / 2) t -= span;
+    else if (ref > t + span / 2) t += span;
     return t;
 }
 
@@ -522,7 +649,7 @@ static void on_stream(host_t* h, uint8_t s, const host_rx_t* r, const cl_msg_t* 
     if (sl->state != LINK_SLOT_CONNECTED) return;
     const cl_stream_t* st = &m->u.stream;
     uint8_t fl = h->fmt->real ? 0 : 1;
-    uint64_t t = unwrap32(r->t_us, st->sample_us);
+    uint64_t t = unwrap(r->t_us, st->sample_us, 32);
     link_input_t in = {t, s, fl, ++sl->input_seq, st->buttons, st->battery_pct, st->touch,
                        {st->stick[0], st->stick[1]}, st->trigger, st->grip, st->pressure};
     if (h->flags & LINK_HOST_COMPACT) {
@@ -532,11 +659,213 @@ static void on_stream(host_t* h, uint8_t s, const host_rx_t* r, const cl_msg_t* 
         return;
     }
     emit(h, EVT_INPUT, &in, sizeof in, NULL, 0);
-    // TODO(RE-2): full scale from reg 0x32 imu_config; these are the ICM-42686 maxima as guesses.
     link_imu_t imu = {t, s, (uint8_t)(fl | 4), ++sl->imu_seq,
                       {st->accel[0], st->accel[1], st->accel[2]}, {st->gyro[0], st->gyro[1], st->gyro[2]},
                       st->temp, 16, 32, 4000, 0};
     emit(h, EVT_IMU, &imu, sizeof imu, NULL, 0);
+}
+
+//------------------------------------------------------------------ real TL uplinks
+
+// One uplink's notification chunks, collected so the events go out in a fixed order.
+typedef struct {
+    host_t* h;
+    uint8_t s;
+    const host_rx_t* r;
+    bool input;               // an input ntf changed sl->in
+    uint8_t nimu;
+    struct { uint64_t t; uint8_t flags; int16_t v[6]; } imu[4];
+} ntf_ctx_t;
+
+static void on_chunk(void* user, uint8_t type, const uint8_t* d, uint8_t n) {
+    ntf_ctx_t* c = user;
+    host_slot_t* sl = &c->h->slot[c->s];
+    if (type < 64 && (sl->ntf_fwd >> type & 1))
+        reg_event(c->h, c->r->t_us, 0, c->s, type, LINK_REG_NOTIFY, LINK_OK, d, n < LINK_REG_MAX ? n : LINK_REG_MAX);
+    switch (type) {
+    case NTF_BATTERY:
+        if (n >= 1) sl->in.battery_pct = d[0], c->input = true;
+        break;
+    case NTF_STICK:
+        if (n >= 4) sl->in.stick[0] = (int16_t)get16(d), sl->in.stick[1] = (int16_t)get16(d + 2), c->input = true;
+        break;
+    case NTF_TRIGGERS:
+        if (n >= 3) {
+            uint32_t v = d[0] | (uint32_t)d[1] << 8 | (uint32_t)d[2] << 16;
+            sl->in.trigger = v & 0xFFF;
+            sl->in.grip = (v >> 12) & 0xFFF;
+            c->input = true;
+        }
+        break;
+    case NTF_BUTTONS:
+        if (n >= 1) sl->in.buttons = d[0] & 0x0F, c->input = true;
+        break;
+    case NTF_TOUCH:
+        if (n >= 2) sl->in.touch = get16(d) & 0xFFF, c->input = true;
+        break;
+    case NTF_PRESSURE:
+        if (n >= 2) sl->in.pressure = get16(d) & 0xFFF, c->input = true;
+        break;
+    case NTF_IMU_TEMP:
+        if (n >= 4) {
+            int32_t t = (int32_t)get32(d);
+            sl->temp_raw = (int16_t)(t > INT16_MAX ? INT16_MAX : t < INT16_MIN ? INT16_MIN : t);
+        }
+        break;
+    case NTF_IMU: {  // u48 timestamp (sync clock), accel x y z, gyro x y z (i16)
+        if (n < 18 || c->nimu >= 4) break;
+        uint64_t ts = 0;
+        for (int i = 0; i < 6; i++) ts |= (uint64_t)d[i] << (8 * i);
+        uint64_t t = unwrap(c->r->t_us, ts, 48);
+        uint8_t fl = 0;
+        if (t > c->r->t_us + IMU_TS_MAX_SKEW_US || c->r->t_us > t + IMU_TS_MAX_SKEW_US) t = c->r->t_us, fl = 2;
+        c->imu[c->nimu].t = t;
+        c->imu[c->nimu].flags = fl;
+        for (int i = 0; i < 6; i++) c->imu[c->nimu].v[i] = (int16_t)get16(d + 6 + 2 * i);
+        c->nimu++;
+        break;
+    }
+    default:
+        break;
+    }
+}
+
+static void tl_notification(host_t* h, uint8_t s, const host_rx_t* r, const uint8_t* d, uint8_t n) {
+    host_slot_t* sl = &h->slot[s];
+    ntf_ctx_t c;
+    memset(&c, 0, sizeof c);
+    c.h = h;
+    c.s = s;
+    c.r = r;
+    cl_ntf_unpack(&sl->ntf, d, n, on_chunk, &c);
+    bool scale_known = sl->accel_fs_g != 0;
+    link_input_t in = {r->t_us, s, 2, 0, sl->in.buttons, sl->in.battery_pct, sl->in.touch,
+                       {sl->in.stick[0], sl->in.stick[1]}, sl->in.trigger, sl->in.grip, sl->in.pressure};
+    if (h->flags & LINK_HOST_COMPACT) {
+        // one EVT_SAMPLE per IMU sample; input changes without one (IMU idle) repeat the last IMU
+        // values, flagged (bit3)
+        bool imu_idle = !sl->imu_last_us || r->t_us - sl->imu_last_us > 20000;
+        for (uint8_t i = 0; i < c.nimu || (i == 0 && c.input && imu_idle); i++) {
+            link_sample_t smp;
+            memset(&smp, 0, sizeof smp);
+            smp.in = in;
+            smp.in.seq = ++sl->input_seq;
+            if (i < c.nimu) {
+                memcpy(sl->imu_last, c.imu[i].v, sizeof sl->imu_last);
+                sl->imu_last_us = r->t_us;
+                smp.in.t_us = c.imu[i].t;
+                smp.in.flags = c.imu[i].flags;
+            } else {
+                smp.in.flags |= 8;
+            }
+            if (!scale_known) smp.in.flags |= 4;
+            memcpy(smp.accel, sl->imu_last, 6);
+            memcpy(smp.gyro, sl->imu_last + 3, 6);
+            emit(h, EVT_SAMPLE, &smp, sizeof smp, NULL, 0);
+        }
+        return;
+    }
+    if (c.input) {
+        in.seq = ++sl->input_seq;
+        emit(h, EVT_INPUT, &in, sizeof in, NULL, 0);
+    }
+    for (uint8_t i = 0; i < c.nimu; i++) {
+        const int16_t* v = c.imu[i].v;
+        link_imu_t imu = {c.imu[i].t, s, (uint8_t)(c.imu[i].flags | (scale_known ? 0 : 4)), ++sl->imu_seq,
+                          {v[0], v[1], v[2]}, {v[3], v[4], v[5]}, sl->temp_raw, 16,
+                          scale_known ? sl->accel_fs_g : 32, scale_known ? sl->gyro_fs_dps : 4000, 0};
+        memcpy(sl->imu_last, v, sizeof sl->imu_last);
+        sl->imu_last_us = r->t_us;
+        emit(h, EVT_IMU, &imu, sizeof imu, NULL, 0);
+    }
+}
+
+// cmd 1 device_desc bytes 16..23: "left" / "right" / "unconf" (REVIEW-RE R11).
+static void got_hand(host_t* h, uint8_t s, const uint8_t* d, uint8_t n) {
+    host_slot_t* sl = &h->slot[s];
+    if (n < 24) return;
+    char name[9];
+    memcpy(name, d + 16, 8);
+    name[8] = 0;
+    sl->hand = !strcmp(name, "left") ? LINK_HAND_LEFT : !strcmp(name, "right") ? LINK_HAND_RIGHT : LINK_HAND_UNKNOWN;
+    if (sl->hand == LINK_HAND_UNKNOWN) return;
+    if (stored(h)) {
+        const store_pair_t* p = store_find(h->store, sl->device_id);
+        // may fail while slots are connected (no synchronous erase then, R9): retried at the next connect
+        if (p && p->hand != sl->hand) store_add_pair(h->store, sl->device_id, p->slot, sl->hand);
+    }
+    if (sl->device_id == h->pair_last_id && !h->pair_last_hand_sent) {  // the pairing's DONE, now with the hand
+        h->pair_last_hand_sent = true;
+        link_pair_event_t e = {h->plat->now_us(h->plat), LINK_PAIR_DONE, LINK_OK, h->pair_step, sl->hand,
+                               sl->device_id, h->netaddr};
+        emit(h, EVT_PAIR, &e, sizeof e, NULL, 0);
+    }
+}
+
+// The head command completed with this answer (data: a read's response, or a write's).
+static void tl_complete(host_t* h, uint8_t s, const host_rx_t* r, bool err, const uint8_t* data, uint8_t n) {
+    host_slot_t* sl = &h->slot[s];
+    host_dl_t* d = &sl->dlq[sl->dlq_head];
+    uint8_t status = err ? LINK_ERR_REJECTED : LINK_OK;
+    if (d->why == DL_USER && is_reg(&d->msg)) {
+        bool read = d->msg.type == CL_REG_READ;
+        uint8_t len = read ? n : 0;
+        if (read && d->msg.u.reg.len && d->msg.u.reg.len < len) len = d->msg.u.reg.len;
+        if (len > LINK_REG_MAX) len = LINK_REG_MAX;
+        reg_event(h, r->t_us, d->msg.u.reg.tag, s, d->msg.u.reg.reg, read ? LINK_REG_READ : LINK_REG_WRITE_ACK, status,
+                  data, len);
+    } else if (!err && d->why == DL_DESC) {
+        got_hand(h, s, data, n);
+    } else if (!err && d->why == DL_IMU_CFG && n >= 4) {
+        uint16_t mg = get16(data), dps = get16(data + 2);
+        sl->accel_fs_g = (uint8_t)(mg / 1000 > 255 ? 255 : mg / 1000);
+        sl->gyro_fs_dps = dps;
+    }
+    dl_pop(sl);
+}
+
+// A TL uplink [S][reg][flags][data] (REVIEW-RE R0): answers the command on air, carries
+// notifications, or both (a notification acks a write by carrying its seq).
+static void tl_on_uplink(host_t* h, uint8_t s, const host_rx_t* r, const cl_msg_t* m) {
+    host_slot_t* sl = &h->slot[s];
+    uint8_t reg = m->u.tl.reg, fl = m->u.tl.flags;
+    if (sl->state != LINK_SLOT_CONNECTED || reg == TL_REG_RF_STATS || m->u.tl.slot != s) return;
+    bool ntf = fl & TL_NTF;
+    // only an uplink after the command's first beacon can answer it: before that, a seq that happens
+    // to match is the controller's previous one
+    if (sl->head_sent && sl->dlq_len && r->t_us / PULSAR_BEACON_PERIOD_US >= sl->tl_sent_period) {
+        host_dl_t* d = &sl->dlq[sl->dlq_head];
+        if (d->msg.type != CL_CONN_ACCEPT && (fl & TL_SEQ_MASK) == d->msg.seq) {
+            bool read = d->msg.type == CL_REG_READ;
+            if (!ntf && reg == d->tl_reg && (bool)(fl & TL_READ) == read)
+                tl_complete(h, s, r, fl & TL_ERR, m->u.tl.data, m->u.tl.n);  // a response
+            else if (ntf && !read)
+                tl_complete(h, s, r, false, NULL, 0);  // a write needs no response: any uplink with its seq
+        }
+    }
+    if (ntf && reg == TL_REG_NTF) tl_notification(h, s, r, m->u.tl.data, m->u.tl.n);
+}
+
+static void queue_led(host_t* h, uint8_t s);
+
+// Real controller connected: what libsyncboss input_refresh_cache reads that the dongle needs,
+// then data-ready, then the LED config the driver set (the controller's on-time is the boot default
+// after a reconnect, R16).
+static void enumerate(host_t* h, uint8_t s) {
+    host_slot_t* sl = &h->slot[s];
+    if (sl->dlq_len && sl->dlq[sl->dlq_head].msg.type == CL_CONN_ACCEPT) dl_pop(sl);
+    cl_msg_t m;
+    memset(&m, 0, sizeof m);
+    m.type = CL_REG_READ;
+    m.u.reg.reg = REG_DEVICE_DESC;
+    dl_push_why(h, s, &m, s, DL_DESC);
+    m.u.reg.reg = REG_IMU_CONFIG;
+    dl_push_why(h, s, &m, s, DL_IMU_CFG);
+    m.type = CL_REG_WRITE;
+    m.u.reg.reg = REG_DATA_READY;
+    m.u.reg.len = 1;
+    dl_push_why(h, s, &m, s, DL_SILENT);
+    if (sl->led_set) queue_led(h, s);
 }
 
 static bool try_steady(host_t* h, host_slot_t* sl, const host_rx_t* r, uint32_t ctr, uint64_t period, uint8_t* pt) {
@@ -544,23 +873,25 @@ static bool try_steady(host_t* h, host_slot_t* sl, const host_rx_t* r, uint32_t 
     pulsar_nonce_steady(ctr, sl->iv, nonce);
     pulsar_nonce_dir(nonce, h->ccm_dir);
     if (!h->plat->ccm(h->plat, false, h->key, nonce, r->data, r->len, pt)) return false;
-    sl->ctr = ctr + 1;
+    sl->ctr_locked = true;
+    sl->ctr_last = ctr;
     sl->ctr_period = period;
     return true;
 }
 
 // The steady nonce (after the accept) or the legacy nonce of this period's beacon (a request, or a
 // controller that has not taken the accept yet); whichever the slot's state makes likelier goes
-// first. Each try is a busy-waiting HW CCM pass, so the candidates are few: the next counters, and
-// the counters the elapsed beacon periods predict (one uplink per period) for when uplinks were lost
-// while the controller kept hearing us. 0 = no MIC matched, 1 = steady, 2 = legacy.
+// first. The steady counter = beacon periods since the controller took the accept (R7), so after the
+// first match it is predicted from time; until then it is searched around "the first accept got
+// through". Each try is a busy-waiting HW CCM pass, so the candidates are few, and one more probe
+// per packet sweeps beyond the window. 0 = no MIC matched, 1 = steady, 2 = legacy.
 static int decrypt_uplink(host_t* h, host_slot_t* sl, const host_rx_t* r, uint8_t* pt) {
     uint64_t period = r->t_us / PULSAR_BEACON_PERIOD_US;
     bool legacy_first = sl->state != LINK_SLOT_CONNECTED && sl->state != LINK_SLOT_LOST;
     for (int pass = 0; pass < 2; pass++) {
         if ((pass == 0) == legacy_first) {
             uint8_t nonce[PULSAR_NONCE_LEN];
-            for (uint8_t k = 0; k < 2; k++) {  // both CCM directions (AUDIT A17 vs pulsar_host)
+            for (uint8_t k = 0; k < 2; k++) {  // both CCM directions (R8: 0; learned, in case)
                 uint8_t dir = (uint8_t)(h->ccm_dir ^ k);
                 pulsar_nonce_legacy(h->session_nonce, period * PULSAR_BEACON_PERIOD_US, nonce);
                 pulsar_nonce_dir(nonce, dir);
@@ -569,18 +900,23 @@ static int decrypt_uplink(host_t* h, host_slot_t* sl, const host_rx_t* r, uint8_
                     return 2;
                 }
             }
-        } else if (sl->steady) {
-            for (uint32_t i = 0; i < HOST_CTR_NEAR; i++)
-                if (try_steady(h, sl, r, sl->ctr + i, period, pt)) return 1;
-            uint32_t ahead = (uint32_t)(period > sl->ctr_period ? period - sl->ctr_period : 1);
-            for (uint32_t i = 0; i <= HOST_CTR_BACK && ahead > i + HOST_CTR_NEAR; i++)
-                if (try_steady(h, sl, r, sl->ctr + ahead - 1 - i, period, pt)) return 1;
-            // the controller skips uplinks in periods it missed our beacon, so the counter can also be
-            // anywhere in between: one probe per packet sweeps that gap
-            if (ahead > HOST_CTR_NEAR + HOST_CTR_BACK + 1) {
-                uint32_t span = ahead - HOST_CTR_NEAR - HOST_CTR_BACK - 1;
-                sl->probe = sl->probe % span;
-                if (try_steady(h, sl, r, sl->ctr + HOST_CTR_NEAR + sl->probe++, period, pt)) return 1;
+        } else if (sl->steady && sl->ctr_locked) {
+            uint32_t pred = sl->ctr_last + (uint32_t)(period - sl->ctr_period);
+            if (try_steady(h, sl, r, pred, period, pt)) return 1;
+            for (uint32_t k = 1; k <= HOST_CTR_NEAR; k++) {
+                if (try_steady(h, sl, r, pred + k, period, pt)) return 1;
+                if (pred >= k && try_steady(h, sl, r, pred - k, period, pt)) return 1;
+            }
+        } else if (sl->steady && sl->accept_period && period >= sl->accept_period) {
+            // the counter is `span` if the first copy of the accept got through, less if a later one
+            uint32_t span = (uint32_t)(period - sl->accept_period);
+            if (try_steady(h, sl, r, span + 1, period, pt)) return 1;  // the off-by-one at the accept
+            uint32_t n = span + 1 < HOST_CTR_SEARCH ? span + 1 : HOST_CTR_SEARCH;
+            for (uint32_t k = 0; k < n; k++)
+                if (try_steady(h, sl, r, span - k, period, pt)) return 1;
+            if (span + 1 > n) {
+                sl->probe = sl->probe % (span + 1 - n);
+                if (try_steady(h, sl, r, span - n - sl->probe++, period, pt)) return 1;
             }
         }
     }
@@ -613,24 +949,32 @@ static void on_uplink(host_t* h, const host_rx_t* r) {
         link_uplink_t u = {r->t_us, s, r->freq, r->rssi, flags, ok ? n : r->len};
         emit(h, EVT_UPLINK, &u, sizeof u, ok ? pt : r->data, ok ? n : r->len);
     }
-    // The controller uses the steady nonce only after it took our accept: it is on the link.
+    // The controller uses the steady nonce only after it took our accept: it is on the link. A
+    // WAITING slot takes back the controller it disconnected (no real disconnect message is known,
+    // so a real one never left) once CMD_CONNECT allows it again.
     if (how == 1) {
         sl->last_rx_us = r->t_us;
-        if (sl->allowed && (sl->state == LINK_SLOT_NEGOTIATING || sl->state == LINK_SLOT_LOST)) {
+        bool readopt = sl->state == LINK_SLOT_WAITING && sl->steady_id == sl->device_id && !sl->held;
+        if (sl->allowed && (sl->state == LINK_SLOT_NEGOTIATING || sl->state == LINK_SLOT_LOST || readopt)) {
+            bool fresh = sl->state != LINK_SLOT_LOST;
             sl->accept_queued = false;
             conn_event(h, s, LINK_SLOT_CONNECTED, LINK_REASON_NONE);
+            if (h->fmt->real && fresh) enumerate(h, s);
         }
     }
     cl_msg_t m;
-    if (!ok || !h->fmt->decode(pt, n, CL_DIR_UP, &m)) return;
+    if (!ok || !h->fmt->decode(pt, n, CL_DIR_UP, &m) || (how == 1 && sl->held)) return;
     sl->last_rx_us = r->t_us;
-    if (sl->head_sent && sl->dlq_len && m.ack == sl->dlq[sl->dlq_head].msg.seq) dl_pop(sl);
+    if (!h->fmt->real && sl->head_sent && sl->dlq_len && m.ack == sl->dlq[sl->dlq_head].msg.seq) dl_pop(sl);
     switch (m.type) {
     case CL_CONN_REQ:
         on_conn_req(h, s, &m);
         break;
     case CL_STREAM:
         on_stream(h, s, r, &m);
+        break;
+    case CL_TL_UP:
+        if (how == 1) tl_on_uplink(h, s, r, &m);
         break;
     case CL_REG_DATA:
         if (sl->state == LINK_SLOT_CONNECTED && m.seq != sl->last_ul_seq) {
@@ -655,6 +999,13 @@ static void slot_timeouts(host_t* h) {
             dlq_clear(sl);
             conn_event(h, s, LINK_SLOT_WAITING, LINK_REASON_TIMEOUT);
         }
+        if (sl->haptic_stop_us && now >= sl->haptic_stop_us) {  // a SIMPLE buzz shorter than 2 s
+            cl_msg_t m;
+            memset(&m, 0, sizeof m);
+            m.type = CL_HAPTIC;
+            m.u.haptic.mode = LINK_HAPTIC_STOP;
+            if (sl->state != LINK_SLOT_CONNECTED || dl_push_why(h, s, &m, s, DL_SILENT)) sl->haptic_stop_us = 0;
+        }
     }
 }
 
@@ -677,6 +1028,12 @@ void host_poll(host_t* h) {
     if (!h->running) return;
     slot_timeouts(h);
     dl_prepare(h);
+    if (h->store) {  // a ~90 ms synchronous erase would drop every controller (R9: 25 beacons = 50 ms)
+        bool linked = false;
+        for (int s = 0; s < PULSAR_SLOTS; s++)
+            linked |= h->slot[s].state == LINK_SLOT_CONNECTED || h->slot[s].state == LINK_SLOT_NEGOTIATING;
+        h->store->no_sync_erase = linked;
+    }
 }
 
 //------------------------------------------------------------------ commands (main loop)
@@ -685,6 +1042,7 @@ static uint8_t host_start(host_t* h, const link_host_start_t* c, uint8_t* detail
     uint64_t map = 0;
     for (int i = 0; i < 5; i++) map |= (uint64_t)c->chmap[i] << (8 * i);
     map &= FULL_MAP;
+    map |= PULSAR_SEEK_MAP;  // a seeking controller listens only on these (R10)
     int count = 0;
     for (int i = 0; i < PULSAR_NUM_CHANNELS; i++) count += (int)((map >> i) & 1);
     if (count < 8 || c->tx_power_dbm < -40 || c->tx_power_dbm > 8) return LINK_ERR_ARGS;
@@ -694,6 +1052,7 @@ static uint8_t host_start(host_t* h, const link_host_start_t* c, uint8_t* detail
         if (!h->store || !h->store->ok) return LINK_ERR_STATE;
         if (!h->store->netaddr) {  // first use: a random identity, kept from now on
             uint8_t k[16];
+            // never 0 (the controller app asserts) or 0xFFFFFFFF (reads as unpaired), R14
             do h->plat->random(h->plat, (uint8_t*)&netaddr, sizeof netaddr);
             while (netaddr == 0 || netaddr == 0xFFFFFFFFu);
             h->plat->random(h->plat, k, sizeof k);
@@ -722,6 +1081,9 @@ static uint8_t host_start(host_t* h, const link_host_start_t* c, uint8_t* detail
     for (int s = 0; s < PULSAR_SLOTS; s++) {
         dlq_clear(&h->slot[s]);
         h->slot[s].input_seq = h->slot[s].imu_seq = 0;
+        // a controller may keep its TL state across our restart: don't start where it last was
+        h->plat->random(h->plat, &h->slot[s].tl_seq, 1);
+        h->slot[s].tl_seq &= TL_SEQ_MASK;
     }
     h->beacons = h->dm_beacons = h->uplinks = h->crc_errors = h->late_beacons = 0;
     h->running = true;
@@ -734,6 +1096,7 @@ static uint8_t host_start(host_t* h, const link_host_start_t* c, uint8_t* detail
             int s = pick_slot(h, p->device_id, p->slot);
             if (s < 0) break;
             allow(h, s, p->device_id);
+            h->slot[s].hand = p->hand;
             (*detail)++;
         }
     }
@@ -777,7 +1140,7 @@ static uint8_t pair_forget(host_t* h, const link_pair_forget_t* c, uint8_t* remo
     } else {
         n = all ? store_forget_all(st) : store_forget(st, c->device_id);
     }
-    if (n < 0) return LINK_ERR_CRYPTO;
+    if (n < 0) return st->no_sync_erase ? LINK_ERR_BUSY : LINK_ERR_CRYPTO;
     *removed = (uint8_t)n;
     return LINK_OK;
 }
@@ -814,18 +1177,19 @@ void host_fill_status(const host_t* h, link_host_status_t* s) {
 static uint8_t slot_check(host_t* h, uint8_t s) {
     if (!h->running) return LINK_ERR_STATE;
     if (s >= PULSAR_SLOTS) return LINK_ERR_ARGS;
-    if (h->fmt->real) return LINK_ERR_PENDING_RE;  // TODO(RE-1/RE-2): real CL formats
     if (h->slot[s].state != LINK_SLOT_CONNECTED) return LINK_ERR_NOT_CONNECTED;
     return LINK_OK;
 }
 
-static uint8_t queue(host_t* h, uint8_t s, const cl_msg_t* m) {
+static uint8_t queue_why(host_t* h, uint8_t s, const cl_msg_t* m, uint8_t why) {
     uint8_t probe[CL_DOWN_MAX];
     int n = h->fmt->encode(m, probe, sizeof probe);
     if (n == CL_PENDING_RE) return LINK_ERR_PENDING_RE;
     if (n < 0) return LINK_ERR_ARGS;
-    return dl_push(h, s, m, s) ? LINK_OK : LINK_ERR_QUEUE_FULL;
+    return dl_push_why(h, s, m, s, why) ? LINK_OK : LINK_ERR_QUEUE_FULL;
 }
+
+static uint8_t queue(host_t* h, uint8_t s, const cl_msg_t* m) { return queue_why(h, s, m, DL_USER); }
 
 // A newer message of the same type replaces one still waiting in the queue (not yet on air), so a
 // fast LED phase loop never fills the queue with stale settings. False if there was none.
@@ -841,6 +1205,11 @@ static bool replace_unsent(host_t* h, uint8_t s, const cl_msg_t* m) {
         }
     }
     return false;
+}
+
+static void queue_led(host_t* h, uint8_t s) {
+    host_slot_t* sl = &h->slot[s];
+    if (!replace_unsent(h, s, &sl->led)) queue_why(h, s, &sl->led, DL_SILENT);
 }
 
 #define BODY(type) \
@@ -912,7 +1281,7 @@ bool host_command(host_t* h, uint8_t cmd, const uint8_t* body, uint32_t len) {
             } else if (c.slot >= PULSAR_SLOTS) {
                 result(h, tag, cmd, LINK_ERR_ARGS, 0);
                 return true;
-            } else if (!slot_free(h, c.slot)) {
+            } else if (!slot_free(h, c.slot) && pick_slot(h, c.device_id, c.slot) != c.slot) {
                 result(h, tag, cmd, LINK_ERR_NO_SLOT, c.slot);
                 return true;
             } else {
@@ -921,6 +1290,7 @@ bool host_command(host_t* h, uint8_t cmd, const uint8_t* body, uint32_t len) {
             result(h, tag, cmd, LINK_OK, (uint8_t)s);
             allow(h, s, c.device_id);
         } else {
+            h->slot[s].held = false;
             result(h, tag, cmd, LINK_OK, (uint8_t)s);  // already allowed there
         }
         return true;
@@ -937,7 +1307,9 @@ bool host_command(host_t* h, uint8_t cmd, const uint8_t* body, uint32_t len) {
     case CMD_REG_WRITE: {
         BODY(link_reg_cmd_t);
         uint8_t st = slot_check(h, c.slot);
-        if (cmd == CMD_REG_WRITE && (c.len > LINK_REG_MAX || len != sizeof c + c.len)) st = LINK_ERR_ARGS;
+        uint32_t extra = len - sizeof c;  // write: the data; read: request parameters (e.g. 0x2b offset, len)
+        if (extra > LINK_REG_MAX || (cmd == CMD_REG_WRITE && (c.len > LINK_REG_MAX || extra != c.len)))
+            st = LINK_ERR_ARGS;
         if (st == LINK_OK) {
             cl_msg_t m;
             memset(&m, 0, sizeof m);
@@ -945,7 +1317,12 @@ bool host_command(host_t* h, uint8_t cmd, const uint8_t* body, uint32_t len) {
             m.u.reg.tag = tag;
             m.u.reg.reg = c.reg;
             m.u.reg.len = c.len;
-            if (cmd == CMD_REG_WRITE) memcpy(m.u.reg.data, body + sizeof c, c.len);
+            if (cmd == CMD_REG_WRITE) {
+                memcpy(m.u.reg.data, body + sizeof c, c.len);
+            } else if (h->fmt->real) {
+                m.u.reg.n = (uint8_t)extra;
+                memcpy(m.u.reg.data, body + sizeof c, extra);
+            }
             st = queue(h, c.slot, &m);
         }
         result(h, tag, cmd, st, c.slot);
@@ -954,7 +1331,12 @@ bool host_command(host_t* h, uint8_t cmd, const uint8_t* body, uint32_t len) {
     case CMD_REG_SUBSCRIBE: {
         BODY(link_reg_sub_t);
         uint8_t st = slot_check(h, c.slot);
-        if (st == LINK_OK) {
+        if (st == LINK_OK && h->fmt->real) {
+            // the controller pushes its notifications by itself: this only forwards ntf `reg` as EVT_REG
+            if (c.reg >= 64) st = LINK_ERR_ARGS;
+            else if (c.flags & LINK_SUB_UNSUBSCRIBE) h->slot[c.slot].ntf_fwd &= ~(1ull << c.reg);
+            else h->slot[c.slot].ntf_fwd |= 1ull << c.reg;
+        } else if (st == LINK_OK) {
             cl_msg_t m;
             memset(&m, 0, sizeof m);
             m.type = CL_REG_SUB;
@@ -983,7 +1365,14 @@ bool host_command(host_t* h, uint8_t cmd, const uint8_t* body, uint32_t len) {
             m.u.led.on_us = c.on_us;
             m.u.led.phase_us = c.phase_us;
             m.u.led.mask = c.led_mask;
-            if (!replace_unsent(h, c.slot, &m)) st = queue(h, c.slot, &m);
+            uint8_t probe[CL_DOWN_MAX];
+            int n = h->fmt->encode(&m, probe, sizeof probe);
+            if (n < 0) st = n == CL_PENDING_RE ? LINK_ERR_PENDING_RE : LINK_ERR_ARGS;  // real: ON is not possible
+            if (st == LINK_OK && !replace_unsent(h, c.slot, &m)) st = queue_why(h, c.slot, &m, DL_SILENT);
+            if (st == LINK_OK) {
+                h->slot[c.slot].led = m;
+                h->slot[c.slot].led_set = true;
+            }
         }
         result(h, tag, cmd, st, c.slot);
         return true;
@@ -994,9 +1383,11 @@ bool host_command(host_t* h, uint8_t cmd, const uint8_t* body, uint32_t len) {
         if (c.mode > LINK_HAPTIC_PCM || c.pcm_len > LINK_PCM_MAX || len != sizeof c + c.pcm_len ||
             (c.mode == LINK_HAPTIC_PCM && !c.pcm_len))
             st = LINK_ERR_ARGS;
+        if (h->fmt->real && c.mode == LINK_HAPTIC_SIMPLE && (c.freq_hz < 40 || c.freq_hz > 561)) st = LINK_ERR_ARGS;
+        if (h->fmt->real && c.mode == LINK_HAPTIC_PCM && st == LINK_OK) st = LINK_ERR_PENDING_RE;  // 0x9d not pinned
         if (st == LINK_OK) {
             const uint8_t* pcm = body + sizeof c;
-            uint8_t chunk = h->fmt->haptic_chunk;
+            uint8_t chunk = h->fmt->haptic_chunk ? h->fmt->haptic_chunk : 1;
             uint8_t parts = c.mode == LINK_HAPTIC_PCM ? (uint8_t)((c.pcm_len + chunk - 1) / chunk) : 1;
             if (HOST_DLQ - h->slot[c.slot].dlq_len < parts) st = LINK_ERR_QUEUE_FULL;
             for (uint8_t i = 0; st == LINK_OK && i < parts; i++) {
@@ -1012,7 +1403,11 @@ bool host_command(host_t* h, uint8_t cmd, const uint8_t* body, uint32_t len) {
                     m.u.haptic.n = n;
                     memcpy(m.u.haptic.pcm, pcm + i * chunk, n);
                 }
-                st = queue(h, c.slot, &m);
+                st = queue_why(h, c.slot, &m, DL_SILENT);
+            }
+            if (st == LINK_OK && h->fmt->real) {  // 0xa0 stops by itself after 2 s; shorter: stop it then
+                bool timed = c.mode == LINK_HAPTIC_SIMPLE && c.duration_ms && c.duration_ms < HAPTIC_AUTO_STOP_MS;
+                h->slot[c.slot].haptic_stop_us = timed ? h->plat->now_us(h->plat) + c.duration_ms * 1000ull : 0;
             }
         }
         result(h, tag, cmd, st, c.slot);

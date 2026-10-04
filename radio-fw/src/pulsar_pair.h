@@ -2,9 +2,11 @@
 // mirroring tools/pulsar_host.py. Pure C, tested on the PC against that tool.
 //
 // Pairing-link frames are the radio payload [cmd][seq][data...] on 2426 MHz (S0 off; LENGTH and
-// the CRC-24 are the radio's). INFERRED: how the host opens this link (we just start polling the
-// controller's DM address after its advert, MASTER-PLAN 3.1.9) and the reply's command byte
-// (UNKNOWN, AUDIT A5: we accept any reply with our seq and the same command number).
+// the CRC-24 are the radio's). The SPL's reply is [status][seq][data] (docs/re/REVIEW-RE.md R5):
+// status bit 7 = the command failed, bit 0 = 0, bits 1..6 stale; it matches the request by seq
+// only. A request that repeats the SPL's last seq (which starts at 0) is a retransmit: answered
+// from the old buffer, not executed (R15). INFERRED: how the host opens this link (we just start
+// polling the controller's DM address after its advert, MASTER-PLAN 3.1.9).
 #pragma once
 #include <stdbool.h>
 #include <stdint.h>
@@ -12,7 +14,8 @@
 // On-air command byte = (number << 1) | read (docs/re/AUDIT.md A5; SPL dispatcher FUN_0000822c).
 #define PAIR_CMD_PAIRING_DATA 0x22   // write #0x11: [8-byte IV][CCM(20)+MIC] = 32 bytes
 #define PAIR_CMD_SETUP_X25519 0x25   // read #0x12: carries our 32-byte public key; the reply has the controller's
-#define PAIR_CMD_NUM(b) (((b) & 0x7F) >> 1)
+#define PAIR_CMD_RESET 0x2A          // write #0x15, empty: after PairingData the SPL boots the app 500 ms later (R6)
+#define PAIR_STATUS_FAILED 0x80      // reply status bit 7
 #define PAIR_DATA_LEN 32
 #define PAIR_ADVERT_LEN 32
 #define PAIR_MAX_MISSES 666          // syncboss FUN_00020a70 gives up after 0x29a misses

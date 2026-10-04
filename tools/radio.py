@@ -84,7 +84,7 @@ CAPS = {0: "sniffer", 1: "host", 2: "fake_ctrl", 3: "placeholder", 4: "store", 5
         9: "real_conn_neg", 10: "real_nonce", 11: "real_hreg", 12: "real_input", 13: "real_imu", 14: "real_led",
         15: "real_haptic"}
 HOST_AUTO_ACCEPT, HOST_DM_BEACONS, HOST_RAW_UPLINKS, HOST_PLACEHOLDER = 1, 2, 4, 8
-HOST_COMPACT, HOST_STORED = 16, 32
+HOST_COMPACT, HOST_STORED, HOST_TL_IDLE = 16, 32, 64
 PAIR_AUTO = 1
 FORGET_ALL, FORGET_IDENTITY = 1, 2
 HANDS = {0: "unknown", 1: "left", 2: "right"}
@@ -814,7 +814,7 @@ def cmd_host(args):
     ident = load_identity(args.identity) if args.identity else None
     flags = HOST_DM_BEACONS | (HOST_AUTO_ACCEPT if args.auto_accept else 0) | \
         (HOST_RAW_UPLINKS if args.raw else 0) | (HOST_PLACEHOLDER if args.placeholder else 0) | \
-        (HOST_COMPACT if args.compact else 0) | (0 if ident else HOST_STORED)
+        (HOST_COMPACT if args.compact else 0) | (0 if ident else HOST_STORED) | (HOST_TL_IDLE if args.tl_idle else 0)
     session = int.from_bytes(os.urandom(2), "little")
     if ident:
         r = d.host_start(ident["netaddr"], bytes.fromhex(ident["link_key"]), session, flags=flags,
@@ -972,6 +972,8 @@ def main():
                    help="placeholder connected-link formats: loopback with a `fake` dongle ONLY")
     p.add_argument("--raw", action="store_true", help="report every uplink (EVT_UPLINK)")
     p.add_argument("--compact", action="store_true", help="EVT_SAMPLE (input + IMU in one event; use on HID)")
+    p.add_argument("--tl-idle", action="store_true",
+                   help="idle beacons carry the TL packet [00][seq], as the Quest's do (REVIEW-RE R0; HW-1 decides)")
     p.add_argument("--tx-power", type=int, default=8, help="dBm, -40..8")
     p.add_argument("--quiet-streams", action="store_true", help="hide input/IMU/sample events")
     p.add_argument("--seconds", type=float)

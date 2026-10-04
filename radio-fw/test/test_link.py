@@ -113,12 +113,12 @@ def test_host_session():
     assert h["version"] == R.LINK_VERSION and "host" in h["caps_names"]
 
     # host commands need host mode
-    r, _ = d.request(R.CMD_CONNECT, "link_connect_t", slot=0, device_id=1, check=False)
+    r, _ = d.request(R.CMD_CONNECT, "link_connect_t", slot=1, device_id=1, check=False)
     assert r["status"] == 2
     netaddr, key = 0x5EED1234, bytes(range(16))
     d.host_start(netaddr, key, 0xBEEF)
     try:
-        d.host_start(netaddr, key, 1, chmap=0x7F)  # 7 channels: rejected like the firmware
+        d.host_start(netaddr, key, 1, chmap=0x1F)  # 5 channels + seek 17, 36 = 7: rejected like the firmware
         raise AssertionError("7-channel map accepted")
     except R.LinkError as e:
         assert e.status == 1
@@ -134,12 +134,18 @@ def test_host_session():
     dev = done["device_id"]
     assert fake.controllers[0].paired == (netaddr, key)  # real 0x11 wrap decrypted by the sim controller
 
-    # connect it (any free slot) -> waiting, negotiating, connected; then streams
+    # connect it (any free slot: 1..4, never the negotiation slot 0) -> waiting, negotiating,
+    # connected, then a second DONE with the hand; then streams
+    r, _ = d.request(R.CMD_CONNECT, "link_connect_t", slot=0, device_id=dev, check=False)
+    assert r["status"] == 6
     r, _ = d.request(R.CMD_CONNECT, "link_connect_t", slot=0xFF, device_id=dev)
     slot = r["detail"]
+    assert slot == 1
     conn, seen = wait(d, lambda n, e: n == "conn" and e["state"] == 3)
     assert conn["slot"] == slot and conn["device_id"] == dev and conn["pulsar_version"] == 0x1701
     assert [e["state"] for n, e in seen if n == "conn"] == [1, 2, 3]
+    hand, _ = wait(d, lambda n, e: n == "pair" and e["state"] == 5)
+    assert hand["device_id"] == dev and hand["hand"] == fake.controllers[0].hand != 0
     inputs, imus = [], []
     end = time.monotonic() + 0.3
     for name, e in d.events(0.05):
@@ -154,7 +160,7 @@ def test_host_session():
     assert all(b == (a + 1) & 0xFFFF for a, b in zip(seqs, seqs[1:])), "input seq gaps"
     assert all(b["t_us"] > a["t_us"] for a, b in zip(inputs, inputs[1:]))
     assert imus[0]["bits"] == 16 and imus[0]["accel_fs_g"] == 32 and imus[0]["gyro_fs_dps"] == 4000
-    assert 0 <= inputs[0]["trigger"] < 4096 and inputs[0]["battery_pct"] == 87
+    assert 0 <= inputs[0]["trigger"] < 4096 and inputs[0]["battery_pct"] == 87 and inputs[0]["flags"] == 2
 
     # registers
     d.request(R.CMD_REG_READ, "link_reg_cmd_t", slot=slot, reg=0x15)
@@ -177,9 +183,12 @@ def test_host_session():
     assert r["status"] == 1  # faster than LINK_LED_MIN_PERIOD_US
     r, _ = d.request(R.CMD_LED, "link_led_t", slot=slot, mode=R.LED_ON, check=False)
     assert r["status"] == 1  # real controllers cannot hold the LEDs on
-    d.request(R.CMD_HAPTIC, "link_haptic_t", tail=bytes(range(10)), slot=slot, mode=R.HAPTIC_PCM,
-              amplitude=255, freq_hz=2000, pcm_len=10)
-    assert fake.last_haptic[slot]["pcm"] == bytes(range(10))
+    d.request(R.CMD_HAPTIC, "link_haptic_t", slot=slot, mode=R.HAPTIC_SIMPLE, amplitude=200, freq_hz=160,
+              duration_ms=100)
+    assert fake.last_haptic[slot]["freq_hz"] == 160
+    r, _ = d.request(R.CMD_HAPTIC, "link_haptic_t", tail=bytes(range(10)), slot=slot, mode=R.HAPTIC_PCM,
+                     amplitude=255, freq_hz=2000, pcm_len=10, check=False)
+    assert r["status"] == 5  # PCM (0x9d) is not implemented for real controllers
     r, _ = d.request(R.CMD_HAPTIC, "link_haptic_t", slot=4, mode=R.HAPTIC_SIMPLE, check=False)
     assert r["status"] == 10  # nobody in slot 4
 
@@ -216,9 +225,9 @@ def test_pending_re_behaviour():
     h = d.hello()
     assert "real_conn_neg" in h["caps_names"] and "real_hreg" not in h["caps_names"]
     d.host_start(0x1234, bytes(16), 1)
-    d.request(R.CMD_CONNECT, "link_connect_t", slot=0, device_id=0xAB)
+    d.request(R.CMD_CONNECT, "link_connect_t", slot=0xFF, device_id=0xAB)
     wait(d, lambda n, e: n == "conn" and e["state"] == 3)
-    r, _ = d.request(R.CMD_REG_READ, "link_reg_cmd_t", slot=0, reg=9, check=False)
+    r, _ = d.request(R.CMD_REG_READ, "link_reg_cmd_t", slot=1, reg=9, check=False)
     assert r["status"] == 5
     t_end = time.monotonic() + 0.3
     for name, e in d.events(0.05):
@@ -248,9 +257,10 @@ def test_stored_and_compact():
     assert done["netaddr"] == netaddr and done["hand"] == 0
     wait(d, lambda n, e: n == "conn" and e["state"] == 3)  # no CMD_CONNECT needed
     smp, seen = wait(d, lambda n, e: n == "sample")
-    assert smp["accel"] == [0, 0, 1024] and smp["flags"] & 4 and not any(n in ("input", "imu") for n, _ in seen)
+    assert smp["accel"] == [0, 0, 1024] and smp["flags"] == 0 and not any(n in ("input", "imu") for n, _ in seen)
     p = d.pairings()
     assert p["count"] == 1 and p["pairings"][0]["device_id"] == 0xC0FFEE
+    assert p["pairings"][0]["slot"] == 1 and p["pairings"][0]["hand"] == 1  # even id: left
 
     fake.reboot()  # power cycle: the identity and the pairing survive
     d = R.Dongle(transport=fake)
@@ -297,7 +307,7 @@ def test_hid_transport():
     assert d.hello()["version"] == R.LINK_VERSION  # a 28-byte event spans an IN report boundary
     d.host_start(0x1234, bytes(16), 1, flags=R.HOST_DM_BEACONS | R.HOST_COMPACT)
     fake.controllers[0].paired = (0x1234, bytes(16))
-    d.request(R.CMD_CONNECT, "link_connect_t", slot=0, device_id=fake.controllers[0].device_id)
+    d.request(R.CMD_CONNECT, "link_connect_t", slot=0xFF, device_id=fake.controllers[0].device_id)
     wait(d, lambda n, e: n == "sample")
     # nobody writes for longer than LINK_HID_OPEN_MS: the dongle discards its output
     fake.hid_last_out -= R.HID_OPEN_MS / 1000 + 0.1

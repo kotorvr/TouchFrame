@@ -32,8 +32,15 @@
 //   boot). It is the Pulsar sync clock: host beacons carry its low 48 bits, so controllers that
 //   timestamp in sync-clock units are already on it. Map it to CLOCK_MONOTONIC_RAW with
 //   CMD_TIME_PING (see link_time_pong_t). Sniffer packets (link_packet_t) carry its low 32 bits.
-// * Controllers live in slots 0..4 (LINK_MAX_SLOTS). On air, slot s transmits with access-address
-//   prefix s+1 (docs/PROTOCOL.md Q1).
+// * Controllers live in slots 1..4. On air, slot S transmits with access-address prefix S+1 and
+//   is addressed by beacon bit 1 << S (docs/re/REVIEW-RE.md R1/R4). Slot 0 (prefix 1) is the
+//   negotiation slot that seeking controllers request in: it is never assigned, and status arrays
+//   (LINK_MAX_SLOTS = 5, indexed by slot) always show it FREE.
+// * Real controllers (no LINK_HOST_PLACEHOLDER), once CONNECTED: the dongle reads cmd 1 (the hand,
+//   R11) and cmd 0x32 (IMU scale), writes cmd 9, and re-sends the last CMD_LED (the controller's LED
+//   on-time is back to its default after a reconnect, R16). A CMD_LED / CMD_REG_* sent meanwhile
+//   is queued behind that. Input and IMU arrive as the controller's notifications and come out as
+//   EVT_INPUT / EVT_IMU (or EVT_SAMPLE).
 // * Identity, two ways:
 //   - Stored (LINK_HOST_STORED, normal): the dongle keeps its host identity (netaddr + link key,
 //     generated once at random) and its pairings in flash, so controllers reconnect after power
@@ -137,10 +144,9 @@ enum {
     LINK_CAP_HID = 1u << 5,               // the HID interface is present
     // Set when the matching on-air format is pinned by RE and implemented for real controllers.
     LINK_CAP_REAL_PAIRING = 1u << 8,      // discovery + 0x12/0x11 exchange (PROTOCOL Q2)
-    LINK_CAP_REAL_CONN_NEG = 1u << 9,     // connected-link negotiation / slot lock (RE-1; built to
-                                          // docs/re/LINK.md §4, not yet seen on air)
-    LINK_CAP_REAL_NONCE = 1u << 10,       // steady-state CCM nonce (RE-1; counter start unverified)
-    LINK_CAP_REAL_HREG = 1u << 11,        // register read / write / subscribe (RE-1)
+    LINK_CAP_REAL_CONN_NEG = 1u << 9,     // connection request + accept (REVIEW-RE R1-R4; not yet seen on air)
+    LINK_CAP_REAL_NONCE = 1u << 10,       // steady-state CCM nonce (R7/R8; counter start unverified)
+    LINK_CAP_REAL_HREG = 1u << 11,        // register read / write over the TL header (REVIEW-RE R0)
     LINK_CAP_REAL_INPUT = 1u << 12,       // EVT_INPUT from real controllers (RE-1 + RE-2)
     LINK_CAP_REAL_IMU = 1u << 13,         // EVT_IMU from real controllers (RE-2)
     LINK_CAP_REAL_LED = 1u << 14,         // CMD_LED (RE-2)
@@ -159,6 +165,9 @@ enum {
     LINK_HOST_STORED = 1u << 5,       // use the flash identity (netaddr/link_key in the command are
                                       // ignored), allow every stored pairing into its slot, and store
                                       // new pairings. EVT_RESULT detail = pairings loaded.
+    LINK_HOST_TL_IDLE = 1u << 6,      // real formats: beacons with no downlink carry the idle TL
+                                      // packet [00][seq] (byte 14 = 0), as the Quest does (REVIEW-RE R0
+                                      // rule 2). Whether controllers need it is a hardware-day item.
 };
 
 //------------------------------------------------------------------ v2 sniffer structs (unchanged)
@@ -233,7 +242,8 @@ typedef struct __attribute__((packed)) {
     uint16_t session_nonce;  // beacon bytes 6..7 (PROTOCOL Q1); pick one at random per host start
     uint32_t netaddr;        // connected-link base address, handed to controllers at pairing
     uint8_t link_key[16];    // AES-128 link key, handed to controllers at pairing
-    uint8_t chmap[5];        // 37-bit logical channel map, LSB first; all-ones = every channel. >= 8 bits set
+    uint8_t chmap[5];        // 37-bit logical channel map, LSB first; all-ones = every channel. >= 8 bits set.
+                             // Channels 0, 17 and 36 are always added: seeking controllers listen there (R10)
     int8_t tx_power_dbm;     // nRF52840 TXPOWER: -40..+8 (rounded down to a supported step)
 } link_host_start_t;
 
@@ -317,7 +327,8 @@ typedef struct __attribute__((packed)) {
     uint8_t state;      // link_pair_state
     uint8_t status;     // link_status_code (LINK_OK unless FAILED/STOPPED)
     uint8_t step;       // pairing-link packets exchanged so far (diagnostic)
-    uint8_t hand;       // link_hand (LINK_HAND_UNKNOWN until RE pins where it comes from)
+    uint8_t hand;       // link_hand. UNKNOWN in the first DONE; when the controller first connects
+                        // (cmd 1, REVIEW-RE R11) a second DONE for the same device_id carries it
     uint64_t device_id; // the controller being paired (0 while scanning)
     uint32_t netaddr;   // what it was given (DONE)
 } link_pair_event_t;
@@ -351,7 +362,7 @@ typedef struct __attribute__((packed)) {
 
 typedef struct __attribute__((packed)) {
     uint64_t device_id;
-    uint8_t slot;         // preferred slot (0..4)
+    uint8_t slot;         // preferred slot (1..4)
     uint8_t hand;         // link_hand
     uint16_t reserved;
 } link_pairing_t;
@@ -360,11 +371,13 @@ typedef struct __attribute__((packed)) {
 
 // CMD_CONNECT: allow a paired controller into a slot. It connects when it next seeks (it does so
 // on its own after pairing and after every link loss). slot 0xFF = first free slot; the EVT_RESULT
-// detail byte carries the slot chosen. Slot 4 is not assigned (LINK_ERR_NO_SLOT) while its CL
-// endpoint would be 5 (src/pulsar_ll.h PULSAR_ENDPOINT_OFFSET; docs/re/LINK.md §4: endpoints 1..4).
+// detail byte carries the slot chosen. Slot 0 is the negotiation slot and is never assigned
+// (LINK_ERR_NO_SLOT); slots are 1..4. Real controllers: no disconnect message is known, so one
+// CMD_DISCONNECT let go of stays on the link in its slot until it loses the beacons; that slot is
+// not free meanwhile, and CMD_CONNECT for that controller gives it back (it reconnects at once).
 typedef struct __attribute__((packed)) {
     uint8_t tag;
-    uint8_t slot;        // 0..4, or 0xFF
+    uint8_t slot;        // 1..4, or 0xFF
     uint8_t flags;       // reserved, 0
     uint8_t reserved;
     uint64_t device_id;
@@ -397,9 +410,12 @@ typedef struct __attribute__((packed)) {
 
 //------------------------------------------------------------------ registers (elk host registers)
 
-// CMD_REG_READ (len = bytes wanted, 0 = the register's natural size; no data follows) and
-// CMD_REG_WRITE (len bytes of data follow, len <= LINK_REG_MAX). Register ids are the elk hreg ids
-// of PROTOCOL Q4 (buttons 9, analogs 3 / 0x17, touch 4 / 0x2b, battery 0x15, IMU 0xb / 0x16, ...).
+// CMD_REG_READ (len = bytes wanted, 0 = all the controller returns) and CMD_REG_WRITE (len bytes of
+// data follow, len <= LINK_REG_MAX). Register ids are the controller's command ids
+// (docs/re/LINK.md §3, PERIPHERALS.md). Real formats: a read may carry request parameters after the
+// struct (<= LINK_REG_MAX bytes, e.g. cmd 0x2b's {u32 offset, u32 len}); EVT_REG(READ) carries the
+// response, EVT_REG(WRITE_ACK) the acknowledgement (status LINK_ERR_REJECTED if the controller's
+// handler failed, LINK_ERR_TIMEOUT after 1 s without an answer).
 typedef struct __attribute__((packed)) {
     uint8_t tag;
     uint8_t slot;
@@ -409,7 +425,11 @@ typedef struct __attribute__((packed)) {
 
 enum { LINK_SUB_UNSUBSCRIBE = 1u << 0 };
 
-// CMD_REG_SUBSCRIBE: stream a register as EVT_REG(NOTIFY). period_ms 0 = on change.
+// CMD_REG_SUBSCRIBE: stream a register as EVT_REG(NOTIFY). period_ms 0 = on change. Real formats:
+// the controller pushes its notifications by itself, so this only forwards notification id `reg`
+// (0..63, e.g. 0x0b LED echo, 0x16 battery alerts, 0x17 index curl) as EVT_REG(NOTIFY, reg = ntf
+// id) next to EVT_INPUT / EVT_IMU; period_ms is ignored, and a payload longer than LINK_REG_MAX
+// is cut to its first LINK_REG_MAX bytes.
 typedef struct __attribute__((packed)) {
     uint8_t tag;
     uint8_t slot;
@@ -438,7 +458,8 @@ typedef struct __attribute__((packed)) {
     uint64_t t_us;        // sample time, dongle clock (see flags bit1)
     uint8_t slot;
     uint8_t flags;        // bit0: placeholder format (loopback), bit1: t_us is the uplink arrival
-                          // time (no controller stamp), bit2: IMU scale is a guess (EVT_SAMPLE)
+                          // time (no controller stamp), bit2: IMU scale is a guess (EVT_SAMPLE),
+                          // bit3: no new IMU sample, accel / gyro repeat the last one (EVT_SAMPLE)
     uint16_t seq;         // per-slot counter, increments by 1 per event (gaps = lost samples)
     uint8_t buttons;      // ntf 4: b0 A/X, b1 B/Y, b2 stick click, b3 system/menu
     uint8_t battery_pct;  // ntf 0, 0xFF = unknown
@@ -492,7 +513,8 @@ enum link_led_mode { LINK_LED_OFF = 0, LINK_LED_ON = 1, LINK_LED_STROBE = 2 };
 // period_us, CENTRED at dongle times phase_us + k * period_us; the controller runs it off the
 // shared Pulsar clock. period_us >= LINK_LED_MIN_PERIOD_US and on_us > 0, else LINK_ERR_ARGS;
 // on_us is clamped to LINK_LED_MAX_ON_US. Real controllers cannot hold the LEDs on: ON is for the
-// fake controller only. Cheap to repeat (a phase-search loop may send it at ~5 Hz): a newer CMD_LED
+// fake controller only (LINK_ERR_ARGS); cmd 0x28 has no intensity or LED mask, so a real controller
+// ignores those two fields. Cheap to repeat (a phase-search loop may send it at ~5 Hz): a newer CMD_LED
 // replaces one still queued for that slot.
 typedef struct __attribute__((packed)) {
     uint8_t tag;
@@ -510,7 +532,8 @@ enum link_haptic_mode { LINK_HAPTIC_STOP = 0, LINK_HAPTIC_SIMPLE = 1, LINK_HAPTI
 // CMD_HAPTIC: SIMPLE = a buzz of amplitude at freq_hz (40..561) for duration_ms (controller cmd
 // 0xa0; it stops by itself after 2 s, so re-send for longer; for shorter buzzes the dongle sends the
 // stop at duration_ms). STOP = 0x97 amplitude 0. PCM = `pcm_len` unsigned 8-bit samples at freq_hz
-// follow the struct (<= LINK_PCM_MAX), queued after any PCM already playing (real: 0x9d, RE pending).
+// follow the struct (<= LINK_PCM_MAX), queued after any PCM already playing (real: 0x9d, 3-bit
+// ADPCM, not implemented: LINK_ERR_PENDING_RE).
 typedef struct __attribute__((packed)) {
     uint8_t tag;
     uint8_t slot;
@@ -554,19 +577,20 @@ enum {
     LINK_FAKE_PAIRED = 1u << 0,      // start already paired to netaddr/link_key (skip advertising)
     LINK_FAKE_STREAM_INPUT = 1u << 1,// send synthetic input samples when connected
     LINK_FAKE_STREAM_IMU = 1u << 2,  // send synthetic IMU samples when connected
-    LINK_FAKE_REAL_CONN = 1u << 3,   // connect with the real request / negotiation formats (host
-                                     // without LINK_HOST_PLACEHOLDER); nothing else after that
+    LINK_FAKE_REAL_CONN = 1u << 3,   // the real connected-link formats (host without
+                                     // LINK_HOST_PLACEHOLDER): request, accept, TL, notifications
 };
 
 // CMD_FAKE_START: this dongle plays a Touch Plus. Unpaired, it advertises on 2402 and answers the
-// 2426 pairing exchange like the controller SPL (0x12 / 0x11, real formats). Paired, it seeks the
-// host's beacons, follows the hop and talks in its slot using the placeholder connected-link
-// formats (the host must run with LINK_HOST_PLACEHOLDER). Reports EVT_PAIR / EVT_CONN for its own
-// side. Stop with CMD_STOP.
+// 2426 pairing exchange like the controller SPL (0x25 / 0x22 / Reset 0x2a, real formats). Paired, it
+// seeks the host's beacons on channels 0/17/36, follows the hop and talks in its slot: with
+// LINK_FAKE_REAL_CONN in the real formats all the way (TL registers, notification input / IMU),
+// else in the placeholder formats (the host must run with LINK_HOST_PLACEHOLDER). Reports EVT_PAIR /
+// EVT_CONN for its own side. Stop with CMD_STOP.
 typedef struct __attribute__((packed)) {
     uint8_t tag;
     uint8_t flags;        // LINK_FAKE_*
-    uint8_t slot;         // slot to ask for when paired (0..4)
+    uint8_t slot;         // placeholder: slot to ask for when paired (0..4); real: ignored
     uint8_t reserved;
     uint64_t device_id;   // 0 = this dongle's FICR DEVICEID
     uint32_t netaddr;     // with LINK_FAKE_PAIRED
