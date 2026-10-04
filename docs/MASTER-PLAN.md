@@ -34,7 +34,7 @@ plus position from Frame hand tracking or the relay. Plan B is in §6.
 | SteamVR driver, bindings, render models, skeleton, haptics | **Done** (relay) | `driver/src/driver.cpp`, verified on the Frame |
 | Relay (Quest bridge, watchdog, install, calibration) | **Done** | INSTALL.md, 7.6 mm calibration RMS |
 | Camera-tracker injection (block queues) | **Proven with a cloned Frame controller** | FRAME-TRACKER §9: 2.3 mm / 0.64° |
-| `CvTouchSource` (camera poses + external feed) | Written, **not wired into the Provider**, no feed | `driver/src/cv_source.*`; the Provider only builds `UdpSource` |
+| `CvTouchSource` (camera poses + external feed) | **Wired (BUILD-2, merged)**: `driver_touchframe.mode` = relay \| radio_camera \| radio_3dof, fed by RadioSource over hidraw | `driver/RADIO.md` |
 | Radio RE: PHY, addresses, hop, beacon, timing, pairing, CCM structure, version, input sample | **Static RE done** | PROTOCOL.md Q1–Q6 |
 | Radio RE: what the host *says* on the connected link | **Not done** (see §3.1) | PROTOCOL.md has no connection-negotiation, CL/TL or register-access layouts |
 | Dongle firmware | **Host mode done offline (BUILD-1 + BUILD-1b, merged)**: needs hardware validation (HARDWARE-DAY "Host mode"). Earlier note: Sniffer on main. **BUILD-1 in progress:** link v3, crypto, host core, fake controller and a C loopback simulator (branch `claude/exciting-bun-66e32e`). **Transport must become USB HID** (the Frame has no CDC ACM) | BUILD-1 report, DEV-1 |
@@ -209,11 +209,11 @@ decides.
 | RE-3 | the plan was written | **ended, blocked**: stopped by a safety check, nothing committed. Touch-only was answered live by DEV-1. The exposure-timing hook is dropped; BUILD-2's closed-loop LED phase sweep replaces it. |
 | RE-3b Frame tracker vs Touch Plus model | DEV-1's error flood ("Couldn't find any neighbor", ~300/s) | **done, merged**: [re/FRAME-MODEL.md](re/FRAME-MODEL.md); flood fixed via model_number |
 | RE-2 | the plan was written | **done, merged 31f35fd**: [re/PERIPHERALS.md](re/PERIPHERALS.md) |
-| BUILD-2 Driver radio backend | BUILD-1 reports link v3 committed | **running (started 2026-10-04)** (base e430b12; hidraw transport) |
+| BUILD-2 Driver radio backend | BUILD-1 reports link v3 committed | **done, merged c585232**: RadioSource (hidraw), time sync, IMU SI + rectification, LED phase closed loop (seeded from XRService frame stamps), radio_camera/radio_3dof modes, Touch-only create, re-announce, install.sh radio; driver tests pass on main |
 | REVIEW-RE | RE-1 and RE-2 are merged | **done, merged 19c8bd8**: [re/REVIEW-RE.md](re/REVIEW-RE.md). TL header pinned; 6 BLOCKING firmware bugs (R1–R6); handedness, the DC threshold (25 beacons) and the seek cadence closed |
 | BUILD-1b firmware + tool fixes | REVIEW-RE's BUILD-1 checklist | **done, merged c06d4bb**: all REVIEW-RE fixes; real controllers get input/IMU/LED/haptics (PCM pending). Build clean, all tests pass |
 | DEV-1 on-device bench | the Echo session releases the Quest + Frame | **done, merged 5a0b33d**: [re/DEV-1.md](re/DEV-1.md); devices handed back to Echo |
-| HW-1 Sniff & validate | the dongles arrive (the user says so) | waiting |
+| HW-1 Sniff & validate | the dongles arrive (the user says so) | **waiting on hardware. All offline work is done (2026-10-04)** |
 | HW-2 Host bring-up | HW-1 done + BUILD-1 merged + REVIEW-RE has no blockers | waiting |
 | HW-3 Gate B + tracking | HW-2 passes G-Link + BUILD-2 merged | waiting |
 | HW-4 Integrate & ship | HW-3 decides G-B (6DoF or Plan B) | waiting |

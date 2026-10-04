@@ -1,6 +1,8 @@
 # Installing the TouchFrame relay
 
-The relay puts Quest 3 Touch Plus controllers on a standalone Steam Frame. A Quest 3 headset sits on a shelf as the controllers' radio and tracker, and its bridge app streams their state over Wi-Fi to the `driver_touchframe` SteamVR driver on the Frame. Haptics go back the same way. This is Phase 1 of [FEASIBILITY.md](FEASIBILITY.md); the native radio and camera tracking come later.
+The relay puts Quest 3 Touch Plus controllers on a standalone Steam Frame. A Quest 3 headset sits on a shelf as the controllers' radio and tracker, and its bridge app streams their state over Wi-Fi to the `driver_touchframe` SteamVR driver on the Frame. Haptics go back the same way. This is Phase 1 of [FEASIBILITY.md](FEASIBILITY.md).
+
+**Native radio (no Quest):** the driver also has `radio_camera` and `radio_3dof` modes, which use the nRF52840 dongle on the Frame. The settings, modes and install (`tools/install.sh radio`) are in [driver/RADIO.md](../driver/RADIO.md). They're built and tested offline, and get validated on hardware day ([HARDWARE-DAY.md](HARDWARE-DAY.md)).
 
 ```
 Touch Plus ──radio──> Quest 3 (shelf, quest-bridge) ──UDP 28430──> Steam Frame (driver_touchframe) ──> SteamVR games
