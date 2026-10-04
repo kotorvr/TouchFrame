@@ -165,8 +165,13 @@ Rules for every session:
   - Sessions started from chips run in a fresh worktree and commit on its branch; the planner merges.
     `artifacts/` (and `radio-fw/third_party/`) are gitignored, so they're missing there. Junction
     them from the main checkout: `cmd /c mklink /J artifacts C:\Users\kaibo\Desktop\Echo\TouchFrame\artifacts`.
-- **Device lock:** only one session drives the Quest/Frame/dongle at a time. Claim it in chat, and
-  message other sessions before installs or SteamVR restarts.
+- **Device lock:** the Quest 3 and Frame are shared with the EchoQuestCombat chats (up to 4 at once).
+  Before you install, launch, stop, BT-scan, pair or restart SteamVR, **atomically create**
+  `C:\Users\kaibo\Desktop\Echo\.locks\quest.lock` or `frame.lock`. It holds one line:
+  `<chat> <purpose> <ISO expiry>`, with the expiry at most 30 min ahead. Renew it while in use,
+  delete it when done, and treat an expired lock as free. Still message other sessions before
+  launches and stops. The dongles are TouchFrame-only: one session drives them at a time,
+  claimed in chat.
 - Static RE tags stay **CONFIRMED / INFERRED / UNKNOWN**, with addresses. No Meta/Valve bytes in the
   repo (README "Legal").
 - Commit small. Run `/code-review` on build branches before merging.
