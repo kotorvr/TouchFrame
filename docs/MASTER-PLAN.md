@@ -162,6 +162,9 @@ Rules for every session:
   - RE sessions write **only** their own `docs/re/<NAME>.md` plus the tools they own.
   - The **planner** (this chat) folds RE results into PROTOCOL.md / FRAME-TRACKER.md.
   - Build sessions own their directories and work in a worktree on a branch.
+  - Sessions started from chips run in a fresh worktree and commit on its branch; the planner merges.
+    `artifacts/` (and `radio-fw/third_party/`) are gitignored, so they're missing there. Junction
+    them from the main checkout: `cmd /c mklink /J artifacts C:\Users\kaibo\Desktop\Echo\TouchFrame\artifacts`.
 - **Device lock:** only one session drives the Quest/Frame/dongle at a time. Claim it in chat, and
   message other sessions before installs or SteamVR restarts.
 - Static RE tags stay **CONFIRMED / INFERRED / UNKNOWN**, with addresses. No Meta/Valve bytes in the
