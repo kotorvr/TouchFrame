@@ -146,7 +146,7 @@ elk `0x24092..0x240d6`, connection-request builder elk `0x23bc4`):
   preceding AP1 beacon automatically.
 
 `tools/pulsar_host.py` exposes `legacy_nonce(session_nonce, beacon_ts48)` (a) and
-`steady_state_nonce(counter, iv, direction=1)` (b), plus `parse_conn_request()` to pull the steady
+`steady_state_nonce(counter, iv, direction=0)` (b; direction is 0, REVIEW-RE R8), plus `parse_conn_request()` to pull the steady
 IV out of the connection request; all with selftests. `pulsar_crypto.py` `candidate_nonces` /
 `scan` lead with these two regimes (A8 fixes: S0-aware header strip, AAD = `S0 & 0xE3`, beacon
 tracking, a real AES-CCM MIC selftest).

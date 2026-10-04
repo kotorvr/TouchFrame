@@ -37,7 +37,7 @@ plus position from Frame hand tracking or the relay. Plan B is in §6.
 | `CvTouchSource` (camera poses + external feed) | Written, **not wired into the Provider**, no feed | `driver/src/cv_source.*`; the Provider only builds `UdpSource` |
 | Radio RE: PHY, addresses, hop, beacon, timing, pairing, CCM structure, version, input sample | **Static RE done** | PROTOCOL.md Q1–Q6 |
 | Radio RE: what the host *says* on the connected link | **Not done** (see §3.1) | PROTOCOL.md has no connection-negotiation, CL/TL or register-access layouts |
-| Dongle firmware | Sniffer on main. **BUILD-1 in progress:** link v3, crypto, host core, fake controller and a C loopback simulator (branch `claude/exciting-bun-66e32e`). **Transport must become USB HID** (the Frame has no CDC ACM) | BUILD-1 report, DEV-1 |
+| Dongle firmware | **Host mode done offline (BUILD-1 + BUILD-1b, merged)**: needs hardware validation (HARDWARE-DAY "Host mode"). Earlier note: Sniffer on main. **BUILD-1 in progress:** link v3, crypto, host core, fake controller and a C loopback simulator (branch `claude/exciting-bun-66e32e`). **Transport must become USB HID** (the Frame has no CDC ACM) | BUILD-1 report, DEV-1 |
 | Offline host tools | Pairing packets, CCM decode, input decode | `tools/pulsar_{host,crypto,input}.py`, all selftests green |
 | Gate B (do Frame cameras see Touch Plus LEDs?) | **Open.** Relay run: 0 hits in 4.5 min (expected: the Quest strobes 19 µs at 15 Hz). XRService logs ~300 "Couldn't find any neighbor" errors/s with the 8-LED model, which is a new risk. LEDs are strobe-only (RE-2), so the real test needs the dongle plus exposure sync | [re/DEV-1.md](re/DEV-1.md), [re/PERIPHERALS.md](re/PERIPHERALS.md) |
 | Touch-only operation (no Frame controller ever connected) | **YES, CONFIRMED on device.** Our driver can Create the shared queues and XRService tracks the injected device. Cost: the first Frame controller of that SteamVR session then gets no pose. driver_cv's queues also survive its last controller disconnecting | [re/DEV-1.md](re/DEV-1.md) |
@@ -211,7 +211,7 @@ decides.
 | RE-2 | the plan was written | **done, merged 31f35fd**: [re/PERIPHERALS.md](re/PERIPHERALS.md) |
 | BUILD-2 Driver radio backend | BUILD-1 reports link v3 committed | **running (started 2026-10-04)** (base e430b12; hidraw transport) |
 | REVIEW-RE | RE-1 and RE-2 are merged | **done, merged 19c8bd8**: [re/REVIEW-RE.md](re/REVIEW-RE.md). TL header pinned; 6 BLOCKING firmware bugs (R1–R6); handedness, the DC threshold (25 beacons) and the seek cadence closed |
-| BUILD-1b firmware + tool fixes | REVIEW-RE's BUILD-1 checklist | **running (started 2026-10-04)**: must land before HW-2 |
+| BUILD-1b firmware + tool fixes | REVIEW-RE's BUILD-1 checklist | **done, merged c06d4bb**: all REVIEW-RE fixes; real controllers get input/IMU/LED/haptics (PCM pending). Build clean, all tests pass |
 | DEV-1 on-device bench | the Echo session releases the Quest + Frame | **done, merged 5a0b33d**: [re/DEV-1.md](re/DEV-1.md); devices handed back to Echo |
 | HW-1 Sniff & validate | the dongles arrive (the user says so) | waiting |
 | HW-2 Host bring-up | HW-1 done + BUILD-1 merged + REVIEW-RE has no blockers | waiting |

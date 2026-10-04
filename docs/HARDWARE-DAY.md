@@ -139,15 +139,26 @@ exposes buttons/triggers/stick/touch as individual host-registers assembled from
 verifies the deerfly checksum offline — field *values* are decoded; a few *semantics* (which analog
 is which axis, button-bit labels, battery scale) stay inferred until confirmed against a live dump.
 
-## Host mode (dongle acts as host — needs the dongle; sequence is pinned)
-Pairing is fully specified (PROTOCOL.md Q2, #1): send `SetupX25519Keys` (0x12) to exchange public
-keys, derive the X25519 secret, then send `PairingData` (0x11) carrying `[4-byte base addr][16-byte
-link key]` CCM-wrapped under the first 16 bytes of the secret (`WriteAESKey` 0x14 is a stub — skip
-it). `tools/pulsar_host.py` builds and self-verifies those frames offline. Advertise host Pulsar
-version **`0x1701`** (on-air `01 17`) and never reject the controller (PROTOCOL.md Q6, #5).
-Not ready yet: the firmware has no TX path (BUILD-1), and after pairing the host must negotiate the
-connection and read registers / set LEDs / send haptics in formats RE-1 and RE-2 are still pinning
-(PROTOCOL open items 8–10).
+## Host mode (dongle acts as host): firmware ready, run in HW-2
+The firmware implements the whole host (BUILD-1 + BUILD-1b, to [re/REVIEW-RE.md](re/REVIEW-RE.md)):
+- pairing: `0x25` SetupX25519, then `0x22` PairingData with our own key, then Reset `0x2a`;
+- connection negotiation, with one accept on slots 1..4;
+- the TL header for register reads/writes and notifications;
+- input/IMU events, LED (cmd 0x28) and haptics (0xa0/0x97).
+See radio-fw/README.md "Host mode" for the commands
+(`radio.py host --pair any`, `pairings`, `forget`, `ping`).
+
+Settle these on the first live session, with the second dongle sniffing (radio-fw/README "Needs
+hardware"):
+- whether the idle TL packet is needed: try without, then `radio.py host --tl-idle`;
+- which beacon period the steady CCM counter starts in;
+- whether the 14-byte accept is enough;
+- whether controllers react to missing beacon acks;
+- HID throughput on the Frame;
+- whether pairings survive DFU.
+
+Not implemented: PCM haptics (0x9d). No real "disconnect" message is known: a dropped controller's
+slot frees when it goes quiet.
 
 ## 6. Gate B: do the Frame cameras see Touch Plus LEDs? (needs the Frame + a Touch Plus)
 This does **not** need the dongle; it reuses the relay. It is the one open question for 6DoF.
