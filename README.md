@@ -10,6 +10,7 @@ Docs:
 - [FRAME-TRACKER.md](docs/FRAME-TRACKER.md): Frame camera-tracker RE and injection.
 - [HARDWARE-DAY.md](docs/HARDWARE-DAY.md): dongle runbook.
 - [INSTALL.md](docs/INSTALL.md): relay install.
+- [docs/re/](docs/re/): per-session RE and bench reports (PERIPHERALS, AUDIT, DEV-1, and later LINK and FRAME-MODEL). Authoritative where they correct the docs above.
 
 ## Layout
 - `driver/`: SteamVR (OpenVR) driver `driver_touchframe`, built natively on the Frame (aarch64). It presents two `oculus_touch` controllers with Quest 3 render models, hand skeletons and haptics. Input comes from a pluggable source; today that's a UDP relay (`driver/src/protocol.h`).

@@ -8,6 +8,11 @@ Nothing on this list needs the Frame except the Gate B section at the end. Sessi
 needs the firmware TX path and the post-pairing command layer. Neither exists yet: sessions BUILD-1
 and RE-1/RE-2.
 
+**Pairing a controller to the dongle unpairs it from the Quest.** Expect the relay (the working
+setup today) to stop for that controller until you re-pair it in the Quest's controller settings.
+Whether a Touch Plus can remember two hosts is not known yet. Pair one controller first, and keep
+the other on the Quest until HW-2 is solid.
+
 **Before you start:**
 - [ ] OTG adapter: the dongle is USB-A, the Frame is USB-C. Not needed for §0–5 on the PC.
 - [ ] Ideally a second dongle: one host, one sniffer.
