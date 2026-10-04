@@ -361,7 +361,7 @@ byte-14 downlink-slot bit and byte-15 ack bitmap), with round-trip selftests.
   `PULSAR_DM_FLAG_ECDH_PAIRING`, `_APP_REQUEST`, `_USER_RESET`, `_CORRUPT_APP`, `_ASSERT_SET`,
   `_IS_SPOOFING` — presence of `ECDH_PAIRING` is the "this device will do our anonymous pairing" cue
   (`"Pulsar device type 0x%x does not support ECDH pairing."` is the reject). The DM framing is a
-  host-polled ping-pong `[ctrl][seq][data…]` (PROTOCOL Q1 "Pairing link framing"); INFERRED.
+  host-polled ping-pong `[ctrl][seq][data…]` (PROTOCOL Q2 "DM link and SPL framing"); INFERRED.
 - **SPL command framing (CONFIRMED, PROTOCOL Q2 + AUDIT A5).** Frame = `[LENGTH][cmd][seq][payload]`.
   The `cmd` byte encodes a command **number** and a read/write bit: the dispatcher `elk-spl
   FUN_0000822c` does `ldrb r1,[r0],#2` (first byte), `ands #1` (bit0 = read/write), `ubfx r1,#1,#6`

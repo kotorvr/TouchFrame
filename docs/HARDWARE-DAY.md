@@ -79,7 +79,7 @@ python tools/radio.py sniff --preset discovery --out disc.jsonl
 ```bash
 python tools/radio.py sniff --freq 26 --base <deviceID_low_u32> --prefix 0xAA --no-crc --out pair.jsonl
 ```
-`<deviceID_low_u32>` = advert bytes 5–8 as a little-endian u32 (PROTOCOL.md Q1 pairing row).
+`<deviceID_low_u32>` = advert bytes 5–8 as a little-endian u32 (PROTOCOL.md Q1 "Addresses" and "Sniffer recipes").
 `pulsar_analyze.py pair.jsonl` for the ping-pong framing.
 
 The exchange is two commands (PROTOCOL.md Q2, confirmed from firmware): `SetupX25519Keys` (0x12,
@@ -104,40 +104,30 @@ Watch the status line: `follow: N beacons … LOCKED` means it's tracking the ho
 parks on one channel if you'd rather. `pulsar_analyze.py conn.jsonl` splits host (`addr` 1) from
 controllers (`addr` 2+) and shows the 2 ms beacon cadence and uplink slots.
 
-## 5. Decode a connected packet (optional, offline, needs the key)
+## 5. Decode a connected packet (our own dongle's sessions only)
 
-> **Mostly not possible against a real Quest (AUDIT-1, [re/AUDIT.md](re/AUDIT.md) A2–A8).**
-> - A real Quest pairs with **0x1d**: the link key is the X25519 shared secret[:16], per device and
->   never on air. The global `pulsar_aes_key.bin` is only the fallback, and DEV-1 found it doesn't
->   even exist on this Quest.
-> - The nonce model below is wrong. The negotiation IV is `session_nonce<<48 | beacon_ts48` with
->   counter 0. The steady IV comes from the controller's connection request, with a per-slot
->   counter. CCM is uplink only; beacons and downlink are plaintext.
-> - `pulsar_crypto.py scan` will be fixed (A8), but expect §5 to work only on **our own dongle's
->   sessions** (HW-2), where we chose the key. Sniffing a Quest is still useful for plaintext
->   beacons, timing and framing (§1–4).
-The AES key never crosses the air. With the headset's `/data/misc/pulsar_aes_key.bin` (or the
-documented default) in hand:
+**Not possible against a real Quest.** A Quest pairs with `0x1d`, so the link key is the X25519
+shared secret[:16]: per device, never on air (PROTOCOL.md Q2 "0x11 vs 0x1d"). On this Quest the
+global `pulsar_aes_key.bin` doesn't exist either (DEV-1). Sniffing a Quest is still useful for the
+**plaintext** beacons and downlink, timing and framing (§1–4). Only the uplink is encrypted
+(PROTOCOL.md Q3 "CCM: uplink only").
 
-The CCM nonce is a per-packet counter + an **8-byte random session IV** (PROTOCOL.md Q3, confirmed
-from firmware). That IV is sent in the clear, once, in the connection-negotiation packet: its
-first 8 payload bytes. **Caveat (open contradiction, PROTOCOL Q3 note):** the function that makes
-that IV builds a blob exactly the shape of `PairingData` 0x11, so the IV may only be on air on
-2426 MHz during a pairing. If you can't find a negotiation packet on the connected link, re-pair a
-controller from the Quest while sniffing §3 and take the IV from the 0x11 payload's first 8 bytes. Grab those, then let `scan` sweep the counter against the fixed IV:
+**Our dongle's sessions (HW-2) can be decoded**, because we chose the key (`radio.py pairings`, or
+`--identity FILE`). The nonces (PROTOCOL.md Q3 "Nonces"):
+- the connection-negotiation packet uses counter 0, IV = `session_nonce<<48 | beacon_ts48`, both
+  taken from the preceding beacon;
+- the steady state uses the 8-byte IV from the controller's connection request, with the counter
+  advancing once per beacon period (+ skipped periods) since the accept, direction 0.
+
 ```bash
-python tools/pulsar_crypto.py scan --key <32 hex> --capture conn.jsonl --iv <8 bytes from negotiation>
+python tools/pulsar_crypto.py scan --key <32 hex> --capture conn.jsonl
 ```
-A verifying 4-byte MIC confirms the key, the IV, the counter and the capture at once. If you did
-*not* capture the negotiation packet, run `scan` without `--iv` to try the (firmware-contradicted,
-last-ditch) `--session`-derived fallbacks. `decode` takes one packet with explicit `--counter`/`--iv`
-for iterating — the negotiation packet itself is `--counter 0 --iv <those 8 bytes>`.
+`scan` tracks the beacons for session and timestamp, and finds the connection request's IV itself.
+A verifying 4-byte MIC confirms key, nonce and capture at once. `decode` takes one packet with
+explicit `--counter`/`--iv` for iterating.
 
-Once decrypted, input is **not** a single packed report (PROTOCOL.md Q4, #6): the controller
-exposes buttons/triggers/stick/touch as individual host-registers assembled from a 61-byte
-"deerfly" sample. `tools/pulsar_input.py` parses that sample/those registers into named fields and
-verifies the deerfly checksum offline — field *values* are decoded; a few *semantics* (which analog
-is which axis, button-bit labels, battery scale) stay inferred until confirmed against a live dump.
+Once decrypted, input is register traffic, not a packed report (PROTOCOL.md "Register access: the
+TL layer" and Q4). `tools/pulsar_input.py` decodes the notification chunk stream into named fields.
 
 ## Host mode (dongle acts as host): firmware ready, run in HW-2
 The firmware implements the whole host (BUILD-1 + BUILD-1b, to [re/REVIEW-RE.md](re/REVIEW-RE.md)):
