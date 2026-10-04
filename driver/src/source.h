@@ -8,16 +8,9 @@
 #include <netinet/in.h>
 
 #include "protocol.h"
+#include "touch_source.h"
 
 namespace tf {
-
-class ITouchSource {
-public:
-    virtual ~ITouchSource() = default;
-    virtual bool Start() = 0;
-    virtual void Stop() = 0;
-    virtual void SendHaptic(int hand, float amplitude, float frequency, float duration_s) = 0;
-};
 
 using StateCallback = std::function<void(const StatePacket&, uint64_t recv_ns)>;
 

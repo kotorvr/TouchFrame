@@ -34,6 +34,8 @@ enum Cmd : uint8_t {
     CMD_LED = 0x19,
     CMD_HAPTIC = 0x1A,
     CMD_TIME_PING = 0x1B,
+    CMD_PAIR_LIST = 0x1E,
+    CMD_PAIR_FORGET = 0x1F,
 };
 
 enum Evt : uint8_t {
@@ -51,6 +53,15 @@ enum Evt : uint8_t {
     EVT_UPLINK = 0x8F,
     EVT_SAMPLE = 0x90,  // LINK_HOST_COMPACT: one input + IMU sample (link_sample_t)
     EVT_SOF = 0x91,     // informational, once a second
+    EVT_PAIRINGS = 0x92,
+};
+
+enum Caps : uint16_t {
+    CAP_HOST = 1u << 1,
+    CAP_PLACEHOLDER = 1u << 3,
+    CAP_STORE = 1u << 4,  // flash identity + pairings (HOST_STORED, PAIR_LIST / PAIR_FORGET)
+    CAP_HID = 1u << 5,
+    CAP_REAL_INPUT = 1u << 12,
 };
 
 enum Status : uint8_t {
@@ -75,7 +86,10 @@ enum HostFlags : uint8_t {
     HOST_RAW_UPLINKS = 1u << 2,
     HOST_PLACEHOLDER = 1u << 3,  // loopback only (our fake controller)
     HOST_COMPACT = 1u << 4,      // EVT_SAMPLE instead of EVT_INPUT + EVT_IMU (needed on HID: 64 B/ms)
+    HOST_STORED = 1u << 5,       // the dongle's flash identity and pairings (netaddr/key ignored)
 };
+enum { FORGET_ALL = 1u << 0, FORGET_IDENTITY = 1u << 1 };
+enum LinkHand : uint8_t { HAND_UNKNOWN = 0, HAND_LEFT = 1, HAND_RIGHT = 2 };
 
 enum SlotState : uint8_t { SLOT_FREE = 0, SLOT_WAITING = 1, SLOT_NEGOTIATING = 2, SLOT_CONNECTED = 3, SLOT_LOST = 4 };
 enum PairState : uint8_t {
@@ -113,10 +127,13 @@ struct HostStart {
 struct PairStart { uint8_t tag, flags; uint16_t timeout_s; uint64_t device_id; };
 struct PairEvt {
     uint64_t t_us;
-    uint8_t state, status, step, reserved;
+    uint8_t state, status, step, hand;  // hand: LinkHand
     uint64_t device_id;
     uint32_t netaddr;
 };
+struct PairForget { uint8_t tag, flags; uint16_t reserved; uint64_t device_id; };
+struct Pairings { uint32_t netaddr; uint8_t count, flags; uint16_t writes_left; };  // + count Pairing
+struct Pairing { uint64_t device_id; uint8_t slot, hand; uint16_t reserved; };
 struct Connect { uint8_t tag, slot, flags, reserved; uint64_t device_id; };
 struct ConnEvt {
     uint64_t t_us;
@@ -177,6 +194,9 @@ static_assert(sizeof(HelloEvt) == 28, "link_hello_t");
 static_assert(sizeof(HostStart) == 30, "link_host_start_t");
 static_assert(sizeof(PairStart) == 12, "link_pair_start_t");
 static_assert(sizeof(PairEvt) == 24, "link_pair_event_t");
+static_assert(sizeof(PairForget) == 12, "link_pair_forget_t");
+static_assert(sizeof(Pairings) == 8, "link_pairings_t");
+static_assert(sizeof(Pairing) == 12, "link_pairing_t");
 static_assert(sizeof(Connect) == 12, "link_connect_t");
 static_assert(sizeof(ConnEvt) == 24, "link_conn_event_t");
 static_assert(sizeof(RegCmd) == 4, "link_reg_cmd_t");
