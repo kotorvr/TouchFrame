@@ -18,6 +18,11 @@ SRC_C = \
   src/sniffer.c \
   src/pulsar_hop.c \
   src/crypto.c \
+  src/pulsar_ll.c \
+  src/pulsar_cl.c \
+  src/pulsar_pair.c \
+  src/host_core.c \
+  src/ctrl_core.c \
   src/usb_descriptors.c \
   $(TP)/nrfx/mdk/system_nrf52840.c \
   $(TP)/tinyusb/src/tusb.c \
