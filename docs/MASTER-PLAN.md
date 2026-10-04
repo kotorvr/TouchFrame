@@ -37,10 +37,10 @@ plus position from Frame hand tracking or the relay. Plan B is in §6.
 | `CvTouchSource` (camera poses + external feed) | Written, **not wired into the Provider**, no feed | `driver/src/cv_source.*`; the Provider only builds `UdpSource` |
 | Radio RE: PHY, addresses, hop, beacon, timing, pairing, CCM structure, version, input sample | **Static RE done** | PROTOCOL.md Q1–Q6 |
 | Radio RE: what the host *says* on the connected link | **Not done** (see §3.1) | PROTOCOL.md has no connection-negotiation, CL/TL or register-access layouts |
-| Dongle firmware | **Sniffer only: there is no transmit path** | `radio-fw/src/link.h` has CONFIG/STOP/STATUS/SWEEP/DFU only |
+| Dongle firmware | Sniffer on main. **BUILD-1 in progress:** link v3, crypto, host core, fake controller and a C loopback simulator (branch `claude/exciting-bun-66e32e`). **Transport must become USB HID** (the Frame has no CDC ACM) | BUILD-1 report, DEV-1 |
 | Offline host tools | Pairing packets, CCM decode, input decode | `tools/pulsar_{host,crypto,input}.py`, all selftests green |
-| Gate B (do Frame cameras see Touch Plus LEDs?) | **Open.** The relay test can't settle it (§3.2) | `tools/frame.sh gateb` |
-| Touch-only operation (no Frame controller ever connected) | **Open, untested** | FRAME-TRACKER §7, §9.3 |
+| Gate B (do Frame cameras see Touch Plus LEDs?) | **Open.** Relay run: 0 hits in 4.5 min (expected: the Quest strobes 19 µs at 15 Hz). XRService logs ~300 "Couldn't find any neighbor" errors/s with the 8-LED model, which is a new risk. LEDs are strobe-only (RE-2), so the real test needs the dongle plus exposure sync | [re/DEV-1.md](re/DEV-1.md), [re/PERIPHERALS.md](re/PERIPHERALS.md) |
+| Touch-only operation (no Frame controller ever connected) | **YES, CONFIRMED on device.** Our driver can Create the shared queues and XRService tracks the injected device. Cost: the first Frame controller of that SteamVR session then gets no pose. driver_cv's queues also survive its last controller disconnecting | [re/DEV-1.md](re/DEV-1.md) |
 
 ## 3. What's left, and what this pass found
 
@@ -56,9 +56,9 @@ has to *talk* to the controller after pairing, and none of that is documented ye
    host-registers (hreg), and how it subscribes to streams (input, IMU) or receives notifications
    (`ntf_reg_irled_config_t` hints at a notify path). PROTOCOL Q4 lists *which* registers hold
    the data, but not *how to ask for them*.
-3. **Steady-state CCM nonce.** A host must *produce* valid MICs, not just check them, so the
+3. ~~**Steady-state CCM nonce.**~~ **Mostly settled by AUDIT-1 (A2–A4):** CCM is **uplink only**, so the host never produces MICs; it only decrypts. The steady IV comes from the controller's connection request, with a per-slot counter. Left for RE-1: the IV's origin and the counter increment. Original text: A host must *produce* valid MICs, not just check them, so the
    per-packet counter/IV/direction packing must be pinned (elk-app's per-packet CCM writes).
-4. **Possible conflation to resolve.** `syncboss FUN_00047604` encrypts a 20-byte blob to 24 bytes
+4. ~~**Possible conflation to resolve.**~~ **RESOLVED by AUDIT-1 A1:** `FUN_00047604` is only the pairing wrap. Original text: `syncboss FUN_00047604` encrypts a 20-byte blob to 24 bytes
    with a random IV. That is exactly the `PairingData` 0x11 layout ([4-byte addr][16-byte key]).
    PROTOCOL Q2 says so, but Q3 and HARDWARE-DAY §5 call it the *connected-link* "connection
    negotiation" and tell you to grab the IV from the connected link. elk-app's "Must use legacy
@@ -82,7 +82,7 @@ has to *talk* to the controller after pairing, and none of that is documented ye
 9. **Pairing link details still INFERRED:** how the host opens the 2426 MHz DM link with an
    advertising controller, the SPL-frame CRC byte order, and what the controller does after 0x11
    (reboot to app?).
-10. **Optional:** the *default* AES key in `libsyncboss.so` / syncboss. If a Quest runs on the
+10. **Mostly moot (AUDIT-1 A7):** a real Quest pairs with 0x1d (per-device key = X25519 secret[:16], never on air), so even the default key wouldn't decode its sessions. Original text: the *default* AES key in `libsyncboss.so` / syncboss. If a Quest runs on the
     default, its sessions can be decrypted without root.
 
 **Best RE source not yet mined:** `artifacts/quest/odm/lib64/libsyncboss.so` (host Android
@@ -114,7 +114,7 @@ HARDWARE-DAY §6 and FEASIBILITY now say this.
 - **Dongle host firmware:** TX, the 2 ms beacon scheduler, CSA#1 (already in `pulsar_hop.c`),
   inline HW CCM, uplink slot RX, the pairing state machine, and link protocol v3 (pair / connect /
   register read-write / LED / haptics / IMU+input events / time sync).
-- **Driver radio backend:** a `RadioSource` reading the dongle (`/dev/ttyACM*` on the Frame),
+- **Driver radio backend:** a `RadioSource` reading the dongle over **hidraw** (`/dev/hidraw*`, group input, steamos already a member, no udev rule. The Frame kernel has no CDC ACM: DEV-1),
   dongle-µs → CLOCK_MONOTONIC_RAW time sync, IMU rectification (raw → SI with per-unit cal) into
   `CvTouchSource`, a Provider mode switch (relay | radio+camera | radio 3DoF), a udev rule and
   install support.
@@ -261,7 +261,7 @@ statistics), because it never touches the hardware.
 | Gate | Decided by | If it fails |
 |---|---|---|
 | **G-LED** can the controller hold its LEDs on? | **ANSWERED NO by RE-2 (2026-10-04)**: cmd 0x28 on-time is clamped to 75 µs, p ≤ 500 ms, p ≥ 700 µs for safety, phase `d` = pulse centre on the host (dongle) clock | **Strobe in sync is now the plan:** RE-3's exposure-schedule tap, plus dongle-µs ↔ CLOCK_MONOTONIC_RAW sync good to well under ±37 µs (or a closed loop that walks `d` to maximise XRService's LED matches), with p = the Frame controller-frame period. This is now on the critical path. |
-| **G-Touch-only** can queues exist without a Frame controller? | RE-3, DEV-1 | Workaround: power one Frame controller on per session, then off. Document it. |
+| **G-Touch-only** can queues exist without a Frame controller? | **ANSWERED YES by DEV-1 (2026-10-04)** | Create them only if none exist. If the user later powers on a Frame controller in the same session, it gets no pose until SteamVR restarts, so document that. Alternative: power one Frame controller on once per session (its queues persist after it's switched off). |
 | **G-Link** does the controller accept our host and stream? | HW-2 | Gate A says no auth. A failure means a protocol detail, so back to RE-1 with captures from the second dongle. |
 | **G-B** do Frame cameras track Touch Plus LEDs? | HW-3 (DEV-1 can give an early yes) | **Plan B:** 3DoF from the radio IMU plus position from Frame hand tracking (wrist), if a driver can read it (RE-3). Otherwise keep the relay as the 6DoF product. |
 

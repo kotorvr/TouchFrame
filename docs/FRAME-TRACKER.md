@@ -620,6 +620,24 @@ at 0x60 is body-frame: relative error 0.00 as body frame vs 1.14 as world frame.
 
 ### 9.6 Next
 
+> **Update 2026-10-04 (DEV-1, [re/DEV-1.md](re/DEV-1.md); AUDIT-1 [re/AUDIT.md](re/AUDIT.md)):**
+> - **Touch-only works.** With both Frame controllers off since SteamVR start, driver_touchframe
+>   Created `/xrservice/controller/{event,data}` with driver_cv's parameters, and XRService
+>   connected and started tracking (streamingMode 4, "Trying to track first LED frame").
+>   - Cost: the first driver_cv controller instance afterwards fails its Create (err 1
+>     QueueAlreadyExists, no fallback). That controller gets no pose; buttons and haptics still work.
+>   - driver_cv's queues survive its last controller disconnecting.
+>   - Experiment code: `cv_create_shared_queues`, off by default.
+> - **No drift:** XRService / driver_cv / vrserver on the Frame match the analysed copies.
+> - **New risk:** with the 8-LED Touch Plus model XRService logs ~300 "Couldn't find any neighbor"
+>   errors/s (0 with Frame models; not caused by model_number). Probably the sparse model.
+>   Strings at XRService `0x914d1e` / `0xa0f246`.
+> - **AUDIT-1 risks:** XRService reads the event queue only about once per second, and it skips
+>   re-registering a deviceId it already knows. Re-announce with a fresh deviceId, or wait more
+>   than 1 s.
+> - The Touch Plus LEDs can't be held on (RE-2: ≤75 µs pulses on the host clock). §3's
+>   "continuous-on" conclusion is void, and strobe sync is required.
+
 - Gate B is unchanged and still the real question: do Touch Plus LEDs (driven always-on by our
   radio) produce blobs XRService matches to a Touch Plus LED model? Everything on the
   driver side of that is now proven.

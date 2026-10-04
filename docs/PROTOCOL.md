@@ -207,7 +207,7 @@ sides: host `syncboss FUN_0001aaf4`, device `elk-app FUN_00023d6c`):**
 | 0 | bit0 reserved (UNKNOWN), bits1..2 = periods until DM beacon (0 = none), bits3..7 = channel map bits 0..4 |
 | 1..4 | channel map bits 5..36 (37-bit map, LSB first; byte 4 bits3..7 = map bits 32..36) |
 | 5 | current `unmapped` channel (0..36) |
-| 6..7 | 16-bit value from host init right after the AES key = the **session nonce** (INFERRED name; CONFIRMED plumbing `FUN_00019e4c -> FUN_0001e5dc +0x54`). The device puts it in the top 16 bits of its 64-bit CCM packet counter (`elk-app 0x240cc`). |
+| 6..7 | 16-bit value from host init right after the AES key = the **session nonce** (INFERRED name; CONFIRMED plumbing `FUN_00019e4c -> FUN_0001e5dc +0x54`). **Corrected by AUDIT-1 A2:** it goes into the CCM **IV** of the connection-negotiation nonce (IV = `session_nonce<<48 \| beacon_ts48`, counter 0; host `FUN_0001aba8`, elk-app `0x24092..0x240d6`), not into the packet counter. |
 | 8..13 | 48-bit beacon timestamp, µs on the sync clock, little-endian (`LL_BITS_IN_BEACON_TIMESTAMP` = 48) |
 | 14 | CL: `1 << slot` of the device addressed by downlink data in this beacon, else 0 (INFERRED meaning) |
 | 15 | CL: **rx/ack bitmap** of slots heard since the last beacon |
@@ -239,6 +239,16 @@ this same clock drives the camera-sync LED strobe (Q4).
 ---
 
 ## Q2 — Pairing flow
+
+> **AUDIT-1 corrections ([re/AUDIT.md](re/AUDIT.md) A5, A7, A15, A16).**
+> - **On-air command byte = `(num << 1) | read`** (elk-spl `0x86a0..0x86d0` passes `pkt+1` to
+>   `FUN_0000822c`). So the bytes are **`0x25`** = SetupX25519Keys read, carrying the 32-byte host
+>   public key (`FUN_00003948`), **`0x22`** = PairingData (0x11) and **`0x3a`** = 0x1d. The "0x12 /
+>   0x11" numbers below are command *numbers*, not bytes.
+> - **A real Quest pairs with 0x1d first** (per-device link key = X25519 shared secret[:16]). It
+>   uses 0x11 with `pulsar_aes_key.bin` only as a fallback (`ecdh_pairing_with_pdk … falling back`,
+>   `FUN_00047548/47834/47310`). So a Quest session's link key is normally per-device and never on
+>   air: sniffing can't decode it. TouchFrame still uses 0x11, because it picks its own key.
 
 **Controller side (SPL "DM" mode, elk-spl):** `device_pairing.c`, `x25519.c`.
 - `pairing_get_public_key` returns the controller's Curve25519 public key.
@@ -340,13 +350,30 @@ pick the key) and can ignore `0x1d`.
 So the 13-byte CCM nonce = `packetCounter[5 LE] || IV[8]`, with the direction bit as bit 0 of the
 byte at `+0x128` (the counter and direction live in adjacent fields, as in BLE CCM).
 
-**Connection-negotiation ("legacy") nonce (CONFIRMED, `syncboss FUN_00047604`):** the one software
+> **Superseded by AUDIT-1 ([re/AUDIT.md](re/AUDIT.md) A1–A4); the two paragraphs below and the
+> contradiction box are kept for history only.** Settled:
+> - **`FUN_00047604` is only the ECDH pairing wrap** (`ecdh_pairing.c`, asserts
+>   `PAIRING_STATE_SENDING_KEY`). The `+0x88 → +0x99` copy puts the IV in front of the ciphertext
+>   inside the 32-byte 0x11 packet. It is not a saved session IV.
+> - **The negotiation ("legacy") nonce is derived from the beacon:** counter 0, IV =
+>   `session_nonce << 48 | beacon_ts48` (host `FUN_0001aba8`, callers `0x1da8c`/`0x1e2dc`; elk-app
+>   `0x24092..0x240d6 → 0x239fc`). No IV is sent for it.
+> - **Steady-state nonce:** IV = 8 bytes the **controller** sends in its connection request (CL
+>   bytes `0x0f..0x16`, built at elk-app `0x23bc4`). The host stores a per-slot key + IV
+>   (`FUN_0001d038 → FUN_0001e90c`). The counter is **per slot** (host `LL+0x3c+slot*4`) and
+>   resets to 0 at accept (elk `FUN_00028ad0`). Still open (RE-1): where the controller's IV
+>   comes from, and when the counter increments.
+> - **CCM is uplink only.** elk-app has only the encrypt mode; syncboss decrypts uplinks
+>   (`FUN_0001b29c`/`0x1b3cc`). **Beacons and downlink CL data are plaintext**, so a host never
+>   produces MICs. There is also a plaintext uplink bypass flag at elk `LL+0x29c`.
+
+**Connection-negotiation ("legacy") nonce (historical; see the box above):** the one software
 crypt call sets KEY at host-struct `+0x61`, fills an **8-byte random IV** at `+0x88` (RNG
 `FUN_000185d8`), and calls crypt with **packet counter 0** (`param_7 = param_8 = 0`), encrypting a
 20-byte blob to `+0xa1` and checking the result is 24 bytes (20 + 4 MIC). The random IV is sent in
 the clear with the negotiation packet. This is the "Must use legacy nonce" path.
 
-> **Open contradiction (2026-10-04, MASTER-PLAN §3.1.4; to be settled by RE-1/AUDIT-1).** A 20-byte
+> **(RESOLVED by AUDIT-1 A1: `FUN_00047604` is only the pairing wrap.)** Original note: A 20-byte
 > blob encrypted to 24 bytes under a random 8-byte IV with counter 0 is exactly the `PairingData`
 > 0x11 layout of Q2 ([4-byte base][16-byte key]), and Q2 calls this function the pairing wrap. But
 > "connection negotiation" and the elk-app string "Must use legacy nonce for connection
@@ -634,7 +661,8 @@ All scripts read the flattened images and `images.json` from the gitignored
    for a live capture: confirm uplink slot anchor (350 µs + offset after the beacon start),
    DM-beacon cadence and the 4000 µs branch, beacon payload byte 0 bit 0 and byte 14
    meaning, advert words at bytes 1..4 / 13..30, pairing-link framing.
-4. CCM nonce — **structure + negotiation CONFIRMED; steady-state packing still needs one live
+4. **Largely CLOSED by AUDIT-1 A2–A4** (Q3 box): negotiation IV = session_nonce<<48|beacon_ts, steady IV from the controller's connection request, per-slot counter, uplink-only CCM. The "`<<48` lead was wrong" sentence below is itself wrong. Old text:
+   CCM nonce — **structure + negotiation CONFIRMED; steady-state packing still needs one live
    MIC check** (Q3/Q4). Confirmed: the 13-byte nonce is `packetCounter[5 LE, incl. direction
    bit] || IV[8]` (nRF HW-CCM; host CCM helper is `syncboss FUN_0001b1a4`, not the elk-app
    `0x1b1a4` which is a battery routine), and the **negotiation** nonce is an 8-byte random IV
