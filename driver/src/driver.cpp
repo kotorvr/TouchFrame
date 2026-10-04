@@ -1,11 +1,19 @@
 // TouchFrame SteamVR driver: presents Quest 3 Touch Plus controllers to SteamVR on the
 // Steam Frame as first-class "oculus_touch" controllers (Touch bindings, Quest 3 render
-// models, haptics). State comes from an ITouchSource; Phase 1 uses the UDP relay.
+// models, haptics). State comes from an ITouchSource, chosen by driver_touchframe.mode:
+//   relay         the Quest bridge over UDP (UdpSource), poses calibrated into SteamVR's space;
+//   radio_camera  the Touch Plus radio dongle (RadioBackend) with XRService tracking the LEDs;
+//   radio_3dof    the dongle with IMU orientation only (no camera tracking).
+#include <sys/stat.h>
+
 #include <atomic>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <memory>
 #include <mutex>
+#include <sstream>
 #include <string>
 
 #include <openvr_driver.h>
@@ -13,6 +21,7 @@
 #include "cv_clone.h"
 #include "log.h"
 #include "protocol.h"
+#include "radio_backend.h"
 #include "skeleton.h"
 #include "source.h"
 
@@ -254,6 +263,45 @@ private:
         h_thumbrest_touch_, h_haptic_;
 };
 
+static std::string GetStringSetting(const char* key, const char* def) {
+    char buf[1024] = {};
+    EVRSettingsError e = VRSettingsError_None;
+    VRSettings()->GetString(kSection, key, buf, sizeof(buf), &e);
+    return e == VRSettingsError_None ? std::string(buf) : std::string(def);
+}
+static int32_t GetIntSetting(const char* key, int32_t def) {
+    EVRSettingsError e = VRSettingsError_None;
+    int32_t v = VRSettings()->GetInt32(kSection, key, &e);
+    return e == VRSettingsError_None ? v : def;
+}
+static bool GetBoolSetting(const char* key, bool def) {
+    EVRSettingsError e = VRSettingsError_None;
+    bool v = VRSettings()->GetBool(kSection, key, &e);
+    return e == VRSettingsError_None ? v : def;
+}
+static float GetFloatSetting(const char* key, float def) {
+    EVRSettingsError e = VRSettingsError_None;
+    float v = VRSettings()->GetFloat(kSection, key, &e);
+    return e == VRSettingsError_None ? v : def;
+}
+static std::string ExpandHome(const std::string& p) {
+    if (p.compare(0, 2, "~/") != 0) return p;
+    const char* home = getenv("HOME");
+    return std::string(home ? home : "") + p.substr(1);
+}
+static bool ReadFile(const std::string& path, std::string* out) {
+    std::ifstream f(path);
+    if (!f) return false;
+    std::stringstream ss;
+    ss << f.rdbuf();
+    *out = ss.str();
+    return true;
+}
+static bool FileExists(const std::string& path) {
+    struct stat st;
+    return stat(path.c_str(), &st) == 0;
+}
+
 class Provider : public IServerTrackedDeviceProvider {
 public:
     EVRInitError Init(IVRDriverContext* ctx) override {
@@ -267,11 +315,25 @@ public:
         Log(skeleton ? "skeleton: finger curl from %s" : "skeleton: off (%s)",
             skeleton ? anim_.Path().c_str() : err.empty() ? "driver_touchframe.skeleton=false" : err.c_str());
         for (int h = 0; h < 2; h++) hands_[h] = std::make_unique<TouchController>(h, skeleton ? &anim_ : nullptr);
-        calib_version_ = VRSettings()->GetInt32(kSection, "calib_version");
-        LoadCalibration();
-        auto port = uint16_t(VRSettings()->GetInt32(kSection, "port"));
-        source_ = std::make_unique<UdpSource>(port, [this](const StatePacket& pkt, uint64_t now) { OnState(pkt, now); });
-        if (!source_->Start()) return VRInitError_Driver_Failed;
+
+        std::string mode = GetStringSetting("mode", "relay");
+        if (mode == "radio_camera") mode_ = kRadioCamera;
+        else if (mode == "radio_3dof") mode_ = kRadio3Dof;
+        else if (mode != "relay") Log("unknown %s.mode '%s' (relay, radio_camera, radio_3dof); using relay", kSection, mode.c_str());
+        Log("mode: %s", mode_ == kRelay ? "relay (Quest bridge over UDP)"
+                        : mode_ == kRadioCamera ? "radio_camera (Touch Plus dongle, XRService camera tracking)"
+                                                : "radio_3dof (Touch Plus dongle, IMU orientation only)");
+        if (mode_ == kRelay) {
+            calib_version_ = VRSettings()->GetInt32(kSection, "calib_version");
+            LoadCalibration();
+            auto port = uint16_t(VRSettings()->GetInt32(kSection, "port"));
+            source_ = std::make_unique<UdpSource>(port, [this](const StatePacket& pkt, uint64_t now) { OnState(pkt, now); });
+        } else {
+            // Radio poses are in SteamVR's space already (camera) or built there (3dof): no relay calibration.
+            Log("calibration: none (radio poses are in SteamVR's tracking space)");
+            source_ = MakeRadio();
+        }
+        if (!source_ || !source_->Start()) return VRInitError_Driver_Failed;
         cv_clone_ = CvClone::CreateFromSettings();  // camera-tracker test; off unless cv_clone_serial is set
         return VRInitError_None;
     }
@@ -281,6 +343,7 @@ public:
         cv_clone_.reset();
         if (source_) source_->Stop();
         source_.reset();
+        radio_ = nullptr;
         VR_CLEANUP_SERVER_DRIVER_CONTEXT();
     }
 
@@ -297,20 +360,26 @@ public:
                 }
             }
         }
-        // tools: tf_calibrate writes new calib_* values and bumps calib_version; pick them up live.
         uint64_t now = MonotonicNs();
+        if (mode_ == kRadio3Dof) CacheHeadPose();
         if (now - last_settings_check_ns_ > 1000000000ull) {
             last_settings_check_ns_ = now;
-            int32_t v = VRSettings()->GetInt32(kSection, "calib_version");
-            if (v != calib_version_) {
-                calib_version_ = v;
-                LoadCalibration();
+            if (mode_ == kRelay) {
+                // tools: tf_calibrate writes new calib_* values and bumps calib_version; pick them up live.
+                int32_t v = VRSettings()->GetInt32(kSection, "calib_version");
+                if (v != calib_version_) {
+                    calib_version_ = v;
+                    LoadCalibration();
+                }
+            } else {
+                PollRadioSettings();
+                if (mode_ == kRadioCamera && reannounce_) ScanCompetitors(now);
             }
         }
-        // A source that went quiet (Quest asleep, Wi-Fi drop) should not leave frozen hands.
-        uint64_t last = last_packet_ns_.load();
-        if (last && now - last > 250000000ull) {
-            for (int h = 0; h < 2; h++) if (added_[h]) hands_[h]->MarkStale();
+        // A source that went quiet (Quest asleep, Wi-Fi drop, radio out of range) should not leave frozen hands.
+        for (int h = 0; h < 2; h++) {
+            uint64_t last = mode_ == kRelay ? last_packet_ns_.load() : last_hand_ns_[h].load();
+            if (added_[h] && last && now - last > 250000000ull) hands_[h]->MarkStale();
         }
     }
 
@@ -319,6 +388,117 @@ public:
     void LeaveStandby() override {}
 
 private:
+    enum Mode { kRelay, kRadioCamera, kRadio3Dof };
+
+    std::unique_ptr<ITouchSource> MakeRadio() {
+        RadioBackend::Options o;
+        o.mode = mode_ == kRadioCamera ? RadioBackend::Mode::kCamera : RadioBackend::Mode::k3Dof;
+        std::string dir = ExpandHome("~/.config/touchframe");
+        mkdir(ExpandHome("~/.config").c_str(), 0755);
+        mkdir(dir.c_str(), 0755);
+        o.radio.transport = GetStringSetting("radio_transport", "hidraw");
+        o.radio.identity_path = ExpandHome(GetStringSetting("radio_state", "~/.config/touchframe/radio_state.json"));
+        o.radio.identity_mode = GetStringSetting("radio_identity_mode", "auto");
+        o.radio.led_loop = GetBoolSetting("radio_led_loop", true);
+        o.radio.led.frame_period_us = GetFloatSetting("radio_led_period_us", float(1e6 / 30));
+        o.radio.led.window_us = GetFloatSetting("radio_led_window_us", 65.0f);
+        o.radio.led.seed_offset_us = GetFloatSetting("radio_led_seed_offset_us", 0.0f);
+        o.radio.led.dwell_s = GetFloatSetting("radio_led_dwell_s", 1.5f);
+        o.radio.led.settle_s = GetFloatSetting("radio_led_settle_s", 0.5f);
+        o.cv.create_shared_queues = GetBoolSetting("radio_create_queues", true);
+        o.cv.create_after_s = GetFloatSetting("radio_create_queues_after_s", 20.0f);
+        o.xr_logs_dir = ExpandHome(GetStringSetting("radio_xrservice_logs", ""));
+        reannounce_ = GetBoolSetting("radio_reannounce", true);
+        for (int h = 0; h < 2; h++) {
+            const char* hn = h ? "right" : "left";
+            std::string key = std::string("radio_config_") + hn;
+            std::string path = ExpandHome(GetStringSetting(key.c_str(), (std::string("~/.config/touchframe/touchplus_") + hn + ".json").c_str()));
+            if (mode_ == kRadioCamera && !ReadFile(path, &o.config_text[h]))
+                Log("radio: no XRService config for the %s hand at %s (%s.%s): it can't be camera-tracked; "
+                    "generate it with tools/touchplus_config.py", hn, path.c_str(), kSection, key.c_str());
+            key = std::string("radio_imu_cal_") + hn;
+            path = ExpandHome(GetStringSetting(key.c_str(), (std::string("~/.config/touchframe/touchplus_") + hn + "_meta_cal.json").c_str()));
+            if (FileExists(path)) o.radio.imu_cal[h] = path;
+            key = std::string("radio_device_id_") + hn;
+            o.device_id[h] = uint32_t(GetIntSetting(key.c_str(), 0));
+        }
+        o.log = [](const std::string& s) { Log("%s", s.c_str()); };
+        radio_pair_version_ = GetIntSetting("radio_pair_version", 0);
+        radio_recenter_version_ = GetIntSetting("radio_recenter_version", 0);
+        auto b = std::make_unique<RadioBackend>(
+            o, [this](int h, const HandState& s, double age) { OnHand(h, s, age); },
+            [this](cv::Pose* p) {
+                std::lock_guard<std::mutex> lk(head_mu_);
+                if (!have_head_) return false;
+                *p = head_;
+                return true;
+            });
+        radio_ = b.get();
+        return b;
+    }
+
+    // tools: bump radio_pair_version (with radio_pair_hand) to pair a controller, and
+    // radio_recenter_version to re-align 3dof yaw with the headset.
+    void PollRadioSettings() {
+        int32_t v = GetIntSetting("radio_pair_version", 0);
+        if (v != radio_pair_version_) {
+            radio_pair_version_ = v;
+            std::string hand = GetStringSetting("radio_pair_hand", "right");
+            int h = hand == "left" ? 0 : 1;
+            Log("radio: pairing requested for the %s hand (%s.radio_pair_version %d)", h ? "right" : "left", kSection, v);
+            radio_->RequestPair(h);
+        }
+        v = GetIntSetting("radio_recenter_version", 0);
+        if (v != radio_recenter_version_) {
+            radio_recenter_version_ = v;
+            for (int h = 0; h < 2; h++) radio_->Recenter(h);
+        }
+    }
+
+    void CacheHeadPose() {
+        TrackedDevicePose_t p{};
+        VRServerDriverHost()->GetRawTrackedDevicePoses(0, &p, 1);
+        if (!p.bPoseIsValid) return;
+        std::lock_guard<std::mutex> lk(head_mu_);
+        head_ = cv::FromMatrix(p.mDeviceToAbsoluteTracking);
+        have_head_ = true;
+    }
+
+    // XRService tracks one controller per hand. A Touch Plus announced while a Steam Frame
+    // controller holds that hand's slot doesn't get the slot when it frees (FRAME-TRACKER §9.3),
+    // so when the competitor goes away, announce again under a fresh deviceId.
+    void ScanCompetitors(uint64_t now) {
+        static TrackedDevicePose_t poses[k_unMaxTrackedDeviceCount];
+        VRServerDriverHost()->GetRawTrackedDevicePoses(0, poses, k_unMaxTrackedDeviceCount);
+        bool comp[2] = {false, false};
+        for (uint32_t i = 1; i < k_unMaxTrackedDeviceCount; i++) {
+            if (i == hands_[0]->Id() || i == hands_[1]->Id() || !poses[i].bDeviceIsConnected) continue;
+            PropertyContainerHandle_t c = VRProperties()->TrackedDeviceToPropertyContainer(i);
+            if (c == k_ulInvalidPropertyContainer) continue;
+            ETrackedPropertyError e = TrackedProp_Success;
+            int32_t cls = VRProperties()->GetInt32Property(c, Prop_DeviceClass_Int32, &e);
+            if (e != TrackedProp_Success || cls != TrackedDeviceClass_Controller) continue;
+            int32_t role = VRProperties()->GetInt32Property(c, Prop_ControllerRoleHint_Int32, &e);
+            if (e != TrackedProp_Success) continue;
+            if (role == TrackedControllerRole_LeftHand) comp[0] = true;
+            if (role == TrackedControllerRole_RightHand) comp[1] = true;
+        }
+        for (int h = 0; h < 2; h++) {
+            const char* hn = h ? "right" : "left";
+            if (comp[h] && !competitor_[h])
+                Log("radio: another %s controller is on. While it holds XRService's %s tracker the Touch Plus %s "
+                    "gets no camera pose; when it turns off, the Touch Plus is announced again", hn, hn, hn);
+            if (!comp[h] && competitor_[h] && radio_->connected(h)) {
+                if (now - last_reannounce_ns_[h] > 5000000000ull) {
+                    last_reannounce_ns_[h] = now;
+                    Log("radio: the other %s controller turned off; re-announcing the Touch Plus %s", hn, hn);
+                    radio_->Reannounce(h);
+                }
+            }
+            competitor_[h] = comp[h];
+        }
+    }
+
     void LoadCalibration() {
         auto* s = VRSettings();
         Quat q{s->GetFloat(kSection, "calib_qw"), s->GetFloat(kSection, "calib_qx"),
@@ -336,9 +516,7 @@ private:
             const HandState& s = pkt.hand[h];
             if (!added_[h]) {
                 if (!(s.flags & kConnected)) continue;
-                // Add lazily so unused Touch Plus never take roles from the Frame controllers.
-                added_[h] = VRServerDriverHost()->TrackedDeviceAdded(hands_[h]->Serial(), TrackedDeviceClass_Controller, hands_[h].get());
-                Log("TrackedDeviceAdded %s -> %d", hands_[h]->Serial(), int(added_[h]));
+                AddHand(h);
                 continue;
             }
             // Relay latency is unknown to the driver until clocks are aligned; use a fixed estimate.
@@ -346,15 +524,42 @@ private:
         }
     }
 
+    // Radio: one hand's state, with the pose's age (XRService's own timestamps, or the IMU's).
+    void OnHand(int h, const HandState& s, double age_s) {
+        last_hand_ns_[h] = MonotonicNs();
+        if (!added_[h]) {
+            if (!(s.flags & kConnected)) return;
+            AddHand(h);
+            return;
+        }
+        hands_[h]->Update(s, age_s);
+    }
+
+    void AddHand(int h) {
+        // Add lazily so unused Touch Plus never take roles from the Frame controllers.
+        added_[h] = VRServerDriverHost()->TrackedDeviceAdded(hands_[h]->Serial(), TrackedDeviceClass_Controller, hands_[h].get());
+        Log("TrackedDeviceAdded %s -> %d", hands_[h]->Serial(), int(added_[h]));
+    }
+
     CurlAnimation anim_;
     std::unique_ptr<TouchController> hands_[2];
     std::atomic<bool> added_[2] = {false, false};
+    Mode mode_ = kRelay;
     std::unique_ptr<ITouchSource> source_;
+    RadioBackend* radio_ = nullptr;  // source_ in the radio modes
     std::unique_ptr<CvClone> cv_clone_;
     std::atomic<uint64_t> last_packet_ns_{0};
+    std::atomic<uint64_t> last_hand_ns_[2] = {{0}, {0}};
     double latency_s_ = 0.015;
     uint64_t last_settings_check_ns_ = 0;
     int32_t calib_version_ = 0;
+    int32_t radio_pair_version_ = 0, radio_recenter_version_ = 0;
+    bool reannounce_ = true;
+    bool competitor_[2] = {false, false};
+    uint64_t last_reannounce_ns_[2] = {0, 0};
+    std::mutex head_mu_;
+    cv::Pose head_;
+    bool have_head_ = false;
 };
 
 }  // namespace tf

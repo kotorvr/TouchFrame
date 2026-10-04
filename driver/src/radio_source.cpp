@@ -175,7 +175,9 @@ void RadioSource::SaveIdentity() {
             return;
         }
     }
-    std::remove(opt_.identity_path.c_str());  // Windows rename won't replace
+#ifdef _WIN32
+    std::remove(opt_.identity_path.c_str());  // Windows rename won't replace (host tests only)
+#endif
     if (std::rename(tmp.c_str(), opt_.identity_path.c_str()) != 0)
         Logf("radio: can't replace %s", opt_.identity_path.c_str());
 }

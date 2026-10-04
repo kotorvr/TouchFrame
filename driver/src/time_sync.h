@@ -61,6 +61,8 @@ private:
     void Fit();
     // Feasible intercept band for slope b over pings sent at or after since_us: [lo, hi].
     void Band(double b, double* lo, double* hi, double since_us = -1e300) const;
+    // The slope in [x0, x1] leaving the widest band over the whole window.
+    double MaxMarginSlope(double x0, double x1) const;
 
     Options opt_;
     bool have_ref_ = false, have_fit_ = false;

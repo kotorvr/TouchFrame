@@ -1,6 +1,7 @@
 {
 	"driver_touchframe": {
 		"enable": true,
+		"mode": "relay",
 		"port": 28430,
 		"hand_priority": 100,
 		"skeleton": true,
@@ -20,6 +21,28 @@
 		"cv_clone_imu": "synth",
 		"cv_clone_accel_sign": 1.0,
 		"cv_clone_probe": true,
-		"cv_clone_csv": ""
+		"cv_clone_csv": "",
+		"radio_transport": "hidraw",
+		"radio_state": "~/.config/touchframe/radio_state.json",
+		"radio_identity_mode": "auto",
+		"radio_config_left": "~/.config/touchframe/touchplus_left.json",
+		"radio_config_right": "~/.config/touchframe/touchplus_right.json",
+		"radio_imu_cal_left": "~/.config/touchframe/touchplus_left_meta_cal.json",
+		"radio_imu_cal_right": "~/.config/touchframe/touchplus_right_meta_cal.json",
+		"radio_device_id_left": 0,
+		"radio_device_id_right": 0,
+		"radio_led_loop": true,
+		"radio_led_period_us": 33333.333,
+		"radio_led_window_us": 65.0,
+		"radio_led_seed_offset_us": 0.0,
+		"radio_led_dwell_s": 1.5,
+		"radio_led_settle_s": 0.5,
+		"radio_create_queues": true,
+		"radio_create_queues_after_s": 20.0,
+		"radio_xrservice_logs": "",
+		"radio_reannounce": true,
+		"radio_pair_version": 0,
+		"radio_pair_hand": "right",
+		"radio_recenter_version": 0
 	}
 }

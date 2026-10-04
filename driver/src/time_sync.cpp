@@ -54,14 +54,33 @@ void TimeSync::Band(double b, double* lo, double* hi, double since_us) const {
     *lo = l, *hi = h;
 }
 
+double TimeSync::MaxMarginSlope(double x0, double x1) const {
+    // gap(b) = hi(b) - lo(b) is concave (a min of lines minus a max of lines): ternary search.
+    for (int it = 0; it < 80 && x1 - x0 > 1e-11; it++) {
+        double m1 = x0 + (x1 - x0) / 3, m2 = x1 - (x1 - x0) / 3, l1, h1, l2, h2;
+        Band(m1, &l1, &h1);
+        Band(m2, &l2, &h2);
+        if (h1 - l1 < h2 - l2) x0 = m1;
+        else x1 = m2;
+    }
+    return (x0 + x1) / 2;
+}
+
 void TimeSync::Fit() {
     best_rtt_us_ = 1e300;
     for (const Sample& s : win_) best_rtt_us_ = std::min(best_rtt_us_, s.rtt_us);
     const double d0 = win_.front().rx_us;
+    const double m = opt_.max_drift_ppm * 1e-6;
     double b = b_;
-    if (win_.size() >= 3 && win_.back().rx_us - d0 > 2e6) {
+    if (win_.size() >= 3 && win_.back().rx_us - d0 >= opt_.margin_span_s * 1e6) {
+        // Long span: the maximum-margin slope (the one leaving the widest band between the two
+        // bound clouds) beats least squares.
+        b = MaxMarginSlope(1 - m, 1 + m);
+    } else if (win_.size() >= 3 && win_.back().rx_us - d0 > 2e6) {
         // Short span: least squares of the ping midpoints (each good to ~±RTT/2, independent
-        // errors). A max-margin slope locks onto 2-3 extreme pings while there are few of them.
+        // errors); a max-margin slope locks onto 2-3 extreme pings while there are few of them.
+        // But only a slope every ping's bounds allow: with asymmetric delays (a busy host, TCP)
+        // least squares can be off by 100+ ppm, and then the max-margin slope is the honest one.
         double n = 0, mx = 0, my = 0;
         for (const Sample& s : win_) mx += (s.rx_us + s.tx_us) / 2 - d0, my += (s.send_us + s.recv_us) / 2, n++;
         mx /= n, my /= n;
@@ -70,22 +89,10 @@ void TimeSync::Fit() {
             double x = (s.rx_us + s.tx_us) / 2 - d0 - mx, y = (s.send_us + s.recv_us) / 2 - my;
             sxx += x * x, sxy += x * y;
         }
-        double ls = sxx > 0 ? sxy / sxx : b_;
-        if (std::fabs(1.0 / ls - 1.0) * 1e6 <= opt_.max_drift_ppm) b = ls;
-    }
-    if (win_.size() >= 3 && win_.back().rx_us - d0 >= opt_.margin_span_s * 1e6) {
-        // Long span: the maximum-margin slope (the one leaving the widest band between the two
-        // bound clouds) beats least squares. gap(b) = hi(b) - lo(b) is concave (a min of lines
-        // minus a max of lines): ternary search around the least-squares slope.
-        double x0 = b * (1 - 50e-6), x1 = b * (1 + 50e-6);
-        for (int it = 0; it < 60 && x1 - x0 > 1e-10; it++) {
-            double m1 = x0 + (x1 - x0) / 3, m2 = x1 - (x1 - x0) / 3, l1, h1, l2, h2;
-            Band(m1, &l1, &h1);
-            Band(m2, &l2, &h2);
-            if (h1 - l1 < h2 - l2) x0 = m1;
-            else x1 = m2;
-        }
-        b = (x0 + x1) / 2;
+        double ls = sxx > 0 ? sxy / sxx : b_, lo, hi;
+        Band(ls, &lo, &hi);
+        if (std::fabs(ls - 1.0) <= m && hi >= lo) b = ls;
+        else b = MaxMarginSlope(1 - m, 1 + m);
     }
     // The intercept from recent pings only: a small slope error then tilts it by little.
     double lo, hi;

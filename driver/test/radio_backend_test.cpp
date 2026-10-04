@@ -148,6 +148,45 @@ static void TestOrientation() {
     CHECKF(f2.x / Len(f2) > 0.9999, "aligned forward (%f %f %f)", f2.x, f2.y, f2.z);
 }
 
+static void WriteText(const std::string& path, const std::string& text) {
+    std::ofstream f(path, std::ios::trunc | std::ios::binary);
+    f << text;
+}
+
+static void TestFindHidraw(const std::string& scratch) {
+    // A fake /sys/class/hidraw: a mouse, then our dongle as hidraw2 and hidraw10 (two interfaces
+    // can't both match on a real Frame, but the lower number must win either way).
+    std::string sys = scratch + "/sysfs";
+    MKDIR(sys.c_str());
+    const char* nodes[][2] = {{"hidraw0", "HID_ID=0003:0000046D:0000C52B"},
+                              {"hidraw10", "HID_ID=0003:00001209:00000001"},
+                              {"hidraw2", "HID_ID=0003:00001209:00000001"}};
+    for (auto& n : nodes) {
+        std::string d = sys + "/" + n[0];
+        MKDIR(d.c_str());
+        MKDIR((d + "/device").c_str());
+        WriteText(d + "/device/uevent", std::string("DRIVER=hid-generic\n") + n[1] + "\nHID_NAME=x\n");
+    }
+    std::string why;
+    std::string got = radio::FindHidraw(0x1209, 0x0001, &why, sys, "/dev");
+    CHECKF(got == "/dev/hidraw2", "found '%s' (%s)", got.c_str(), why.c_str());
+    got = radio::FindHidraw(0x1209, 0x0002, &why, sys, "/dev");
+    CHECKF(got.empty() && why.find("046d:c52b") != std::string::npos, "no match: '%s' (%s)", got.c_str(), why.c_str());
+}
+
+static void TestIdentityJson() {
+    uint8_t key[16];
+    for (int i = 0; i < 16; i++) key[i] = uint8_t(i * 17);
+    std::map<uint64_t, int> paired{{0x1122334455667701ull, 0}, {0xAABBCCDDEEFF0011ull, 0xFF}}, hands{{0x1122334455667701ull, 1}};
+    std::string j = radio::IdentityJson(0x12345678, key, paired, hands);
+    uint32_t na = 0;
+    uint8_t k2[16] = {};
+    std::map<uint64_t, int> p2, h2;
+    CHECKF(radio::ParseIdentityJson(j, &na, k2, &p2, &h2) && na == 0x12345678 && !memcmp(key, k2, 16) && p2 == paired &&
+               h2 == hands,
+           "round trip: %s", j.c_str());
+}
+
 struct Seen {
     std::mutex mu;
     HandState last[2] = {};
@@ -262,6 +301,8 @@ int main(int argc, char** argv) {
     TestParse();
     TestWatcher(argv[1]);
     TestOrientation();
+    TestFindHidraw(argv[1]);
+    TestIdentityJson();
     if (argc >= 4) {
         TestBackend3Dof(argv[2], argv[3]);
         TestBackendCamera(argv[2], argv[3]);
