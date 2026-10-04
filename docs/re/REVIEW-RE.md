@@ -13,7 +13,7 @@ re-derived from the binaries, not from the reports' prose:
 - A tolerant Thumb sweep (capstone; it steps over data words).
 - An AArch64 capstone wrapper that labels symbols, strings and branch targets.
 
-**Scope.** The BUILD-1 branch `claude/exciting-bun-66e32e` (`5e35606`) was read to see which
+**Scope.** BUILD-1 (`radio-fw/`, branch `5e35606`, re-checked on main `167f6fa`: the same code; line numbers below are main's) was read to see which
 claims the firmware already encodes. Static only: no device was touched. No Meta bytes are copied
 here, only addresses, short instruction snippets and our own descriptions. Three helper passes
 (register layer, peripherals, tools) were run. Every BLOCKS item and every closed open item was
@@ -35,6 +35,7 @@ then re-checked by hand in the disassembly.
 
 | # | Finding | Severity | Who must act |
 |---|---|---|---|
+| R0 | **On-air TL header pinned (planner's top ask; was INFERRED/UNKNOWN in LINK §3).** Downlink = beacon byte 16 on: `[reg][flags][payload ≤ 32]`. Uplink (after CL byte 0 = slot): `[reg][flags][data]`. flags: bits 0..3 = seq, bit 4 = **read** (1) / write (0), bit 5 = error (responses), bit 6 = notification. Notifications use reg 0 followed by the ntf chunk stream. CONFIRMED on both sides. | **closes BUILD-1's last stub** | LINK §3, BUILD-1 `pulsar_cl.c` TODO(RE-1) |
 | R1 | The accept packet's slot byte `[11]` must be **1..4**. `[11] = 0` trips a fatal assert in the controller (`accept_pkt->endpoint != CONN_NEG_SLOT`). Slot 0 is the negotiation slot only. | **BLOCKS** | LINK §4, `pulsar_host.py`, BUILD-1 `pick_slot` |
 | R2 | Accept `[2]&7 == 3` is **reject**, not "lock". It sends the controller back to idle. The host sends exactly one accept with `[2] = (fmt<<3)\|2`. | **BLOCKS** | LINK §4, tool `EP_LOCK`, BUILD-1 (queues CONN_NEG then LOCK) |
 | R3 | Accept bytes `[12]`/`[13]` are **not** the version. `[12]` = "use your steady IV" flag (0 makes the controller zero its IV). `[13]` = slot count (≥ 1). The tool and BUILD-1 put `01 17` there, which means slot count 23. | **BLOCKS** (corrupts the uplink length budget) | LINK §4, tool, BUILD-1 |
@@ -53,10 +54,123 @@ then re-checked by hand in the disassembly.
 | R16 | Smaller report errors: the 0x2b request has no `type`; the sidechannel chunk size is 4; PCM haptics are 3-bit; on-time resets to 19 µs per enumeration; the validator doesn't wake the LED thread; the ntf 8 label; deerfly pins; conn-request format byte. | HARMLESS / WORDING | §R16 |
 | R17 | Tool mismatches and selftest independence. | HARMLESS / WORDING (except R1–R3/R8, counted above) | §R17 |
 
-**Bottom line for HW-2:** R1–R6 must be fixed in BUILD-1 before G-Link. They are all small code
-changes. R7/R8 are already absorbed by BUILD-1's RX search but should be fixed in the docs and
-tools. Everything else in LINK/PERIPHERALS that BUILD-1/BUILD-2 rely on re-verified (list at the
-end).
+**Bottom line for HW-2:**
+- BUILD-1 can now implement the TL from R0.
+- R1–R6 must be fixed in BUILD-1 before G-Link. They are all small code changes.
+- R7/R8 are already absorbed by BUILD-1's RX search but should be fixed in the docs and tools.
+- Everything else in LINK/PERIPHERALS that BUILD-1/BUILD-2 rely on re-verified (list at the end).
+
+**BUILD-1 checklist** (`radio-fw/src`, main `167f6fa`):
+
+| # | where | change |
+|---|---|---|
+| 1 | `pulsar_cl.c:31,66`, `host_core.c:817` | implement the TL per R0 |
+| 2 | `host_core.c:119-120` `pick_slot` | never return 0; slots 1..4 (R1) |
+| 3 | `host_core.c:499` + `pulsar_cl.c:24,71` | drop the second accept with `CL_EP_LOCK` (R2) |
+| 4 | `pulsar_cl.c:46` | `[2] = (fmt<<3)\|2`, `[12] = iv != 0`, `[13] = 1`; no version (R3) |
+| 5 | `pulsar_ll.h:21` | `PULSAR_ENDPOINT_OFFSET 0`, with slot = prefix−1 ∈ 1..4 (R4) |
+| 6 | `host_core.c:345` `pair_on_reply` | match on seq only; fail on `data[0] & 0x80` (R5) |
+| 7 | after PairingData OK | send Reset `0x2a` (empty), then stop DM polling (R6) |
+| 8 | `decrypt_uplink` | advance the counter per beacon period (R7; the window already hides it) |
+| 9 | `store.c:124-125` | no synchronous `erase_now` while any slot is connected (R9) |
+| 10 | channel map | keep indices 0/17/36 (R10) |
+| 11 | `LINK_HAND_UNKNOWN` | fill from cmd 1 desc[16..23] (R11) |
+
+---
+
+## R0. The TL header (register read / write / response / notification): CONFIRMED on both sides
+
+**Sources:**
+- host: syncboss `pulsar_tl_host.c` (`0x19acc..0x1a220`, string refs at `0x19e48..0x1a214`);
+- controller: elk the TL state machine at `T = 0x200051e8` (hsm states `0x253e5` → `0x22761` →
+  `0x235fd` / `0x236a5`), handlers registered at `0x18b5a..0x18b6c`.
+
+### Where the TL packet sits
+
+| direction | CCM | layout |
+|---|---|---|
+| downlink | plaintext | beacon payload `[0..13 beacon][14 = 1<<S downlink mask][15 = ack mask][16.. TL packet]` |
+| uplink | decrypted | `[S][TL packet]` |
+
+- **Downlink.**
+  - Controller: the CL layer hands `CL+2` with length `LEN−2` to the TL (`0x23d02..0x23d1c` →
+    `rec+0x38` = `0x251f9` = TL event 7).
+  - Host: `FUN_00019acc` (the CL `prepare_beacon_handler`) writes the TL packet into the CL buffer
+    and gives the length.
+  - TL packet ≤ 34 bytes (syncboss asserts payload ≤ 0x20, `FUN_00019fd0`/`FUN_0001a088` line
+    0xbe).
+- **Uplink.**
+  - Controller: `0x23d26 strb slot,[buf],#1`, then the TL builder fills the rest.
+  - Host: `FUN_0001d038` takes CL[0] ≠ 0 as data and passes `data+1`, `len−1` to the TL RX
+    `FUN_00019c70`.
+
+### TL packet
+
+`[0] reg | [1] flags | [2..] payload`
+
+| flags bit | meaning | host evidence | controller evidence |
+|---|---|---|---|
+| 0..3 | **seq** (0..15) | `FUN_0001a6f8` stamps the current seq into every TL packet it sends (`bfi r3,r0,#0,#4` at `0x19b30`, `0x19bae`, `0x19bdc`, `0x19c1c`) | RX: `pkt[1] & 0xf` → `T+0x40` (last seen seq). TX: every uplink carries `T+0x40` in bits 0..3 (`bfi r2,r1,#0,#4` at `0x23670`, `0x23706`, `0x237d8`, `0x23860`) |
+| 4 | **1 = READ, 0 = WRITE** | the read path (msg type 0, as for SPL `0x12`) → `FUN_000198e0` → `FUN_0001a088` sets `\|0x10`. Writes (types 1/2) → `FUN_000198ac` → `FUN_00019fd0` with `& 0xcf` | `ubfx sb,r3,#4,#1` (`0x234f6`): `sb = 0` calls `T+0x2c` = `FUN_00027ebc` (**write** handler, `app_command_registers.c`); `sb = 1` calls `T+0x30` = `FUN_00025c98` (**read** handler) |
+| 5 | **error** (responses) | the completion callback `T[2]` gets `(flags >> 5) & 1` as its first argument (`0x19dc4 ubfx r0,r0,#5,#1; blx r4`) | `T+0x4b` bit 5 = `!handler_ok` (`0x2355a..0x2355e`) |
+| 6 | **notification** (unsolicited uplink) | `pkt[1]` bit 6 → notification callback `T[0]` with `reg = pkt[0]`, `data = pkt+2`, `len−2` (bit-6 test `0x19ca6 lsls r2,r2,#0x19`) | set on notification uplinks (`0x23664 orr #0x40`, `0x2371a`); clear on responses (`0x23850 bfi …,#6,#1` with 0) |
+| 7 | unused (always 0 as far as seen) | printed only in the mismatch assert | never set |
+
+### Exchange rules (CONFIRMED unless tagged)
+
+1. **Host request.**
+   - Format: `[reg][seq \| 0x10 if read][payload ≤ 32]`, addressed to the controller (beacon byte 14
+     bit S).
+   - The seq advances by one per new request (`FUN_0001a708`: +1, wrapping 15 → 0; initial 0 from
+     `FUN_0001a6d8(T+0x10, 0xf)`).
+   - The **same packet is re-sent in every beacon** until it is answered or its timeout runs out
+     (`T+0x1c` = timeout in beacon periods; `ms*1000 → /2000`, minimum 1).
+   - On timeout the host completes with an error and sends the empty packet below.
+2. **Idle host beacon.** It carries the 2-byte TL `[0x00][seq]` with byte 14 = 0 (`0x19b98`
+   path). INFERRED to be optional for the controller: a byte-14 = 0 packet goes to the broadcast
+   handler `T+0x34`, not to the command path.
+3. **Controller duplicate filter.** An addressed packet with the same (seq, reg, bit 4) as the
+   last one (`T+0x40`, `T+0x4a`, `T+0x4b` bit 4) is a retransmit (`0x234f2..0x23514`). The
+   controller re-sends its last response and does not execute the command again. So the host must
+   advance the seq for every new command, including a repeat of the same command.
+4. **Read response.** `[reg][ack-seq \| 0x10 \| err<<5][data]`, data length = what the read
+   handler returned (`T+0x48`; `0x23834..0x23866` copies `T+0x4a..` = reg, flags, then the
+   `T+0x4c` buffer). It is always sent for reads (`0x23544`: `sb ≠ 0` → `T+0x49 = 1`).
+5. **Write acknowledgement.** A successful write that returns no data sends **no response
+   packet**: `T+0x49 = 0` unless the handler failed or returned data (`0x2354a..0x23552`).
+   - The host completes it when **any** uplink from that controller (for example the next
+     notification) carries the request's seq in bits 0..3.
+   - `FUN_00019c70`: `FUN_0001a6fc(seq_state, pkt[1] & 0xf)` passes, and bit 6 set → completion
+     `T[2](bit5, reg, 0, NULL)`.
+   - A failed write gets an explicit `[reg][ack-seq \| err]` response.
+6. **Response check.** The host requires response `pkt[0]` == the request reg (or it asserts, with
+   all six flag fields in the message) and bits 0..3 == its current seq.
+7. **Notifications.**
+   - Format: `[0x00][ack-seq \| 0x40][ntf chunk stream]`.
+   - The packer `0x20210` writes reg = 0 first (`0x2021c strb r4(=0),[r0]`) and fills chunks up to
+     the uplink budget `0x34 + 0x47*(slots−1)` = 52 bytes for one slot (`0x22714..0x2272e`).
+   - Host: notification reg 0 = chunk stream. libsyncboss sees it as the 0x14-byte wrapper with
+     byte 0x13 = 0, sidechannel absent because caps bit 0 is set (R16); reg 8 = blob.
+   - This is the stream `pulsar_input.unpack_chunks` parses (remember R13).
+8. **Reg `0x2a` (`'*'`)** in either direction is the RF-performance stats channel (host
+   `FUN_0001a430` / `FUN_0001a524`, controller `FUN_000232c0` and the `0x20007158` builder). A
+   non-Meta host doesn't need it; ignore uplinks with reg `0x2a`.
+
+**Example (hand-built, not from a capture):**
+- Read cmd 0x32 with seq 3, controller in slot 1: beacon bytes 14..18 = `02 00 32 13`. The CL
+  length covers 2 + 2 bytes.
+- Response uplink plaintext = `01 32 13 <16 bytes>`.
+- A write of cmd 0x28 with seq 4 = `.. 28 04 <12 bytes>`. Its ack = the next uplink with bits 0..3
+  = 4.
+
+**Still to confirm on air (non-blocking):** that the Quest's real downlink matches (HW-1 can check
+from plaintext); the exact CL LENGTH accounting; whether the idle `[00][seq]` must be present.
+
+**Fix:**
+- LINK §3: replace the "on-air TL header UNKNOWN" paragraph with the above.
+- BUILD-1: implement `pulsar_cl.c` TODO(RE-1) to it (per-controller seq, retransmit per beacon,
+  read = bit 4, implicit write-ack, reg 0 notifications).
+- `pulsar_host.py`: add `build_tl_request` / `parse_tl_uplink` with literal-byte selftests.
 
 ---
 
@@ -418,7 +532,7 @@ plain IMU/input chunks, which fit in one uplink.
   If it is, "No pairing info found. Skipping wireless init." (`0x2d610`) — so netaddr `0xFFFFFFFF`
   = unpaired.
 - `0x18bcc cbnz r3` else assert `"init->address"` (`pulsar_ll_device.c`) — so netaddr `0` is fatal.
-- BUILD-1 `host_core.c:666` already redraws on both values.
+- BUILD-1 `host_core.c:698` already redraws on both values.
 - LINK §6's "default network address = 0x00000000" would therefore crash a controller provisioned
   with it. Add a note to LINK §5 and Q2: the netaddr must not be 0 or 0xFFFFFFFF.
 - The record the app reads is the same single SPL record (`m_pairing` pointer `0x20004dd8`, one
@@ -604,7 +718,7 @@ instruction sequences) gave 54 passes. The 6 failures are listed below.
 | Steady IV origin | **closed**: RNG per idle entry (R16) |
 | Steady counter rule | per period (R7); the start period needs one live MIC |
 | cmd 9 / 0xa1 | **closed** (R12) |
-| On-air TL header for register read/write/notify | **still UNKNOWN**, one capture. Note that downlink data starts at beacon byte 16 and uplink CL[0] = S (R4), so the TL header sits right after those. |
+| On-air TL header for register read/write/notify | **closed** (R0), CONFIRMED on both sides; a capture only double-checks it |
 | Inactive-seek duty, CRC trailer byte order, cmd 0x2b blob content, sync-buffer haptics rate | unchanged, live items |
 
 ---
