@@ -36,6 +36,8 @@ radio-fw/build.sh            # already builds clean; rebuild to be sure
 - Does it enumerate as `1209:0001`? If not, check `preview_logs`/Device Manager; the descriptor or
   the USB power-event glue in `main.c` is the suspect.
 - `radio.py status` returns a status line with `version: 1`.
+- Host firmware (BUILD-1): the dongle enumerates as composite CDC + vendor HID (interface 2). On the Frame only HID works (no CDC ACM in its kernel).
+- After pairing a controller (HW-2), re-flash with `build.sh flash` and check the pairing survives DFU. The store is at flash 0xDE000/0xDF000, assumed to be inside the bootloader's preserved app-data area (INFERRED).
 - `radio.py dfu` (while running) reboots into the bootloader on its own (GPREGRET 0xB1). If it
   doesn't, the button still works; note it and move on.
 
