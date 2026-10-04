@@ -13,7 +13,7 @@
 // written a word at a time (interrupts run in between) and erases are done as partial-erase slices
 // (store_step, one slice per call, paced by the caller). The only synchronous erase is at boot
 // (store_init) and when a page fills while the spare is still being erased, which needs > 100 writes
-// in a few seconds.
+// in a few seconds; with no_sync_erase set that write fails instead.
 #pragma once
 #include <stdbool.h>
 #include <stdint.h>
@@ -43,6 +43,10 @@ typedef struct {
     uint32_t gen;
     uint16_t used;         // records used in the active page, header included
     uint16_t erase_left[2];// slices still needed to erase each page (0 = erased or in use)
+    // Set by the host while any controller is on the link: a synchronous erase (~90 ms) would drop
+    // them all (25 missed beacons = 50 ms, docs/re/REVIEW-RE.md R9). A write that would need one
+    // fails instead (the caller retries later); the page is compacted early while the spare is ready.
+    volatile bool no_sync_erase;
     // the replayed state
     uint32_t netaddr;      // 0 = no identity yet
     uint8_t key[16];

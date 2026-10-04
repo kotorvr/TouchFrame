@@ -4,9 +4,10 @@
 // the firmware's USB link calls; the link-v3 events that come out are checked.
 //
 // This exercises everything above the RADIO peripheral: beacon scheduling, CSA#1 hop following,
-// slot timing, DM beacons, the real 0x25/0x22 pairing exchange, uplink CCM with the pinned legacy
-// and steady-state nonces (plaintext downlink), placeholder
-// CL negotiation / registers / LED / haptics / streams, retransmission and link loss.
+// slot timing, DM beacons, the real 0x25/0x22/0x2a pairing exchange, uplink CCM with the pinned
+// legacy and steady-state nonces (plaintext downlink), the real accept and TL (docs/re/REVIEW-RE.md
+// R0-R16) and the placeholder CL formats: registers / LED / haptics / streams, retransmission and
+// link loss.
 #include <assert.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -504,44 +505,208 @@ static void scenario_disconnect_forget(void) {
 }
 
 static void scenario_real_formats(void) {
-    printf("scenario: real formats (no placeholder): RE-pending answers, no connection\n");
+    printf("scenario: real host, placeholder fake: no connection, commands need a connected slot\n");
     size_t mark = H.nev;
     link_result_t r = start_host(LINK_HOST_DM_BEACONS | LINK_HOST_RAW_UPLINKS);
     CHECK(r.status == LINK_OK, "restart");
     CHECK(find(&H, EVT_CONN, mark, 10, LINK_REASON_HOST_RESTART), "restart did not drop the connection");
-    r = HOST_CMD(CMD_REG_READ, link_reg_cmd_t, .slot = 0, .reg = 9);
-    CHECK(r.status == LINK_ERR_PENDING_RE, "real read: %u", r.status);
-    r = HOST_CMD(CMD_LED, link_led_t, .slot = 0, .mode = LINK_LED_ON);
-    CHECK(r.status == LINK_ERR_PENDING_RE, "real LED: %u", r.status);
+    r = HOST_CMD(CMD_REG_READ, link_reg_cmd_t, .slot = 1, .reg = 9);
+    CHECK(r.status == LINK_ERR_NOT_CONNECTED, "real read: %u", r.status);
     mark = H.nev;
-    run(1500000);  // the fake loses the restarted hop, re-seeks and asks again: undecryptable here
-    CHECK(!find(&H, EVT_CONN, mark, 9, LINK_SLOT_CONNECTED), "connected with unpinned formats");
+    run(1500000);  // the fake loses the restarted hop or not: either way nothing it says parses here
+    CHECK(!find(&H, EVT_CONN, mark, 9, LINK_SLOT_CONNECTED), "connected a placeholder controller");
     CHECK(count(&H, EVT_UPLINK, mark) > 0, "raw uplinks not reported");
-    // the LL nonces are pinned (AUDIT A2/A3), so even real mode decrypts the uplinks; only the CL
-    // formats on top are unknown
-    size_t mic_ok = 0;
-    for (size_t i = mark; i < H.nev; i++) mic_ok += H.ev[i].type == EVT_UPLINK && (H.ev[i].body[11] & LINK_UP_MIC_OK);
-    CHECK(mic_ok > 0, "real mode decrypted no uplink");
+    CHECK(count(&H, EVT_INPUT, mark) == 0 && count(&H, EVT_REG, mark) == 0, "placeholder data parsed as real");
+}
+
+// EVT_REG fields (link_reg_event_t then data)
+#define REG_KIND(e) ((e)->body[11])
+#define REG_STATUS(e) ((e)->body[12])
+#define REG_LEN(e) ((e)->body[13])
+#define REG_DATA(e) ((e)->body + 14)
+
+static ev_t* wait_reg(size_t mark, uint8_t reg, uint8_t kind, double max_us) {
+    ev_t* e = NULL;
+    for (double t = 0; t < max_us && !e; t += 5000) {
+        run(5000);
+        for (size_t i = mark; i < H.nev && !e; i++)
+            if (H.ev[i].type == EVT_REG && H.ev[i].body[10] == reg && REG_KIND(&H.ev[i]) == kind) e = &H.ev[i];
+    }
+    return e;
+}
+
+static int real_slot(void) {
+    for (int i = 0; i < PULSAR_SLOTS; i++)
+        if (H.host->slot[i].device_id == FAKE_ID && H.host->slot[i].allowed) return i;
+    return -1;
 }
 
 static void scenario_real_conn(void) {
-    printf("scenario: real connection request + negotiation (CONN_NEG, LOCK), learned CCM direction\n");
+    printf("scenario: real formats: request, one accept in slot 1..4, TL registers, notifications, LED, haptics\n");
+    link_result_t r = start_host(LINK_HOST_DM_BEACONS | LINK_HOST_TL_IDLE);
+    CHECK(r.status == LINK_OK, "restart");
     C.plat.radio_halt(&C.plat);
-    start_fake(LINK_FAKE_PAIRED | LINK_FAKE_REAL_CONN, 0);
+    start_fake(LINK_FAKE_PAIRED | LINK_FAKE_REAL_CONN | LINK_FAKE_STREAM_INPUT | LINK_FAKE_STREAM_IMU, 0);
     size_t mark = H.nev;
     for (int i = 0; i < 300 && !find(&H, EVT_CONN, mark, 9, LINK_SLOT_CONNECTED); i++) run(10000);
     CHECK(find(&H, EVT_CONN, mark, 9, LINK_SLOT_NEGOTIATING), "real: never negotiating");
     CHECK(find(&H, EVT_CONN, mark, 9, LINK_SLOT_CONNECTED), "real: never connected");
-    int s = -1;
-    for (int i = 0; i < PULSAR_SLOTS; i++)
-        if (H.host->slot[i].device_id == FAKE_ID) s = i;
-    CHECK(s >= 0 && C.ctrl->accepted && C.ctrl->slot == s, "real: fake slot %u vs host %d", C.ctrl->slot, s);
-    CHECK(H.host->ccm_dir == 1, "real: CCM direction not learned");
-    run(500000);
-    CHECK(s >= 0 && H.host->slot[s].state == LINK_SLOT_CONNECTED && H.host->slot[s].rx_bad_mic == 0,
-          "real: link not held (%u bad MICs)", s >= 0 ? H.host->slot[s].rx_bad_mic : 0);
-    link_result_t r = HOST_CMD(CMD_REG_READ, link_reg_cmd_t, .slot = (uint8_t)s, .reg = 0x2f);
-    CHECK(r.status == LINK_ERR_PENDING_RE, "real: register read %u", r.status);
+    int s = real_slot();
+    CHECK(s >= 1 && C.ctrl->accepted && C.ctrl->slot == s, "real: fake slot %u vs host %d", C.ctrl->slot, s);
+    if (s < 1) return;
+    CHECK(C.ctrl->fatal_accepts == 0, "accept with slot 0 sent");
+    CHECK(H.host->ccm_dir == 0, "real: CCM direction %u (R8: 0)", H.host->ccm_dir);
+    uint32_t bad0 = H.host->slot[s].rx_bad_mic;
+
+    // enumeration: hand (cmd 1), IMU scale (cmd 0x32), data ready (cmd 9); never cmd 0xa1
+    size_t s0 = H.nev;
+    run(1000000);
+    CHECK(H.host->slot[s].state == LINK_SLOT_CONNECTED && H.host->slot[s].rx_bad_mic == bad0,
+          "real: link not held (%u bad MICs)", H.host->slot[s].rx_bad_mic - bad0);
+    CHECK(H.host->slot[s].hand == LINK_HAND_LEFT, "hand %u", H.host->slot[s].hand);
+    CHECK(H.host->slot[s].accel_fs_g == 32 && H.host->slot[s].gyro_fs_dps == 4000, "IMU scale %u/%u",
+          H.host->slot[s].accel_fs_g, H.host->slot[s].gyro_fs_dps);
+    CHECK(C.ctrl->data_ready && C.ctrl->a1_writes == 0, "data ready %u, 0xa1 x%u", C.ctrl->data_ready, C.ctrl->a1_writes);
+
+    // input + IMU from the notification chunk stream
+    size_t n_in = count(&H, EVT_INPUT, s0), n_imu = count(&H, EVT_IMU, s0);
+    CHECK(n_in > 400 && n_imu > 400, "real: input %zu imu %zu per second", n_in, n_imu);
+    int bad_in = 0, bad_imu = 0;
+    for (size_t i = s0; i < H.nev; i++) {
+        if (H.ev[i].type == EVT_INPUT) {
+            link_input_t in;
+            memcpy(&in, H.ev[i].body, sizeof in);
+            if (i < s0 + 100) continue;  // the first events come before every input ntf has been seen
+            bad_in += in.slot != s || in.flags != 2 || in.battery_pct != 87 || in.trigger + in.grip != 4000 ||
+                      in.stick[0] != (int16_t)in.trigger - 2000 || in.pressure != 0xABC || in.touch != 1;
+        } else if (H.ev[i].type == EVT_IMU) {
+            link_imu_t imu;
+            memcpy(&imu, H.ev[i].body, sizeof imu);
+            uint64_t host_now = (uint64_t)local_of(&H, H.ev[i].t);
+            bad_imu += imu.slot != s || (imu.flags & 4 && i > s0 + 100) || imu.accel[2] != 1024 ||
+                       imu.t_us > host_now || host_now - imu.t_us > 3000;
+            if (i > s0 + 100 && (imu.accel_fs_g != 32 || imu.gyro_fs_dps != 4000)) bad_imu++;
+        }
+    }
+    CHECK(bad_in == 0 && bad_imu == 0, "real: %d bad input, %d bad IMU events", bad_in, bad_imu);
+
+    // registers over the TL header
+    mark = H.nev;
+    r = HOST_CMD(CMD_REG_READ, link_reg_cmd_t, .slot = (uint8_t)s, .reg = 0x32);
+    CHECK(r.status == LINK_OK, "real read %u", r.status);
+    ev_t* e = wait_reg(mark, 0x32, LINK_REG_READ, 100000);
+    CHECK(e && REG_STATUS(e) == LINK_OK && REG_LEN(e) == 16 && !memcmp(REG_DATA(e), C.ctrl->regs[0x32], 16) &&
+              e->body[8] == r.tag, "real read 0x32");
+    mark = H.nev;
+    HOST_CMD(CMD_REG_READ, link_reg_cmd_t, .slot = (uint8_t)s, .reg = 0x01, .len = 8);
+    e = wait_reg(mark, 0x01, LINK_REG_READ, 100000);
+    CHECK(e && REG_LEN(e) == 8 && !memcmp(REG_DATA(e), "oculus", 6), "real read cmd 1, 8 bytes");
+    mark = H.nev;
+    HOST_CMD(CMD_REG_READ, link_reg_cmd_t, .slot = (uint8_t)s, .reg = 0x3e);
+    e = wait_reg(mark, 0x3e, LINK_REG_READ, 100000);
+    CHECK(e && REG_STATUS(e) == LINK_ERR_REJECTED, "read of an unknown register not refused");
+    struct { link_reg_cmd_t c; uint8_t d[3]; } w = {{tag_n++, (uint8_t)s, 0x30, 3}, {7, 8, 9}};
+    mark = H.nev;
+    r = host_cmd(CMD_REG_WRITE, &w, sizeof w);
+    e = wait_reg(mark, 0x30, LINK_REG_WRITE_ACK, 100000);
+    CHECK(e && REG_STATUS(e) == LINK_OK, "real write: no ack");
+    CHECK(C.ctrl->reg_len[0x30] == 3 && C.ctrl->regs[0x30][2] == 9, "real write not applied");
+    w.c.tag = tag_n++;  // the same command again: a new seq, so it runs again (R0 rule 3)
+    w.d[2] = 10;
+    mark = H.nev;
+    host_cmd(CMD_REG_WRITE, &w, sizeof w);
+    e = wait_reg(mark, 0x30, LINK_REG_WRITE_ACK, 100000);
+    CHECK(e && C.ctrl->regs[0x30][2] == 10, "repeated write not executed");
+    struct { link_reg_cmd_t c; uint8_t d[12]; } badled = {{tag_n++, (uint8_t)s, 0x28, 12}, {0x40, 0x42, 0x0f}};  // p 1 s
+    mark = H.nev;
+    host_cmd(CMD_REG_WRITE, &badled, sizeof badled);
+    e = wait_reg(mark, 0x28, LINK_REG_WRITE_ACK, 100000);
+    CHECK(e && REG_STATUS(e) == LINK_ERR_REJECTED, "failed write not reported");
+
+    // LED: cmd 0x28 {period, on-time, d = centre mod period}; ON is impossible on a real controller
+    r = HOST_CMD(CMD_LED, link_led_t, .slot = (uint8_t)s, .mode = LINK_LED_STROBE, .period_us = 11111, .on_us = 80,
+                 .phase_us = -500);
+    CHECK(r.status == LINK_OK, "real LED %u", r.status);
+    r = HOST_CMD(CMD_LED, link_led_t, .slot = (uint8_t)s, .mode = LINK_LED_ON);
+    CHECK(r.status == LINK_ERR_ARGS, "real LED ON: %u", r.status);
+    run(30000);
+    CHECK(C.ctrl->led_cfg[0] == 11111 && C.ctrl->led_cfg[1] == 75 && C.ctrl->led_cfg[2] == 10611, "LED %u %u %u",
+          C.ctrl->led_cfg[0], C.ctrl->led_cfg[1], C.ctrl->led_cfg[2]);
+
+    // notifications the dongle does not decode: forwarded on request. ntf 0xb (the LED echo, every
+    // 2 s) is 12 bytes split across two uplinks (R13).
+    mark = H.nev;
+    r = HOST_CMD(CMD_REG_SUBSCRIBE, link_reg_sub_t, .slot = (uint8_t)s, .reg = 0x0b);
+    CHECK(r.status == LINK_OK, "real subscribe %u", r.status);
+    e = wait_reg(mark, 0x0b, LINK_REG_NOTIFY, 2500000);
+    uint8_t echo[12];
+    for (int i = 0; i < 3; i++) memcpy(echo + 4 * i, &C.ctrl->led_cfg[i], 4);
+    CHECK(e && REG_LEN(e) == 12 && !memcmp(REG_DATA(e), echo, 12), "fragmented LED echo not reassembled");
+    HOST_CMD(CMD_REG_SUBSCRIBE, link_reg_sub_t, .slot = (uint8_t)s, .reg = 0x0b, .flags = LINK_SUB_UNSUBSCRIBE);
+
+    // haptics: 0xa0 buzz, stopped by 0x97 0 after duration_ms; PCM (0x9d) is not pinned
+    r = HOST_CMD(CMD_HAPTIC, link_haptic_t, .slot = (uint8_t)s, .mode = LINK_HAPTIC_SIMPLE, .amplitude = 200,
+                 .freq_hz = 160, .duration_ms = 100);
+    CHECK(r.status == LINK_OK, "real haptic %u", r.status);
+    run(40000);
+    CHECK(C.ctrl->haptic_amp == 200 && C.ctrl->haptic_freq == 160, "buzz %u at %u Hz", C.ctrl->haptic_amp,
+          C.ctrl->haptic_freq);
+    run(100000);
+    CHECK(C.ctrl->haptic_amp == 0, "buzz not stopped after duration_ms");
+    r = HOST_CMD(CMD_HAPTIC, link_haptic_t, .slot = (uint8_t)s, .mode = LINK_HAPTIC_SIMPLE, .freq_hz = 30);
+    CHECK(r.status == LINK_ERR_ARGS, "30 Hz accepted");
+    struct { link_haptic_t h; uint8_t pcm[8]; } hp = {{tag_n++, (uint8_t)s, LINK_HAPTIC_PCM, 255, 2000, 0, 8, 0}, {0}};
+    r = host_cmd(CMD_HAPTIC, &hp, sizeof hp);
+    CHECK(r.status == LINK_ERR_PENDING_RE, "real PCM: %u", r.status);
+
+    // a link loss: the controller re-seeks, reconnects, and gets its LED config again (R16)
+    mark = H.nev;
+    outage = true;
+    run(300000);
+    outage = false;
+    CHECK(find(&H, EVT_CONN, mark, 9, LINK_SLOT_LOST), "real: outage not noticed");
+    CHECK(C.ctrl->led_cfg[1] == 19 || !C.ctrl->accepted, "fake kept its LED config over a reconnect");
+    for (int i = 0; i < 100 && !find(&H, EVT_CONN, mark, 9, LINK_SLOT_CONNECTED); i++) run(10000);
+    CHECK(find(&H, EVT_CONN, mark, 9, LINK_SLOT_CONNECTED), "real: no reconnect");
+    run(50000);
+    CHECK(C.ctrl->led_cfg[0] == 11111 && C.ctrl->led_cfg[1] == 75, "LED config not re-sent after the reconnect");
+    CHECK(C.ctrl->fatal_accepts == 0 && C.ctrl->a1_writes == 0, "fatal accepts / 0xa1");
+}
+
+static void scenario_real_pairing(void) {
+    printf("scenario: real pairing: a refused PairingData redoes 0x25 (R15), Reset (R6), then the hand (R11)\n");
+    link_result_t r = start_host(LINK_HOST_DM_BEACONS);
+    CHECK(r.status == LINK_OK, "restart");
+    C.plat.radio_halt(&C.plat);
+    start_fake(LINK_FAKE_REAL_CONN | LINK_FAKE_STREAM_IMU, 0);
+    C.ctrl->fail_pair_data = 1;
+    size_t mark = H.nev;
+    r = HOST_CMD(CMD_PAIR_START, link_pair_start_t, .flags = LINK_PAIR_AUTO, .timeout_s = 10);
+    CHECK(r.status == LINK_OK, "pair start");
+    for (int i = 0; i < 300 && !find(&H, EVT_PAIR, mark, 8, LINK_PAIR_DONE); i++) run(10000);
+    CHECK(find(&H, EVT_PAIR, mark, 8, LINK_PAIR_DONE), "real pairing did not finish");
+    size_t pair_mark = mark;
+    ev_t* first = find(&H, EVT_PAIR, mark, 8, LINK_PAIR_DONE);
+    CHECK(first && first->body[11] == LINK_HAND_UNKNOWN, "first DONE should not know the hand");
+    bool redo = false;
+    for (size_t i = mark; i < H.nev; i++)
+        if (H.ev[i].type == EVT_TEXT && strstr((const char*)H.ev[i].body, "redoing")) redo = true;
+    CHECK(redo, "refused PairingData not retried via 0x25");
+    CHECK(C.ctrl->paired && C.ctrl->netaddr == NETADDR, "fake not provisioned");
+    CHECK(C.ctrl->state == CTRL_ADVERTISING && C.ctrl->reset_at_us, "no Reset sent");
+    run(600000);
+    CHECK(C.ctrl->state != CTRL_ADVERTISING, "fake still in the SPL 600 ms after the Reset");
+    mark = H.nev;
+    for (int s = 0; s < LINK_MAX_SLOTS; s++) HOST_CMD(CMD_DISCONNECT, link_disconnect_t, .slot = (uint8_t)s, .flags = 1);
+    r = HOST_CMD(CMD_CONNECT, link_connect_t, .slot = 0, .device_id = FAKE_ID);
+    CHECK(r.status == LINK_ERR_NO_SLOT, "slot 0 assigned: %u", r.status);
+    r = HOST_CMD(CMD_CONNECT, link_connect_t, .slot = 0xFF, .device_id = FAKE_ID);
+    CHECK(r.status == LINK_OK && r.detail == 1, "connect %u/%u", r.status, r.detail);
+    for (int i = 0; i < 100 && !find(&H, EVT_CONN, mark, 9, LINK_SLOT_CONNECTED); i++) run(10000);
+    CHECK(find(&H, EVT_CONN, mark, 9, LINK_SLOT_CONNECTED), "no connection after real pairing");
+    run(50000);
+    ev_t* e = find(&H, EVT_PAIR, pair_mark, 8, LINK_PAIR_DONE);  // the last DONE: the one with the hand
+    CHECK(e && e != first && e->body[11] == LINK_HAND_LEFT, "no EVT_PAIR(DONE) with the hand after connecting");
 }
 
 static link_result_t start_stored(void) {
@@ -591,7 +756,7 @@ static void scenario_stored(void) {
     CHECK(find(&H, EVT_CONN, mark, 9, LINK_SLOT_CONNECTED), "did not connect after pairing");
     link_pairing_t rec[LINK_MAX_PAIRINGS];
     p = list_pairings(rec);
-    CHECK(p.count == 1 && rec[0].device_id == FAKE_ID && rec[0].slot == 0, "stored pairing");
+    CHECK(p.count == 1 && rec[0].device_id == FAKE_ID && rec[0].slot == 1, "stored pairing");
 
     // compact samples instead of input + IMU
     size_t s0 = H.nev;
@@ -602,7 +767,7 @@ static void scenario_stored(void) {
     if (e) {
         link_sample_t smp;
         memcpy(&smp, e->body, sizeof smp);
-        CHECK(e->len == sizeof smp && smp.in.slot == 0 && smp.accel[2] == 1024 && (smp.in.flags & 4), "sample fields");
+        CHECK(e->len == sizeof smp && smp.in.slot == 1 && smp.accel[2] == 1024 && (smp.in.flags & 4), "sample fields");
     }
 
     // dongle reboot: RAM gone, flash kept. The controller loses us, seeks, and is let back in.
@@ -636,7 +801,7 @@ static void scenario_stored(void) {
 
 static void scenario_bad_args(void) {
     printf("scenario: argument and state checks\n");
-    link_host_start_t s = {.tag = tag_n++, .netaddr = 1, .chmap = {0x7f}};
+    link_host_start_t s = {.tag = tag_n++, .netaddr = 1, .chmap = {0x1f}};  // + 17 and 36 (R10) = 7
     link_result_t r = host_cmd(CMD_HOST_START, &s, sizeof s);
     CHECK(r.status == LINK_ERR_ARGS, "7-channel map accepted");
     r = host_cmd(CMD_HOST_START, &s, 5);
@@ -676,6 +841,7 @@ int main(int argc, char** argv) {
     scenario_disconnect_forget();
     scenario_real_formats();
     scenario_real_conn();
+    scenario_real_pairing();
     scenario_stored();
     scenario_bad_args();
     if (failures) {

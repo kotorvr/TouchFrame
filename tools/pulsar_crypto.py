@@ -18,8 +18,14 @@ which was the *pairing* wrap `FUN_00047604`, a different link):
   - **negotiation / "legacy" (A2):** counter 0, IV = session_nonce<<48 | beacon_ts48 (u64 LE), both
     read from the beacon (bytes 6..7 and 8..13). Nothing is random; a sniffer with the key derives
     it from the beacon alone. Decrypts the controller's first uplink (its connection request).
+    After missed beacons the controller uses ts + missed*2000 (elk LL+0x280), so `scan` also tries
+    a few missed periods past the last captured beacon.
   - **steady state (A3):** IV = the 8 bytes the controller put in its connection request (bytes
-    15..22, from elk record +0x68), with a per-slot counter that advances per packet.
+    15..22, from elk record +0x68). The counter = beacon periods since the accept (REVIEW-RE R7):
+    it advances every 2 ms period, with or without an uplink, so after a few seconds it is in the
+    thousands; `scan` sweeps 0..--max-counter (default 4096).
+The direction bit (nonce bit 39) is always 0 (REVIEW-RE R8, AUDIT A17); the flipped direction is
+still tried as a fallback.
 
 Decode: for a negotiation uplink, pass `--session`/`--timestamp` (or let `scan` read them from the
 preceding AP1 beacon). For steady-state uplinks, pass `--iv <the 8 request bytes>` and let `scan`
@@ -29,7 +35,8 @@ confirms IV + counter + key. AAD = S0 & 0xE3 (connected S0 0x04 -> 0x00).
   pulsar_crypto.py selftest
   pulsar_crypto.py decode --key <32 hex> --packet <hex payload incl. 4-byte MIC> \\
       [--counter N] [--dir 0|1] [--iv <16 hex>] [--session <4 hex>] [--timestamp N]
-  pulsar_crypto.py scan  --key <32 hex> --capture cap.jsonl [--session ...] [--limit N]
+  pulsar_crypto.py scan  --key <32 hex> --capture cap.jsonl [--iv ...] [--session ...]
+      [--max-counter 4096] [--max-missed 4] [--limit N]
       try every candidate layout against captured packets; report the first that verifies
 """
 import argparse
@@ -108,13 +115,14 @@ def candidate_nonces(counter, direction, iv=None, session=None, beacon_ts=None):
     """Firmware-grounded nonce candidates (AUDIT A2/A3). Two regimes:
 
     - **steady state (A3):** `iv` = the 8 bytes the controller sent in its connection request
-      (bytes 15..22), swept against a per-packet `counter`. This is the regime for all normal
-      uplinks once the link is up.
+      (bytes 15..22), swept against `counter` = beacon periods since the accept (R7). This is the
+      regime for all normal uplinks once the link is up.
     - **negotiation (A2):** `session` + `beacon_ts` from the beacon that opened the period; the
       nonce is counter 0, IV = legacy_iv(session, beacon_ts). This decrypts the controller's first
       uplink (its connection request), which itself carries the steady IV.
 
-    Each is tried in the caller's direction and the flipped one (uplink is bit 39 = 1). The old
+    Each is tried in the caller's direction and the flipped one (the real uplink is direction 0,
+    R8; the flip is a fallback). The old
     `ctr=session<<48|ts` candidate is gone: `nonce_from_fields` masks the counter to 39 bits, so it
     silently dropped the session."""
     out = []
@@ -143,7 +151,7 @@ def selftest():
     assert pt == bytes.fromhex("08090a0b0c0d0e0f101112131415161718191a1b1c1d1e"), pt.hex()
     # Round-trip a Pulsar-shaped frame (1-byte AAD=0, M=4) to exercise that path.
     k = bytes.fromhex("000102030405060708090a0b0c0d0e0f")
-    n = nonce_from_fields(counter=0x1234, direction=1, iv=bytes(range(8)))
+    n = nonce_from_fields(counter=0x1234, direction=0, iv=bytes(range(8)))
     msg = bytes(range(20))
     # encrypt = decrypt keystream is symmetric; forge a ct by decrypting then re-deriving is circular,
     # so just check decrypt of a self-encrypted frame:
@@ -153,34 +161,71 @@ def selftest():
     pt2, _ = ccm_decrypt(k, n, ct + b"\x00" * 4, aad=b"\x00", mic_len=4)
     assert pt2 == msg, "keystream round-trip failed"
 
-    # AUDIT A8: an independent MIC check. Build a real Pulsar-shaped packet with the stdlib AES-CCM
-    # under the A2 legacy nonce, wrap it as an on-air connected packet ([S0=0x04][LEN][ct+MIC]), and
-    # confirm `scan`'s beacon-tracked legacy path finds it (so the nonce model, header stripping and
-    # AAD are all correct, not just self-consistent).
+    # Independent MIC checks (AUDIT A8, REVIEW-RE R17): real Pulsar-shaped packets built with
+    # `cryptography`'s AESCCM (M=4, AAD 00) under HAND-PACKED nonces (not nonce_from_fields /
+    # legacy_iv), wrapped as on-air connected packets ([S0=0x04][LEN][ct+MIC]), then found by `scan`
+    # (so the nonce model, header stripping and AAD are all checked, not just self-consistent).
     from cryptography.hazmat.primitives.ciphers.aead import AESCCM
-    import os, tempfile
+    from pulsar_host import parse_conn_request, parse_tl_uplink
+    ccm = AESCCM(k, tag_length=4)
     session, ts = 0xABCD, 0x1122334455
-    nonce_a2 = nonce_from_fields(0, 1, legacy_iv(session, ts))      # uplink (dir 1), counter 0
-    plain = bytes(range(20))
-    ct_mic = AESCCM(k, tag_length=4).encrypt(nonce_a2, plain, b"\x00")  # AAD = S0 0x04 & 0xE3 = 0x00
-    assert len(ct_mic) == 24
-    beacon_payload = bytes(6) + session.to_bytes(2, "little") + ts.to_bytes(6, "little") + bytes(2)
-    beacon = bytes([0x04, len(beacon_payload)]) + beacon_payload     # S0 + LEN + payload (AP1)
-    uplink = bytes([0x04, len(ct_mic)]) + ct_mic                     # S0 + LEN + CCM(ct+MIC)
+
+    def beacon_row(t_us, sess, bts):
+        bp = bytes(6) + sess.to_bytes(2, "little") + bts.to_bytes(6, "little") + bytes(2)
+        return dict(t_us=t_us, mhz=2404, addr=1, data=(bytes([0x04, len(bp)]) + bp).hex())
+
+    def uplink_row(t_us, ct_mic):
+        return dict(t_us=t_us, mhz=2404, addr=2, data=(bytes([0x04, len(ct_mic)]) + ct_mic).hex())
+
+    # (1) A2 legacy, DIRECTION 0 (R8): the controller's connection request, hand-packed per the A3
+    #     table, nonce = 00*5 ‖ ts48 LE ‖ session LE. scan must find it and parse_conn_request
+    #     must read it.
+    steady_iv = bytes.fromhex("a1a2a3a4a5a6a7a8")
+    req = bytes([0x00, 0x11]) + (0x0102030405060708).to_bytes(8, "little") + b"\x01\x17" \
+        + bytes(2) + b"\x01" + steady_iv + bytes(2)
+    assert len(req) == 25
+    nonce_a2 = bytes(5) + ts.to_bytes(6, "little") + session.to_bytes(2, "little")
+    res = _scan_rows(k, [beacon_row(1, session, ts), uplink_row(2, ccm.encrypt(nonce_a2, req, b"\x00"))])
+    assert res and res["dir"] == 0 and res["ctr"] == 0 and res["pt"] == req, res
+    got = parse_conn_request(res["pt"])
+    assert got["device_id"] == 0x0102030405060708 and got["steady_iv"] == steady_iv
+    assert got["version"] == 0x1701 and got["format"] == 2 and got["slot_count"] == 1
+
+    # (2) AUDIT A2: one missed beacon -> the controller used ts + 2000; still found.
+    nonce_miss = bytes(5) + (ts + 2000).to_bytes(6, "little") + session.to_bytes(2, "little")
+    res = _scan_rows(k, [beacon_row(1, session, ts), uplink_row(2, ccm.encrypt(nonce_miss, req, b"\x00"))])
+    assert res and "+1 missed" in res["name"] and res["pt"] == req, res
+
+    # (3) R7: a steady packet at counter 1000 (2 s into the link) under the request's IV,
+    #     direction 0, found with the DEFAULT --max-counter (the old default 8 missed it).
+    body = bytes.fromhex("010043") + bytes.fromhex("248005")       # [S=1][reg 0][0x40|3][ntf 4]
+    nonce_st = (1000).to_bytes(5, "little") + steady_iv
+    res = _scan_rows(k, [uplink_row(5, ccm.encrypt(nonce_st, body, b"\x00"))], iv=steady_iv)
+    assert res and res["ctr"] == 1000 and res["dir"] == 0 and res["pt"] == body, res
+    assert parse_tl_uplink(res["pt"])["ntf"]
+    print("selftest ok (RFC 3610 vector #1 + keystream round-trip + independent AESCCM: "
+          "direction-0 A2 legacy connection request found by scan and parsed + one-missed-beacon "
+          "legacy ts + counter-1000 steady packet found with the default --max-counter)")
+
+
+def _scan_rows(key, rows, iv=None, **kw):
+    """Run do_scan over in-memory capture rows (selftest helper); returns its result dict."""
+    import contextlib
+    import io
+    import os
+    import tempfile
     with tempfile.TemporaryDirectory() as d:
         cap = os.path.join(d, "c.jsonl")
         with open(cap, "w") as f:
-            f.write(json.dumps(dict(t_us=1, mhz=2404, addr=1, data=beacon.hex())) + "\n")
-            f.write(json.dumps(dict(t_us=2, mhz=2404, addr=2, data=uplink.hex())) + "\n")
-        args = argparse.Namespace(key=k.hex(), capture=cap, iv=None, session=None,
-                                  s0len=1, max_counter=2, limit=0)
-        import io, contextlib
-        buf = io.StringIO()
-        with contextlib.redirect_stdout(buf):
-            do_scan(args)
-        assert "VERIFIED" in buf.getvalue() and plain.hex() in buf.getvalue(), buf.getvalue()
-    print("selftest ok (RFC 3610 vector #1 + keystream round-trip + "
-          "A2 legacy-nonce AES-CCM packet recovered by scan)")
+            for r in rows:
+                f.write(json.dumps(r) + "\n")
+        args = argparse.Namespace(key=key.hex(), capture=cap, iv=iv.hex() if iv else None,
+                                  session=None, s0len=1, max_counter=MAX_COUNTER_DEFAULT,
+                                  max_missed=MAX_MISSED_DEFAULT, limit=0)
+        for name, val in kw.items():
+            setattr(args, name, val)
+        with contextlib.redirect_stdout(io.StringIO()):
+            return do_scan(args)
 
 
 def h(s):
@@ -214,10 +259,39 @@ def _ccm_body(data, s0len):
     return body, aad
 
 
+MAX_COUNTER_DEFAULT = 4096   # R7: counter = beacon periods since the accept (2 ms each)
+MAX_MISSED_DEFAULT = 4       # A2: legacy ts = last beacon ts + missed * 2000
+BEACON_PERIOD_US = 2000
+
+
+def _scan_candidates(iv, sess, bts, max_counter, max_missed):
+    """Yield (name, direction, counter, nonce) for one packet, cheapest first, direction 0 (R8)
+    before the flip: legacy (counter 0, ts + missed*2000, A2), then steady (counter 0..max, R7)."""
+    if sess is not None and bts is not None:
+        for missed in range(max_missed + 1):
+            liv = legacy_iv(sess, (bts + missed * BEACON_PERIOD_US) & ((1 << 48) - 1))
+            tag = f" +{missed} missed" if missed else ""
+            for direction in (0, 1):
+                yield f"legacy session<<48|ts{tag}", direction, 0, nonce_from_fields(0, direction, liv)
+    if iv is not None:
+        for counter in range(max_counter + 1):
+            for direction in (0, 1):
+                yield "steady iv-from-request", direction, counter, nonce_from_fields(counter, direction, iv)
+    elif sess is None or bts is None:
+        for counter in range(max_counter + 1):
+            for direction in (0, 1):
+                yield ("ctr-only (pass --iv or --session+--timestamp)", direction, counter,
+                       nonce_from_fields(counter, direction, b"\x00" * 8))
+
+
 def do_scan(args):
+    """Try every candidate nonce against each captured uplink; print and return the first hit as
+    dict(t_us, mhz, addr, dir, ctr, name, aad, pt), or None."""
     key = h(args.key)
     iv = h(args.iv) if args.iv else None
     s0len = args.s0len
+    max_counter = getattr(args, "max_counter", MAX_COUNTER_DEFAULT)
+    max_missed = getattr(args, "max_missed", MAX_MISSED_DEFAULT)
     rows = []
     with open(args.capture) as f:
         for line in f:
@@ -228,8 +302,8 @@ def do_scan(args):
     # Track the most recent host beacon (AP1) so the A2 legacy nonce can use its session+ts (A8:
     # pull them from the preceding beacon rather than the dongle capture time).
     sess, bts = args.session, None
-    print(f"{len(rows)} packets; s0len={s0len}; counters 0..{args.max_counter}; "
-          f"{'steady IV given' if iv else 'legacy (beacon-tracked)'}")
+    print(f"{len(rows)} packets; s0len={s0len}; counters 0..{max_counter}; missed beacons "
+          f"0..{max_missed}; {'steady IV given' if iv else 'legacy (beacon-tracked)'}")
     for r in rows:
         data = h(r["data"])
         addr = r.get("addr")
@@ -242,16 +316,16 @@ def do_scan(args):
         body, aad = _ccm_body(data, s0len)
         if not body or len(body) < 5:
             continue
-        for direction in (0, 1):
-            for counter in range(args.max_counter + 1):
-                for name, nonce in candidate_nonces(counter, direction, iv, sess, bts):
-                    pt, ok = ccm_decrypt(key, nonce, body, aad=aad)
-                    if ok:
-                        print(f"VERIFIED t={r.get('t_us')} mhz={r.get('mhz')} addr={addr} dir={direction} "
-                              f"ctr={counter} [{name}] aad={aad.hex()}\n  pt={pt.hex()}")
-                        return
+        for name, direction, counter, nonce in _scan_candidates(iv, sess, bts, max_counter, max_missed):
+            pt, ok = ccm_decrypt(key, nonce, body, aad=aad)
+            if ok:
+                print(f"VERIFIED t={r.get('t_us')} mhz={r.get('mhz')} addr={addr} dir={direction} "
+                      f"ctr={counter} [{name}] aad={aad.hex()}\n  pt={pt.hex()}")
+                return dict(t_us=r.get("t_us"), mhz=r.get("mhz"), addr=addr, dir=direction,
+                            ctr=counter, name=name, aad=aad, pt=pt)
     print("no packet verified with the given key and candidates "
           "(need the link key; for legacy, a preceding AP1 beacon; for steady, --iv from the request)")
+    return None
 
 
 def main():
@@ -276,7 +350,11 @@ def main():
                    help="16-bit session nonce (fallback if no AP1 beacon is in the capture)")
     s.add_argument("--s0len", type=int, default=1, choices=(0, 1),
                    help="1 for connected captures ([S0][LEN][payload]), 0 for DM/pairing")
-    s.add_argument("--max-counter", type=int, default=8)
+    s.add_argument("--max-counter", type=int, default=MAX_COUNTER_DEFAULT,
+                   help="steady counter sweep 0..N; the counter = beacon periods since the accept "
+                        "(R7), so 4096 covers ~8 s of link")
+    s.add_argument("--max-missed", type=int, default=MAX_MISSED_DEFAULT,
+                   help="legacy: also try ts + k*2000 for k = 1..N missed beacons (AUDIT A2)")
     s.add_argument("--limit", type=int, default=0)
     s.set_defaults(fn=do_scan)
     args = ap.parse_args()

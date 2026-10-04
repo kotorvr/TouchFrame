@@ -4,6 +4,7 @@
 
 #define MAGIC 0x54460000u  // "TF" in the top half of word 0, the record type in the bottom
 #define ERASED 0xFFFFFFFFu
+#define STORE_EARLY_COMPACT 4  // compact this many records before the page is full, if the spare is ready
 
 enum { REC_HEADER = 1, REC_IDENT = 2, REC_PAIR = 3, REC_FORGET = 4, REC_FORGET_ALL = 5 };
 
@@ -119,10 +120,18 @@ static void put_id(uint32_t d[6], uint64_t id) {
 }
 
 // Rebuild the live state on the other page, header last, then retire this one.
+static bool spare_ready(const store_t* s) {
+    uint8_t to = (uint8_t)(1 - s->active);
+    return !s->erase_left[to] && page_blank(s, to);
+}
+
 static bool compact(store_t* s) {
     uint8_t to = (uint8_t)(1 - s->active);
-    if (s->erase_left[to]) erase_now(s, to);  // still being erased in the background: finish now
-    if (!page_blank(s, to)) erase_now(s, to);
+    if (!spare_ready(s)) {
+        if (s->no_sync_erase) return false;  // R9: never stall a connected link; retried later
+        if (s->erase_left[to]) erase_now(s, to);  // still being erased in the background: finish now
+        if (!page_blank(s, to)) erase_now(s, to);
+    }
     uint16_t i = 1;
     uint32_t d[6];
     if (s->netaddr) {
@@ -149,6 +158,8 @@ static bool compact(store_t* s) {
 
 static bool append(store_t* s, uint32_t type, const uint32_t d[6]) {
     if (!s->ok) return false;
+    // compact early while the spare is ready, so a full page rarely meets a spare still being erased
+    if (s->used >= STORE_RECS - STORE_EARLY_COMPACT && s->used < STORE_RECS && spare_ready(s)) compact(s);
     if (s->used >= STORE_RECS && !compact(s)) return false;
     uint16_t i = s->used++;
     if (!rec_write(s, s->active, i, type, d)) return false;

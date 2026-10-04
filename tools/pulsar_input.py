@@ -3,13 +3,17 @@
 
 Evidence: docs/re/PERIPHERALS.md (RE-2). Tags there: CONFIRMED / INFERRED / UNKNOWN.
 
-There is NO HID report descriptor. A Touch Plus talks to the host through two register spaces
-(PERIPHERALS §1), and this tool models both, with NO hardware and NO radio:
+Input does not go through a HID report descriptor: cmd 0xab does return one (LINK §3), but the
+host decodes Touch Plus input from two register spaces (PERIPHERALS §1), and this tool models
+both, with NO hardware and NO radio:
 
 * Notification registers ("ntf"): the controller pushes them as a chunk stream (u16 header +
-  payload, PERIPHERALS §1.1). Chunk type == ntf id. Buttons, stick, triggers, touch, IMU,
-  battery, LED echo all arrive this way.
-    unpack_chunks(payload)      -> [(type, bytes)]  (host ntf_unpacker_next, with fragments)
+  payload, PERIPHERALS §1.1) in TL notifications [S][0x00][0x40|seq][chunks] (REVIEW-RE R0).
+  Chunk type == ntf id. Buttons, stick, triggers, touch, IMU, battery, LED echo all arrive this way.
+    NtfUnpacker().feed(payload) -> [(type, bytes)]  (host ntf_unpacker_next; fragments span
+                                   notifications, so keep one unpacker per controller, R13)
+    unpack_chunks(payload)      -> the same for one isolated notification (stateless)
+    pack_notifications(items)   -> per-notification chunk streams within the 49-byte budget
     decode_ntf(type, payload)   -> labelled fields, SI units for the IMU
 * Command registers: host pulsar_read/pulsar_write by id.
     pack_led_config / parse_led_config   cmd 0x28 {u32 period_us, u32 ontime_us, i32 delay_us}
@@ -28,12 +32,14 @@ It also keeps the deerfly (input MCU) layer that elk-app repacks into ntf regist
   pulsar_input.py selftest
   pulsar_input.py parse  --sample <122 hex chars = 61 bytes>
   pulsar_input.py ntf    --type <id> --value <hex>
-  pulsar_input.py chunks --payload <hex>          (notification body after the 0x14-byte header)
+  pulsar_input.py chunks --payload <hex> [--payload <hex> ...]
+                         (notification bodies after the 0x14-byte header, in order; one unpacker)
   pulsar_input.py led    --period 11111 --ontime 75 --delay 0 [--now 123456]
 """
 import argparse
 import math
 import struct
+import warnings
 import zlib
 
 SAMPLE_LEN = 61            # deerfly reg 0x37 sample: 0x3d bytes
@@ -53,7 +59,7 @@ NTF_STATE = 0x06           # u8 state flags
 NTF_CAPTOUCH = 0x08        # 10 B raw
 NTF_TOUCH = 0x09           # u32, 12 touch/prox bits
 NTF_IRLED = 0x0B           # 12 B {p, ot, d} echo of the applied LED config
-NTF_PRESSURE = 0x15        # u16, 12-bit index-trigger pressure, full scale 8.5 N
+NTF_PRESSURE = 0x15        # u16 (deerfly u16@0x37), 12-bit index-trigger pressure, full scale 8.5 N
 NTF_BATT_ALERTS = 0x16     # u16 alert bits
 NTF_IDXCURL = 0x17         # 8 B: u8 curl1d, u8 idx_slider, 4 x s12 joint angles
 NTF_SENSOR20 = 0x20        # 6 B (UNKNOWN meaning)
@@ -76,7 +82,7 @@ BATT_ALERT_BITS = {0: "battery_pack_too_hot", 1: "battery_pack_too_cold", 2: "de
 CMD_DEVICE_DESC = 0x01
 CMD_PCB_SN = 0x02
 CMD_ASSEMBLY_SN = 0x03
-CMD_DATA_READY = 0x09      # write 1 byte 0x00: starts notification streaming (INFERRED required)
+CMD_DATA_READY = 0x09      # write 1 byte 0x00: optional; the controller streams anyway after 100 ms (R12)
 CMD_CAPABILITIES = 0x0A
 CMD_SELECT_MCU = 0x20
 CMD_APP_VERSION = 0x24
@@ -92,7 +98,7 @@ CMD_HAPTIC_SYNCBUF = 0x9B
 CMD_HAPTIC_MULTI = 0x9C    # NOT supported by Touch Plus elk (no case)
 CMD_HAPTIC_PCM = 0x9D
 CMD_HAPTIC_FREQ = 0xA0
-CMD_A1 = 0xA1              # host sends 0x00 after data-ready (meaning UNKNOWN)
+CMD_A1 = 0xA1              # battery load test: pulses the motor at 3 amplitudes (REVIEW-RE R12). NEVER send.
 CAL_BLOB_LEN = 0x1FE0      # bytes the host reads from CMD_CAL_BLOB
 
 # IR LED limits (CONFIRMED elk FUN_00016e7c init + FUN_0001fbb8 validator + 0x27fe6 clamp).
@@ -241,9 +247,18 @@ def pack_chunk(ctype, payload, seq=0, last=True):
     return struct.pack("<H", chunk_header(ctype, len(payload), seq, last)) + bytes(payload)
 
 
+CHUNK_TOTAL_MAX = 0x3F     # host: a reassembled chunk must total <= 63 bytes
+NTF_UPLINK_BUDGET = 52     # one-slot uplink CL payload 0x34 (elk 0x22714..0x2272e, REVIEW-RE R0)
+NTF_STREAM_BUDGET = NTF_UPLINK_BUDGET - 3   # minus [S][reg 0][0x40|seq] = 49 B of chunk stream
+
+
 def pack_chunks(items, frag=63):
-    """[(type, payload)] -> chunk stream, splitting payloads into <= `frag`-byte fragments.
-    The host only reassembles fragments totalling < 64 bytes."""
+    """[(type, payload)] -> ONE chunk stream, splitting payloads into <= `frag`-byte fragments.
+
+    Low-level: the host stops parsing a notification at the first non-final fragment (R13), so a
+    stream with a fragmented chunk is only fully read if that chunk's pieces each end a
+    notification. Use pack_notifications to build what a controller actually sends; this stays for
+    building test vectors. The host only reassembles fragments totalling <= 63 bytes."""
     out = b""
     for t, p in items:
         p = bytes(p)
@@ -253,41 +268,110 @@ def pack_chunks(items, frag=63):
     return out
 
 
-def unpack_chunks(payload):
-    """Chunk stream -> [(type, payload)], with the host's fragment rules: (h & 0xf000) == 0x8000
-    is a whole chunk; otherwise fragments of one type with seq 0, 1, 2 ... are appended (total
-    < 64 B) and delivered on the fragment with bit 15. A broken sequence drops the chunk."""
-    buf = bytes(payload)
-    pos, out = 0, []
-    acc_type, acc, acc_seq = None, b"", -1
-    while pos + 2 <= len(buf):
-        h = _u16(buf, pos)
-        n = (h >> 5) & 0x3F
-        if pos + 2 + n > len(buf):
-            break                                    # is_chunk_overrun
-        body = buf[pos + 2:pos + 2 + n]
-        pos += 2 + n
-        ctype = (h & 0x1F) | ((h >> 6) & 0x20)
-        seq, last = (h >> 12) & 7, bool(h & 0x8000)
-        if (h & 0xF000) == 0x8000:
-            out.append((ctype, body))
-            acc_type, acc, acc_seq = None, b"", -1
+def pack_notifications(items, budget=NTF_STREAM_BUDGET):
+    """[(type, payload)] -> [chunk stream per notification], each <= `budget` bytes (default 49 =
+    the 52-byte one-slot uplink minus the [S][reg][flags] TL header).
+
+    Whole chunks are packed greedily. A chunk too big for one notification is fragmented: each
+    NON-FINAL piece goes at the END of a notification (the host stops parsing there, R13) and the
+    final piece starts the next one, after which packing continues. Raises if a chunk exceeds the
+    host's 63-byte reassembly limit or needs more than 8 fragments."""
+    if budget < 3:
+        raise ValueError("budget must fit a 2-byte header plus 1 byte")
+    out, cur = [], b""
+    for t, p in items:
+        p = bytes(p)
+        if len(p) > CHUNK_TOTAL_MAX:
+            raise ValueError(f"chunk type {t:#x} is {len(p)} B; the host drops chunks > 63 B")
+        if 2 + len(p) <= budget:                 # fits a notification whole
+            if len(cur) + 2 + len(p) > budget:
+                out.append(cur)
+                cur = b""
+            cur += pack_chunk(t, p)
             continue
-        if seq == 0:
-            acc_type, acc, acc_seq = ctype, b"", 0
-        elif ctype != acc_type or seq != acc_seq + 1:
-            acc_type, acc, acc_seq = None, b"", -1
-            continue
-        else:
-            acc_seq = seq
-        if len(acc) + n >= 0x40:
-            acc_type, acc, acc_seq = None, b"", -1
-            continue
-        acc += body
-        if last:
-            out.append((ctype, acc))
-            acc_type, acc, acc_seq = None, b"", -1
+        seq, rest = 0, p
+        while rest:
+            if seq > 7:
+                raise ValueError("chunk needs more than 8 fragments (3-bit seq)")
+            room = budget - len(cur) - 2
+            if room < 1:
+                out.append(cur)
+                cur, room = b"", budget - 2
+            if len(rest) <= room and seq > 0:    # final piece (seq >= 1, bit 15)
+                cur += pack_chunk(t, rest, seq=seq, last=True)
+                rest = b""
+            else:                                # non-final piece: ends this notification
+                piece, rest = rest[:room], rest[room:]
+                cur += pack_chunk(t, piece, seq=seq, last=False)
+                out.append(cur)
+                cur = b""
+            seq += 1
+    if cur:
+        out.append(cur)
     return out
+
+
+class NtfUnpacker:
+    """Per-controller notification unpacker (host ntf_unpacker_next, libsyncboss 0x12e74; state
+    in the per-controller entry +0x158, REVIEW-RE R13). Reassembly state persists across feed()
+    calls, so a chunk fragmented across notifications is delivered when its final piece arrives.
+
+    Rules for each u16 header h in one notification's chunk stream:
+      - (h & 0xf000) == 0x8000: a whole chunk, delivered (partial state left alone, INFERRED).
+      - else a fragment. seq 0 starts a new chunk of that type; a continuation needs the same
+        type and seq + 1; the total must stay <= 0x3f.
+      - a NON-FINAL fragment ends parsing of this notification (the host's loop sees NULL); the
+        rest of the payload is not parsed. State persists to the next feed().
+      - a broken sequence (or an over-long total) drops the partial chunk and also stops parsing.
+      - the final fragment (bit 15) delivers the reassembled chunk.
+      - a chunk overrunning the payload ends parsing (is_chunk_overrun)."""
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.acc_type, self.acc, self.acc_seq = None, b"", -1
+
+    def feed(self, payload):
+        """One notification's chunk stream (after the 0x14-byte wrapper / TL header) ->
+        [(type, bytes)] of the chunks completed by it."""
+        buf = bytes(payload)
+        pos, out = 0, []
+        while pos + 2 <= len(buf):
+            h = _u16(buf, pos)
+            n = (h >> 5) & 0x3F
+            if pos + 2 + n > len(buf):
+                break                                    # is_chunk_overrun
+            body = buf[pos + 2:pos + 2 + n]
+            pos += 2 + n
+            ctype = (h & 0x1F) | ((h >> 6) & 0x20)
+            seq, last = (h >> 12) & 7, bool(h & 0x8000)
+            if (h & 0xF000) == 0x8000:
+                out.append((ctype, body))
+                continue
+            if seq == 0:
+                self.acc_type, self.acc, self.acc_seq = ctype, b"", 0
+            elif ctype != self.acc_type or seq != self.acc_seq + 1:
+                self.reset()                             # broken sequence: drop and stop
+                break
+            else:
+                self.acc_seq = seq
+            if len(self.acc) + n > CHUNK_TOTAL_MAX:
+                self.reset()
+                break
+            self.acc += body
+            if not last:
+                break                                    # non-final fragment ends this notification
+            out.append((ctype, self.acc))
+            self.reset()
+        return out
+
+
+def unpack_chunks(payload):
+    """Stateless: one notification's chunk stream -> [(type, payload)], using a fresh NtfUnpacker
+    (kept for old callers). A chunk fragmented across notifications is lost here; feed one
+    NtfUnpacker per controller instead (R13)."""
+    return NtfUnpacker().feed(payload)
 
 
 # ---- decode one ntf payload ----------------------------------------------------------------
@@ -335,7 +419,9 @@ def decode_ntf(ntf_id, payload, imu_config=None):
     if ntf_id == NTF_IRLED:
         return dict(zip(("led_period_us", "led_ontime_us", "led_delay_us"), parse_led_config(p)))
     if ntf_id == NTF_PRESSURE:
-        v = _u16(p, 0)
+        # 12-bit field (R16/R17). The host caches the raw u16 and emits raw/4095 plus a separate
+        # 8.5 N full-scale field; we mask so stray top bits cannot push it past full scale.
+        v = _u16(p, 0) & 0xFFF
         return {"trigger_pressure_raw": v, "trigger_pressure": v / 4095.0,
                 "trigger_pressure_n": v / 4095.0 * 8.5}
     if ntf_id == NTF_BATT_ALERTS:
@@ -368,9 +454,25 @@ def parse_led_config(b):
     return struct.unpack_from("<IIi", bytes(b))
 
 
+def led_period_warning(period_us):
+    """Warning text for a period the controller accepts but should never get, else None.
+
+    The validator has no minimum period, but the scheduler's 700 µs lead floor adds at most one
+    period (FUN_0001873c), so p < 700 µs schedules pulses closer than the lead (PERIPHERALS §2.2,
+    REVIEW-RE R17)."""
+    if 0 < period_us < LED_MIN_LEAD_US:
+        return (f"LED period {period_us} us < {LED_MIN_LEAD_US} us: the controller accepts it but "
+                f"cannot keep its {LED_MIN_LEAD_US} us scheduling lead; never send it")
+    return None
+
+
 def controller_apply_led(period_us, ontime_us, delay_us):
     """What the controller does with a cmd 0x28 write: clamp on-time to 75 µs (elk 0x27fe6),
-    then reject if ot > 75, ot > p or p > 500 000 (FUN_0001fbb8). Returns (accepted, (p, ot, d))."""
+    then reject if ot > 75, ot > p or p > 500 000 (FUN_0001fbb8). Returns (accepted, (p, ot, d)).
+    Issues a warnings.warn (UserWarning) when p < 700 µs (led_period_warning)."""
+    msg = led_period_warning(period_us)
+    if msg:
+        warnings.warn(msg, stacklevel=2)
     ot = min(ontime_us, LED_MAX_ONTIME_US)
     if ot > LED_MAX_ONTIME_US or ot > period_us or period_us > LED_MAX_PERIOD_US:
         return False, None
@@ -507,19 +609,76 @@ def selftest():
     assert remap_edge10(0b0001) == 0b0100
     assert decode_ntf(NTF_AUX2B, deerfly_to_ntf(pack_deerfly(buttons=0x10))[NTF_AUX2B])["aux_2b"] == 1
 
-    # 3. chunk stream round trip incl. a type with bit 5 set and a fragmented chunk
+    # 2b. ntf 0x17 hand-packed per the AUDIT A6 bfi sequence (elk 0x179fe..0x17a68), not via
+    #     pack_deerfly: [0]=buf[0x2d], [1]=buf[0x2e], bfi s12@0x2f #16, C@0x31 #28, D@0x33 #40,
+    #     s12@0x35 #52 (each 12 bits wide).
+    def bfi(dst, src, lsb, width):
+        m = ((1 << width) - 1) << lsb
+        return (dst & ~m) | ((src << lsb) & m)
+    v = 0x80 | 0x40 << 8
+    for lsb, field in ((16, 0x7FF), (28, 0x800), (40, 0x123), (52, 0xFFF)):
+        v = bfi(v, field, lsb, 12)
+    raw17 = v.to_bytes(8, "little")
+    assert raw17 == bytes.fromhex("8040ff078023f1ff"), raw17.hex()
+    d17 = decode_ntf(NTF_IDXCURL, raw17)
+    # by hand: s12 0x7ff = 2047 -> 2047*360/4096 = 179.9 -> 179; 0x800 = -2048 -> -180;
+    # 0x123 = 291 -> 25.58 -> 25; 0xfff = -1 -> -0.09 -> 0 (truncation toward zero)
+    assert d17["idx_curl1d"] == 0x80 / 255.0 and d17["idx_slider"] == 0x40 / 255.0
+    assert d17["idx_joint_deg"] == {"0_z": 179, "0_y": -180, "1": 25, "2": 0}, d17
+    assert deerfly_to_ntf(pack_deerfly(curl=(0x80, 0x40, 0x7FF, 0x800, 0x123, 0xFFF)))[NTF_IDXCURL] == raw17
+
+    # 2c. every ntf 9 bit vs TOUCH_BITS, and every deerfly touch input bit -> its label (table
+    #     written out from the elk remap, REVIEW-RE "ntf 9 byte 0 = b0 b2 b4 c2 b6 b1 b3 b5,
+    #     byte 1 = b7 c3 c0 c1")
+    for bit, label in TOUCH_BITS.items():
+        dt = decode_ntf(NTF_TOUCH, (1 << bit).to_bytes(4, "little"))
+        assert dt["touch"] == 1 << bit and [k for k in TOUCH_BITS.values() if dt[k]] == [label]
+    deerfly_touch = {("b", 0): "touch_a_x", ("b", 2): "touch_b_y", ("b", 4): "touch_thumbstick",
+                     ("c", 2): "touch_thumbrest", ("b", 6): "touch_trigger", ("b", 1): "prox_a_x",
+                     ("b", 3): "prox_b_y", ("b", 5): "prox_thumbstick", ("b", 7): "prox_trigger",
+                     ("c", 3): "prox_thumbrest", ("c", 0): "touch_trigger2", ("c", 1): "prox_trigger2"}
+    assert sorted(deerfly_touch.values()) == sorted(TOUCH_BITS.values())
+    for (reg, bit), label in deerfly_touch.items():
+        touch = (1 << bit, 0) if reg == "b" else (0, 1 << bit)
+        pt = parse_deerfly(pack_deerfly(touch=touch))
+        assert [k for k in TOUCH_BITS.values() if pt[k]] == [label], (reg, bit, label)
+
+    # 2d. ntf 0x15 pressure is a 12-bit field (R16/R17)
+    dp = decode_ntf(NTF_PRESSURE, b"\xff\xff")
+    assert dp["trigger_pressure_raw"] == 0xFFF and dp["trigger_pressure"] == 1.0
+
+    # 3. chunk stream round trip incl. a type with bit 5 set
     imu = struct.pack("<IH3h3h", 0x89ABCDEF, 0x0123, 1024, -1024, 0, 82, -82, 8192)
     items = [(NTF_IMU, imu), (NTF_BUTTONS, b"\x05"), (0x2B, b"\x01\x00"), (0x19, bytes(range(61)))]
     assert chunk_header(0x2B, 2) == (0x2B & 0x1F) | 2 << 5 | 1 << 11 | 0x8000
     assert unpack_chunks(pack_chunks(items)) == [(t, bytes(b)) for t, b in items]
-    stream = pack_chunks(items, frag=32)             # 0x19 -> fragments of 32 + 29 bytes
-    assert unpack_chunks(stream) == [(t, bytes(b)) for t, b in items]
-    broken = bytearray(stream)                       # 2nd fragment: seq 1 -> 2 breaks the chain
-    i = len(pack_chunks(items[:3])) + 2 + 32
-    struct.pack_into("<H", broken, i, chunk_header(0x19, 29, seq=2, last=True))
-    assert [t for t, _ in unpack_chunks(bytes(broken))] == [NTF_IMU, NTF_BUTTONS, 0x2B]
-    big = pack_chunks([(0x19, bytes(70))], frag=40)  # 40 + 30 >= 64: host drops it
-    assert unpack_chunks(big) == []
+    # A non-final fragment ends the notification (R13): fragments of 32 + 29 in ONE stream lose
+    # 0x19, and so does a broken sequence (which also stops parsing).
+    stream = pack_chunks(items, frag=32)
+    assert unpack_chunks(stream) == [(t, bytes(b)) for t, b in items[:3]]
+    broken = pack_chunks([(NTF_BUTTONS, b"\x05")]) + pack_chunk(0x19, bytes(29), seq=2, last=True) \
+        + pack_chunks([(NTF_IMU, imu)])
+    assert unpack_chunks(broken) == [(NTF_BUTTONS, b"\x05")]
+    big = pack_chunks([(0x19, bytes(70))], frag=40)   # 40 + 30 > 63: the host drops it
+    u = NtfUnpacker()
+    assert u.feed(big[:42]) == [] and u.feed(big[42:]) == []
+
+    # 3b. R13: a chunk split across two notifications. pack_notifications puts the non-final
+    #     piece at the end of notification 1 and the final piece first in notification 2.
+    split_items = [(NTF_IMU, imu), (0x19, bytes(range(61))), (NTF_BUTTONS, b"\x05")]
+    ntfs = pack_notifications(split_items)
+    assert [len(n) for n in ntfs] == [49, 39], [len(n) for n in ntfs]
+    assert ntfs[0][20:22] == struct.pack("<H", chunk_header(0x19, 27, seq=0, last=False))
+    assert ntfs[1][:2] == struct.pack("<H", chunk_header(0x19, 34, seq=1, last=True))
+    u = NtfUnpacker()                                  # stateful, one per controller: reassembles
+    assert u.feed(ntfs[0]) == [(NTF_IMU, imu)]
+    assert u.feed(ntfs[1]) == [(0x19, bytes(range(61))), (NTF_BUTTONS, b"\x05")]
+    # the old stateless call loses the chunk (and, as a broken sequence, the rest of ntf 2)
+    assert unpack_chunks(ntfs[0]) == [(NTF_IMU, imu)] and unpack_chunks(ntfs[1]) == []
+    # whole chunks only: everything fits, nothing fragments
+    assert pack_notifications(items[:3]) == [pack_chunks(items[:3])]
+    for n in pack_notifications([(t, bytes(40)) for t in (1, 2, 3)] + [(0x19, bytes(63))]):
+        assert len(n) <= NTF_STREAM_BUDGET
 
     # 4. IMU SI conversion with the controller-reported scales
     d = decode_ntf(NTF_IMU, imu)
@@ -536,7 +695,12 @@ def selftest():
     assert pack_led_config(33333, 19, -9).hex() == "35820000" "13000000" "f7ffffff"
     assert parse_led_config(pack_led_config(*LED_DEFAULT)) == LED_DEFAULT
     assert controller_apply_led(11111, 200, 0) == (True, (11111, 75, 0))   # silently clamped
-    assert controller_apply_led(50, 75, 0) == (False, None)                 # ot > p
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        assert controller_apply_led(50, 75, 0) == (False, None)             # ot > p
+        assert controller_apply_led(699, 19, 0) == (True, (699, 19, 0))     # accepted, but < 700 us
+        assert controller_apply_led(700, 19, 0) == (True, (700, 19, 0))     # no warning
+    assert len(caught) == 2 and all("700 us" in str(w.message) for w in caught)
     assert controller_apply_led(500_001, 19, 0) == (False, None)            # p > 500 ms
     assert controller_apply_led(500_000, 0, 0) == (True, (500_000, 0, 0))  # ot = 0: LEDs off
     st, en = next_pulse_start(1_000_000, 11111, 5000, 75)
@@ -559,8 +723,10 @@ def selftest():
     assert bi["battery_v"] == 3.912 and bi["battery_pct"] == 87.0
 
     print("selftest ok -- deerfly CRC + ntf repack/labels (buttons ntf4, touch/prox ntf9, "
-          "stick ntf2, trigger/grip ntf3, idxcurl, pressure); chunk stream + fragments; IMU SI "
-          "from cmd 0x32; LED clamp/validate/scheduler; cal/haptics/battery payloads.")
+          "stick ntf2, trigger/grip ntf3, idxcurl, pressure); hand-packed A6 ntf 0x17 vector; "
+          "every ntf 9 bit vs TOUCH_BITS; 12-bit ntf 0x15; chunk stream + R13 cross-notification "
+          "fragments (NtfUnpacker, pack_notifications); IMU SI from cmd 0x32; LED clamp/validate/"
+          "scheduler + p < 700 us warning; cal/haptics/battery payloads.")
 
 
 # ---- cli -----------------------------------------------------------------------------------
@@ -587,13 +753,16 @@ def main():
     n.add_argument("--type", required=True)
     n.add_argument("--value", required=True)
     n.set_defaults(fn=lambda a: _show(decode_ntf(int(a.type, 0), _h(a.value))))
-    c = sub.add_parser("chunks", help="decode a notification chunk stream")
-    c.add_argument("--payload", required=True)
+    c = sub.add_parser("chunks", help="decode notification chunk streams (one controller, in order)")
+    c.add_argument("--payload", required=True, action="append",
+                   help="one notification's chunk stream, hex; repeat for consecutive notifications")
 
     def do_chunks(a):
-        for t, body in unpack_chunks(_h(a.payload)):
-            print(f"ntf {t:#04x} ({len(body)} B)")
-            _show(decode_ntf(t, body))
+        u = NtfUnpacker()                    # fragments may span the given notifications (R13)
+        for i, pl in enumerate(a.payload):
+            for t, body in u.feed(_h(pl)):
+                print(f"[{i}] ntf {t:#04x} ({len(body)} B)")
+                _show(decode_ntf(t, body))
     c.set_defaults(fn=do_chunks)
     led = sub.add_parser("led", help="build cmd 0x28 and model what the controller does with it")
     led.add_argument("--period", type=int, required=True)
@@ -603,7 +772,12 @@ def main():
 
     def do_led(a):
         print("  cmd 0x28 payload =", pack_led_config(a.period, a.ontime, a.delay).hex())
-        ok, applied = controller_apply_led(a.period, a.ontime, a.delay)
+        msg = led_period_warning(a.period)
+        if msg:
+            print("  WARNING:", msg)
+        with warnings.catch_warnings():      # already printed above
+            warnings.simplefilter("ignore")
+            ok, applied = controller_apply_led(a.period, a.ontime, a.delay)
         print("  controller:", f"applied p/ot/d = {applied}" if ok else "REJECTED (old config kept)")
         if ok and applied[1]:
             st, en = next_pulse_start(a.now, applied[0], applied[2], applied[1])

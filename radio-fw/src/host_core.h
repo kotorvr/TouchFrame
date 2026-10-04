@@ -21,10 +21,11 @@
 #define HOST_LOST_US 250000   // a connected slot with no uplink this long is LOST
 #define HOST_DL_RETRY_PERIODS 3
 #define HOST_DL_MAX_TRIES 60
-#define HOST_CTR_NEAR 4       // steady counters tried from the next expected one on
-#define HOST_CTR_BACK 4       // ... and back from where elapsed beacon periods put it (lost uplinks)
+#define HOST_CTR_NEAR 2       // steady counters tried each side of the predicted one
+#define HOST_CTR_SEARCH 32    // first steady uplink after an accept: counters tried around the prediction
 #define HOST_TX_LEAD_US 150   // a beacon is planned at least this long before it goes out
-#define HOST_REAL_DL_REPEATS 4 // real formats: no CL ack is known, so each downlink goes out this often
+#define HOST_TL_TIMEOUT_US 1000000  // real TL: a command not answered in this long fails (TIMEOUT)
+#define HOST_ACCEPT_TRIES 100 // real: the accept goes out in this many beacons at most
 
 typedef struct {
     uint64_t t_us;
@@ -34,10 +35,15 @@ typedef struct {
     uint8_t data[PULSAR_UPLINK_MAX_LEN + 4];
 } host_rx_t;
 
+// Why a queued real TL command was sent (what its answer is for).
+enum { DL_USER = 0, DL_SILENT, DL_DESC, DL_IMU_CFG };
+
 typedef struct {
     cl_msg_t msg;
     uint8_t addr_slot;  // slot the beacon addresses (byte 14); differs from the queue's slot only
                         // for a CONN_ACCEPT answering a request made in another slot
+    uint8_t why;        // DL_*: DL_USER reads / writes report EVT_REG
+    uint8_t tl_reg;     // real: the register the TL packet named (set when it is first encoded)
 } host_dl_t;
 
 typedef struct {
@@ -52,16 +58,37 @@ typedef struct {
     uint16_t input_seq, imu_seq;
     uint8_t last_ul_seq;
     bool steady;             // steady-state CCM: iv + per-slot counter (after the accept was queued)
-    uint64_t ctr_period;     // beacon period of the last steady-nonce uplink (or of the accept)
-    uint32_t probe;          // sweeps the counters between "next" and "elapsed periods" after losses
+    uint64_t steady_id;      // the controller that iv belongs to
+    bool held;               // CMD_DISCONNECT: ignore it until CMD_CONNECT (a real one stays on the link)
+    bool ctr_locked;         // a steady uplink decrypted: ctr_last / ctr_period predict the next
+    uint32_t ctr_last;       // counter of the last steady uplink
+    uint64_t ctr_period;     // ... and its beacon period (the counter advances once per period, R7)
+    uint64_t accept_period;  // beacon period the accept first went out in (0 = not yet)
+    uint32_t probe;          // sweeps the counters beyond the search window
     uint8_t iv[8];
-    uint32_t ctr;            // next expected uplink counter
     host_dl_t dlq[HOST_DLQ];
     uint8_t dlq_head, dlq_len;
     uint8_t next_dl_seq;
     bool head_sent;
     uint64_t head_sent_period;
     uint8_t head_tries;
+
+    // real TL (docs/re/REVIEW-RE.md R0): one command on air at a time, re-sent every beacon
+    uint8_t tl_seq;          // seq of the newest command; bumped per new command, 15 wraps to 0.
+                             // Kept across reconnects: the controller drops a repeat of its last seq
+    uint64_t tl_deadline_us; // the head command (head_sent) times out then
+    cl_ntf_t ntf;            // notification reassembly (R13)
+    uint64_t ntf_fwd;        // ntf ids forwarded as EVT_REG(NOTIFY) (CMD_REG_SUBSCRIBE in real mode)
+    struct { uint8_t buttons, battery_pct; uint16_t touch; int16_t stick[2]; uint16_t trigger, grip, pressure; } in;
+    int16_t imu_last[6];     // accel, gyro: the last IMU sample (EVT_SAMPLE)
+    uint64_t imu_last_us;
+    int16_t temp_raw;
+    uint8_t accel_fs_g;      // from cmd 0x32 (0 = not read yet)
+    uint16_t gyro_fs_dps;
+    uint8_t hand;            // link_hand, from cmd 1 (R11)
+    cl_msg_t led;            // the last CMD_LED, re-sent after every (re)connect (R16)
+    bool led_set;
+    uint64_t haptic_stop_us; // a SIMPLE buzz shorter than 2 s: send the stop then (0 = none)
 } host_slot_t;
 
 typedef struct {
@@ -107,6 +134,9 @@ typedef struct {
     uint64_t pair_deadline_us;
     uint64_t pair_device;
     uint8_t pair_seq, pair_step, pair_cmd;
+    uint8_t pair_retries;      // 0x25 rounds after a failed reply (R15)
+    uint64_t pair_last_id;     // the controller paired last: EVT_PAIR(DONE) again with its hand
+    bool pair_last_hand_sent;
     uint8_t pair_priv[32], pair_pub[32], pair_shared[32];
     uint8_t pair_tx[2 + PAIR_DATA_LEN];
     uint8_t pair_tx_len;
@@ -117,6 +147,7 @@ typedef struct {
 
     host_slot_t slot[PULSAR_SLOTS];
     uint8_t dl_rr;
+    volatile uint8_t idle_seq;  // real TL: the seq the idle [00][seq] beacon carries (LINK_HOST_TL_IDLE)
     uint64_t refused_id, refused_us;  // rate-limits the "not allowed" note
 
     // stats
