@@ -46,7 +46,11 @@ namespace cv {
 // XRService stamps IMU and poses with oc::now_seconds(), which is clock_gettime(4) =
 // CLOCK_MONOTONIC_RAW (libArcturusPerception 0x322070: `mov w0, #4; bl clock_gettime`). On the
 // Frame it is ~0.1 s/h away from CLOCK_MONOTONIC, so the choice matters.
+#ifdef _WIN32
+constexpr clockid_t kXrClock = CLOCK_MONOTONIC;  // host-side tests only (no MONOTONIC_RAW there)
+#else
 constexpr clockid_t kXrClock = CLOCK_MONOTONIC_RAW;
+#endif
 double NowSeconds(clockid_t clock = kXrClock);
 
 // What a controller config carries that the driver itself needs.

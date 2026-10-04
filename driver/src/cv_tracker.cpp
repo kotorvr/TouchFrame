@@ -92,7 +92,8 @@ bool ParseControllerConfig(const std::string& text, ControllerConfig* out, std::
 // Interfaces and pose conversion
 
 IVRBlockQueue* BlockQueue() {
-    static IVRBlockQueue* bq = [] {
+    static IVRBlockQueue* bq = []() -> IVRBlockQueue* {
+        if (!vr::VRDriverContext()) return nullptr;  // not inside vrserver (host tests)
         vr::EVRInitError e = vr::VRInitError_None;
         auto* p = static_cast<IVRBlockQueue*>(vr::VRDriverContext()->GetGenericInterface(IVRBlockQueue_Version, &e));
         Log("cv: GetGenericInterface(%s) = %p (err %d)", IVRBlockQueue_Version, (void*)p, int(e));
@@ -102,7 +103,8 @@ IVRBlockQueue* BlockQueue() {
 }
 
 IVRPaths* Paths() {
-    static IVRPaths* paths = [] {
+    static IVRPaths* paths = []() -> IVRPaths* {
+        if (!vr::VRDriverContext()) return nullptr;
         vr::EVRInitError e = vr::VRInitError_None;
         auto* p = static_cast<IVRPaths*>(vr::VRDriverContext()->GetGenericInterface(IVRPaths_Version, &e));
         Log("cv: GetGenericInterface(%s) = %p (err %d)", IVRPaths_Version, (void*)p, int(e));
