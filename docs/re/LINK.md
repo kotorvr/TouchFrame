@@ -233,12 +233,22 @@ protocol version `0x1701`. Advertise `0x1701` and **never reject the controller*
   slot, `+0x81` = slot count). Exact request byte offsets are INFERRED (stripped-side cross-check
   pending); the device-side accept rules above are the firm contract.
 - **Slot / endpoint allocator** = `FUN_0001d4d8` (+ `connection_tracker.c` `FUN_0001d8d4` /
-  `FUN_0001d910`, `endpoint_allocator.c`): **CONFIRMED** — slots are endpoints `1..4`
-  (`TRANSPORT_ENDPOINT_START=1`, `< 5`), i.e. `PULSAR_NUM_DEVICE_SLOTS_TOTAL` usable device slots,
-  tracked in a bitmap at connection-record `+0x4`. Device TX prefix = `slot + 1` (PROTOCOL Q1:
-  `0x01..0x05`). A requested run of contiguous slots is honored
-  (`slot + slots_requested <= PULSAR_NUM_DEVICE_SLOTS_TOTAL`); auxiliary slots are single
-  (`slot >= PULSAR_NUM_AUXILIARY_DEVICE_SLOTS || slots_requested == 1`).
+  `FUN_0001d910`, `endpoint_allocator.c`). **Two distinct, both-CONFIRMED indices — do not
+  conflate them; their exact correspondence is the one slot fact a live capture must settle:**
+  - **radio slot, 0-based (0..4).** The negotiation slot byte `[11]` is asserted `< PULSAR_NUM_
+    DEVICE_SLOTS + PULSAR_NUM_AUXILIARY_DEVICE_SLOTS = 5` (elk-app `0x31ba1`), and the device TX
+    prefix = `slot + 1 = 0x01..0x05` (PROTOCOL Q1). So the slot assigned in the negotiation packet
+    is 0..4 and the controller will transmit on prefix slot+1.
+  - **CL endpoint, 1-based (1..4).** `TRANSPORT_ENDPOINT_START = 1`, `endpoint < END`
+    (`FUN_0001d8d4` rejects `endpoint == 0`, requires `< 5`), tracked in a bitmap at connection
+    record `+0x4`. The beacon **byte-14 downlink bit and byte-15 ack bitmap are `1 << endpoint`**
+    over these 1..4 endpoints (`FUN_0001cf30`/`FUN_0001d738` return the endpoint 1..4;
+    `FUN_0001cdcc` sets bit `endpoint`).
+  - A requested run of contiguous slots is honored (`slot + slots_requested <=
+    PULSAR_NUM_DEVICE_SLOTS_TOTAL`); auxiliary slots are single (`slot >=
+    PULSAR_NUM_AUXILIARY_DEVICE_SLOTS || slots_requested == 1`). **Whether CL endpoint == radio
+    slot, or endpoint == slot + 1, is INFERRED and needs one capture** — the tool keeps the two as
+    separate parameters rather than assuming a mapping.
 - **Beacon builder** = `FUN_0001cf30` (`prepare_beacon`, asserts `0x503dc "tx_beacon.len <=
   CL_HOST_MAX_PAYLOAD_LEN"`, max `0x22 = 34`). Two shapes, **CONFIRMED**:
   - normal beacon: **byte 14** = `1 << slot` of the device addressed by this beacon's downlink data
@@ -315,7 +325,7 @@ on the default.
 - **For the planner (PROTOCOL.md corrections):** the `0x240cc` session-nonce-in-CCM-counter claim is
   wrong (§1); add the command-register namespace + ID map and the "HID descriptor is register 0xab"
   nuance to Q4 (§3); fold the §3.1.4 resolution into Q2/Q3.
-- **For BUILD-1:** the four CL host callbacks (`FUN_0001d300`), slots = endpoints 1..4, device TX
-  prefix = slot+1, beacon bytes 14/15, and the negotiation packet contract (§4) are enough to stub
-  the connection state machine; leave the TL header bytes as a parameter to fill from the first
-  capture.
+- **For BUILD-1:** the four CL host callbacks (`FUN_0001d300`), the radio-slot domain (0..4, TX
+  prefix slot+1) vs the CL-endpoint domain (1..4, beacon `1<<endpoint`), beacon bytes 14/15, and the
+  negotiation packet contract (§4) are enough to stub the connection state machine; leave the TL
+  header bytes **and the endpoint↔slot correspondence** as parameters to fill from the first capture.

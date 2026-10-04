@@ -256,14 +256,21 @@ EP_LOCK = 3      # "lock" endpoint (the follow-up that locks the link)
 CONN_PKT_TYPE = 1  # accept handler requires connection packet [0] == 1
 PULSAR_VERSION = 0x1701  # on-air bytes 01 17 = major 1 / pulsar_protocol_sub_version 23 (Q6)
 
-# Slots are transport endpoints 1..4 (CONFIRMED: TRANSPORT_ENDPOINT_START=1, < 5;
-# connection_tracker.c / endpoint_allocator.c). Device TX prefix = slot + 1 (Q1: 0x01..0x05).
-SLOT_MIN = 1
-SLOT_MAX = 4
+# TWO distinct, both-CONFIRMED indices (their exact correspondence needs one live capture):
+#  - radio "slot": 0-based, 0..4. Device TX prefix = slot+1 = 0x01..0x05 (PROTOCOL Q1), and the
+#    device accept handler asserts the negotiation slot byte < PULSAR_NUM_DEVICE_SLOTS +
+#    PULSAR_NUM_AUXILIARY_DEVICE_SLOTS = 5 (elk-app 0x31ba1). So the negotiation slot field is 0..4.
+#  - CL "endpoint": 1-based, 1..4 (TRANSPORT_ENDPOINT_START=1, < END; connection_tracker.c /
+#    endpoint_allocator.c). The beacon byte-14 downlink bit and byte-15 ack bitmap are 1<<endpoint.
+SLOT_MIN = 0
+SLOT_MAX = 4          # negotiation slot byte: device asserts < 5
+ENDPOINT_MIN = 1
+ENDPOINT_MAX = 4      # CL endpoint domain for the beacon bitmaps
 
 
 def device_tx_prefix(slot):
-    """Uplink radio prefix a device in `slot` transmits on = slot + 1 (CONFIRMED, Q1)."""
+    """Uplink radio prefix a device in 0-based `slot` (0..4) transmits on = slot + 1 (Q1,
+    CONFIRMED: 0x01..0x05)."""
     if not (SLOT_MIN <= slot <= SLOT_MAX):
         raise ValueError(f"slot must be {SLOT_MIN}..{SLOT_MAX}")
     return slot + 1
@@ -347,7 +354,8 @@ def build_conn_negotiation(device_id_64, slot, endpoint=EP_CONN_NEG, version=PUL
     """Build the device-validated connection-negotiation packet the host transmits.
 
     device_id_64 : the controller's 64-bit device ID (its FICR DEVICEID, from the advertisement).
-    slot         : the slot we assign (1..4). endpoint: EP_CONN_NEG then EP_LOCK on the follow-up.
+    slot         : the 0-based radio slot we assign (0..4; device asserts < 5). endpoint:
+                   EP_CONN_NEG then EP_LOCK on the follow-up.
     Returns the 14-byte validated prefix: [type=1][0][endpoint][id:8 LE][slot][ver:2 LE].
     """
     if endpoint not in (EP_CONN_NEG, EP_LOCK):
@@ -388,15 +396,17 @@ def parse_conn_negotiation(pkt):
 
 # ---- Beacon header (host -> all; CONFIRMED layout, PROTOCOL Q1 + LINK.md §4) --------------------
 def build_beacon_header(channel_map_37, unmapped, session_nonce, timestamp_us,
-                        downlink_slot=None, ack_bitmap=0):
+                        downlink_endpoint=None, ack_bitmap=0):
     """Build beacon payload bytes 0..15 (the CL header; the <=34-byte CL data area follows).
 
-    channel_map_37 : 37-bit active-channel bitmap (LSB = logical channel 0).
-    unmapped       : current unmapped-channel value 0..36 (byte 5).
-    session_nonce  : 16-bit value (bytes 6..7).
-    timestamp_us   : 48-bit beacon timestamp on the sync clock (bytes 8..13, little-endian).
-    downlink_slot  : slot whose downlink data rides this beacon -> byte 14 = 1<<slot, else 0.
-    ack_bitmap     : byte 15 = rx/ack bitmap of slots heard since the last beacon.
+    channel_map_37    : 37-bit active-channel bitmap (LSB = logical channel 0).
+    unmapped          : current unmapped-channel value 0..36 (byte 5).
+    session_nonce     : 16-bit value (bytes 6..7).
+    timestamp_us      : 48-bit beacon timestamp on the sync clock (bytes 8..13, little-endian).
+    downlink_endpoint : CL endpoint (1..4) whose downlink data rides this beacon -> byte 14 =
+                        1<<endpoint, else 0. (Beacon bitmaps are indexed by CL endpoint, not the
+                        0-based radio slot; see the index note at the top of this section.)
+    ack_bitmap        : byte 15 = rx/ack bitmap of endpoints heard since the last beacon.
 
     Byte 0 bits 1..2 (periods-until-DM-beacon) and bit 0 (reserved) are left 0 here. Returns the
     16-byte header; LENGTH on air = 14 + len(CL data) (the caller appends the CL data area)."""
@@ -418,10 +428,10 @@ def build_beacon_header(channel_map_37, unmapped, session_nonce, timestamp_us,
     b[5] = unmapped
     b[6:8] = session_nonce.to_bytes(2, "little")
     b[8:14] = timestamp_us.to_bytes(6, "little")
-    if downlink_slot is not None:
-        if not (SLOT_MIN <= downlink_slot <= SLOT_MAX):
-            raise ValueError(f"downlink_slot must be {SLOT_MIN}..{SLOT_MAX}")
-        b[14] = 1 << downlink_slot
+    if downlink_endpoint is not None:
+        if not (ENDPOINT_MIN <= downlink_endpoint <= ENDPOINT_MAX):
+            raise ValueError(f"downlink_endpoint must be {ENDPOINT_MIN}..{ENDPOINT_MAX}")
+        b[14] = 1 << downlink_endpoint
     b[15] = ack_bitmap & 0xFF
     return bytes(b)
 
@@ -432,14 +442,14 @@ def parse_beacon_header(b):
         raise ValueError("beacon header too short")
     channel_map = ((b[0] >> 3) & 0x1F) | (b[1] << 5) | (b[2] << 13) | (b[3] << 21) | (b[4] << 29)
     downlink = b[14]
-    downlink_slot = (downlink.bit_length() - 1) if downlink else None
+    downlink_endpoint = (downlink.bit_length() - 1) if downlink else None
     return {
         "channel_map": channel_map & ((1 << 37) - 1),
         "dm_periods": (b[0] >> 1) & 0x3,
         "unmapped": b[5],
         "session_nonce": int.from_bytes(b[6:8], "little"),
         "timestamp_us": int.from_bytes(b[8:14], "little"),
-        "downlink_slot": downlink_slot,
+        "downlink_endpoint": downlink_endpoint,
         "ack_bitmap": b[15],
     }
 
@@ -573,7 +583,7 @@ def _check_conn_negotiation():
     """Connection-negotiation packet round-trips and enforces the device accept rules."""
     dev_id = 0x1122334455667788
     for ep in (EP_CONN_NEG, EP_LOCK):
-        for slot in (SLOT_MIN, SLOT_MAX):
+        for slot in (SLOT_MIN, SLOT_MAX):  # 0..4, device asserts < 5
             pkt = build_conn_negotiation(dev_id, slot, endpoint=ep)
             got = parse_conn_negotiation(pkt)
             assert got["type"] == CONN_PKT_TYPE
@@ -586,10 +596,10 @@ def _check_conn_negotiation():
             # device validates [0]==1 and [2]&7==endpoint
             assert pkt[0] == 1 and (pkt[2] & 7) == ep
             assert pkt[3:11] == dev_id.to_bytes(8, "little")
-    # device TX prefix = slot + 1
-    assert device_tx_prefix(1) == 2 and device_tx_prefix(4) == 5
-    # out-of-range slot/endpoint rejected both ways
-    for bad in (0, 5, 255):
+    # device TX prefix = slot + 1 (0-based slot 0..4 -> prefix 0x01..0x05, PROTOCOL Q1)
+    assert device_tx_prefix(0) == 1 and device_tx_prefix(4) == 5
+    # out-of-range slot rejected (device asserts slot < 5)
+    for bad in (5, 255):
         try:
             build_conn_negotiation(dev_id, bad)
             raise AssertionError("bad slot accepted")
@@ -606,21 +616,28 @@ def _check_beacon_header():
     """Beacon header bytes 0..15 round-trip, incl. map packing, byte-14 slot, byte-15 ack."""
     cmap = 0x1555555555 & ((1 << 37) - 1)  # arbitrary 37-bit pattern
     hdr = build_beacon_header(cmap, unmapped=19, session_nonce=0xBEEF,
-                              timestamp_us=0x0123456789AB, downlink_slot=3, ack_bitmap=0b01010)
+                              timestamp_us=0x0123456789AB, downlink_endpoint=3, ack_bitmap=0b01010)
     assert len(hdr) == 16
     got = parse_beacon_header(hdr)
     assert got["channel_map"] == cmap, hex(got["channel_map"])
     assert got["unmapped"] == 19
     assert got["session_nonce"] == 0xBEEF
     assert got["timestamp_us"] == 0x0123456789AB
-    assert got["downlink_slot"] == 3            # byte 14 == 1<<3
+    assert got["downlink_endpoint"] == 3        # byte 14 == 1<<3 (CL endpoint domain)
     assert hdr[14] == (1 << 3)
     assert got["ack_bitmap"] == 0b01010
     assert hdr[6:8] == b"\xef\xbe"              # session nonce little-endian
     assert hdr[8:14] == (0x0123456789AB).to_bytes(6, "little")
-    # no-downlink beacon has byte 14 == 0 and downlink_slot None
+    # endpoint domain is 1..4 (0 and 5 are rejected)
+    for bad in (0, 5):
+        try:
+            build_beacon_header(cmap, 0, 0, 0, downlink_endpoint=bad)
+            raise AssertionError("bad endpoint accepted")
+        except ValueError:
+            pass
+    # no-downlink beacon has byte 14 == 0 and downlink_endpoint None
     hdr2 = build_beacon_header(cmap, 0, 0, 0)
-    assert hdr2[14] == 0 and parse_beacon_header(hdr2)["downlink_slot"] is None
+    assert hdr2[14] == 0 and parse_beacon_header(hdr2)["downlink_endpoint"] is None
 
 
 def _check_reg_map_and_limits():
