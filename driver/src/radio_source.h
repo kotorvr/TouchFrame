@@ -86,6 +86,8 @@ public:
     // LED loop feedback: a pose block from XRService for this hand / an XRService LED match.
     void ObservePose(int hand, double t, bool valid);
     void LedStatsHit(int hand, double t);
+    // XRService logged a controller-frame timestamp (host clock s), read by us at read_t.
+    void FrameTimestamp(double read_t, double frame_t);
 
     struct HandStatus {
         bool connected = false;
@@ -128,6 +130,10 @@ private:
         HapticScheduler haptic;
         std::unique_ptr<LedPhaseLoop> led;
         int led_logged_state = -1;
+        bool led_logged_fine = false;
+        // The frame phase this hand last tracked at P (camera property: survives reconnects).
+        bool have_phase = false;
+        double phase_us = 0, phase_t = 0, phase_rate = 0;
         uint64_t inputs = 0, imu = 0, gaps = 0, unsynced = 0;
     };
     struct Identity {
@@ -179,6 +185,7 @@ private:
     SessionState state_ = kClosed;
     bool stored_ = false;          // this session uses the dongle's flash identity
     bool restart_ = false;         // end the session (the dongle rebooted under us)
+    double pairlist_due_s_ = 0;    // stored mode: re-read the pairings (hands) after a connect
     uint8_t hello_mode_ = 0;       // link_mode at HELLO
     uint32_t dongle_netaddr_ = 0;  // stored identity's netaddr (PAIR_LIST)
     std::map<uint8_t, Pending> pending_;

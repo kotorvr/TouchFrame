@@ -17,7 +17,8 @@ using namespace tf;
 using namespace tf::radio;
 
 static int g_fail = 0;
-static bool g_trace = false;  // phase_dbg: print every probe
+static bool g_trace = false;  // radio_unit_test phase NAME_PREFIX: print every probe of matching cases
+static const char* g_only = nullptr;
 #define CHECK(c)                                                         \
     do {                                                                 \
         if (!(c)) {                                                      \
@@ -228,15 +229,17 @@ static void TestDecode() {
 // exposure. XRService-ish tracker: bootstraps after 3 consecutive seen frames, coasts on IMU for
 // `hold_s` after the last seen frame, then loses the pose.
 struct PhaseSim {
-    double P = 1e6 / 30, cam_ppm = 0, theta_us = 12345, exp_us = 40, hold_s = 0.3;
+    double P = 1e6 / 30, cam_ppm = 0, theta_us = 12345, exp_us = 10, hold_s = 0.3;
     double dongle_ppm = 0, dongle_off_us = 2.5e9;
     bool log_hits = false;  // also report LED-stats hits (one per seen frame, 1 in 10 logged)
+    // XRService logs a frame timestamp (exposure centre + seed_err_us) every seed_every_s (0 = never).
+    double seed_every_s = 0, seed_err_us = 0;
     uint32_t seed = 1;
 
     struct Result {
         double first_track_s = -1, valid_frac_tail = 0, centre_err_us = 1e9;
         int state_at_end = 0, sweeps = 0;
-        double drift_est = 0;
+        double drift_est = 0, seed_offset_us = 0;
     };
 
     Result Run(LedPhaseLoop::Options lo, double seconds, double tail_s) {
@@ -253,7 +256,7 @@ struct PhaseSim {
         double last_seen = -1e9;
         bool tracking = false;
         long n_frame = long(std::ceil((t0 * 1e6 - theta_us) / P_true));
-        double next_ping = t0, next_pose = t0;
+        double next_ping = t0, next_pose = t0, next_seed = t0 + 2;
         long tail_obs = 0, tail_valid = 0;
         int hitlog = 0;
         Result res;
@@ -286,12 +289,19 @@ struct PhaseSim {
                 if (E > t * 1e6) break;
                 n_frame++;
                 bool seen = false;
+                if (seed_every_s > 0 && E * 1e-6 >= next_seed) {
+                    next_seed += seed_every_s;
+                    loop.Seed(E * 1e-6 + 0.05, (E + seed_err_us) * 1e-6);  // logged a bit later
+                }
                 if (have_cmd) {
                     double dE = double(dc.at(E));
                     double k = std::round((dE - cmd.phase_us) / cmd.period_us);
                     double centre = cmd.phase_us + k * cmd.period_us;
                     double off_host = std::fabs(centre - dE) / (1 + dongle_ppm * 1e-6);
-                    seen = off_host <= (exp_us + std::min<uint32_t>(cmd.on_us, 75)) / 2;
+                    // Seen only when the pulse covers the whole exposure (or the exposure the whole
+                    // pulse): ±32.5 µs for mode 4's 10 µs (docs/re/FRAME-MODEL.md §3.3).
+                    double on = std::min<uint32_t>(cmd.on_us, 75);
+                    seen = off_host <= std::max(std::fabs(exp_us - on) / 2, 2.0);
                 }
                 if (seen) {
                     consec++;
@@ -315,11 +325,13 @@ struct PhaseSim {
         res.state_at_end = loop.state();
         res.sweeps = loop.sweeps();
         res.drift_est = loop.drift_us_per_s();
+        res.seed_offset_us = loop.seed_offset_us(tend);
         // Where the loop thinks the centre is vs the true exposure centre, both mod P at tend.
-        LedPhaseLoop::Schedule s = loop.schedule(tend);
-        double truth = std::fmod(theta_us + std::ceil((s.anchor_s * 1e6 - theta_us) / P_true) * P_true, P);
-        double est = std::fmod(s.anchor_s * 1e6, P);
-        double d = std::fmod(est - truth + 1.5 * P, P) - P / 2;
+        // Truth: the exposure phase mod P at tend. (The schedule itself may be a sentinel.)
+        double truth = std::fmod(theta_us + std::ceil((tend * 1e6 - theta_us) / P_true) * P_true, P);
+        double d = loop.state() == LedPhaseLoop::kTrack && !loop.coarse()
+                       ? std::fmod(loop.centre_at(tend) - truth + 1.5 * P, P) - P / 2
+                       : 1e9;
         res.centre_err_us = std::fabs(d);
         return res;
     }
@@ -330,26 +342,63 @@ static void TestPhaseLoop() {
         const char* name;
         double exp_us, cam_ppm, dongle_ppm, theta;
         bool log_hits;
+        double seed_every_s, seed_err_us, max_track_s;
     } cases[] = {
-        {"short exposure, still clocks", 40, 0, 0, 12345, false},
-        {"short exposure, dongle +18 ppm", 40, 0, 18, 30111, false},
-        {"camera +3 ppm, dongle -15 ppm", 40, 3, -15, 777, false},
-        {"long exposure 600 us", 600, 0, 10, 20000, false},
-        {"camera -6 ppm, LED-stats hits", 40, -6, 5, 16000, true},
+        // Mode 4 (10 µs) unless noted; the camera's ppm is against the host clock.
+        {"mode 4, still clocks", 10, 0, 0, 12345, false, 0, 0, 180},
+        {"mode 4, dongle +18 ppm", 10, 0, 18, 30111, false, 0, 0, 180},
+        {"camera +20 ppm, dongle -15 ppm", 10, 20, -15, 777, false, 0, 0, 180},
+        {"camera -12 ppm, dongle +25 ppm", 10, -12, 25, 5000, false, 0, 0, 180},
+        {"long exposure 600 us", 600, 0, 10, 20000, false, 0, 0, 180},
+        {"camera -6 ppm, LED-stats hits", 10, -6, 5, 16000, true, 0, 0, 180},
+        {"seeded, frame stamp = centre + 140 us", 10, 4, 8, 23456, false, 10, 140, 40},
+        {"seeded, stamp 2 ms off (fallback)", 10, 0, 3, 9000, false, 10, 2000, 240},
     };
     for (auto& c : cases) {
+        if (g_only && strncmp(c.name, g_only, strlen(g_only)) != 0) continue;
         PhaseSim sim;
         sim.exp_us = c.exp_us, sim.cam_ppm = c.cam_ppm, sim.dongle_ppm = c.dongle_ppm, sim.theta_us = c.theta;
         sim.log_hits = c.log_hits;
+        sim.seed_every_s = c.seed_every_s, sim.seed_err_us = c.seed_err_us;
         LedPhaseLoop::Options o;
+        o.window_us = std::fabs(c.exp_us - 75);  // what the exposure mode says (FRAME-MODEL §3.3)
         PhaseSim::Result r = sim.Run(o, 420, 120);
-        printf("     phase loop [%s]: track at %.0f s, sweeps %d, tail valid %.3f, centre err %.0f us, drift est %+.2f us/s, state %s\n",
-               c.name, r.first_track_s, r.sweeps, r.valid_frac_tail, r.centre_err_us, r.drift_est,
+        printf("     phase loop [%s]: track at %.0f s, sweeps %d, tail valid %.3f, centre err %.0f us, drift est %+.2f us/s, "
+               "seed offset %+.0f us, state %s\n",
+               c.name, r.first_track_s, r.sweeps, r.valid_frac_tail, r.centre_err_us, r.drift_est, r.seed_offset_us,
                LedPhaseLoop::StateName(LedPhaseLoop::State(r.state_at_end)));
-        CHECKF(r.first_track_s > 0 && r.first_track_s < 180, "[%s] reached TRACK at %.0f s", c.name, r.first_track_s);
+        CHECKF(r.first_track_s > 0 && r.first_track_s < c.max_track_s, "[%s] reached TRACK at %.0f s", c.name,
+               r.first_track_s);
         CHECKF(r.valid_frac_tail > 0.95, "[%s] tail valid fraction %.3f", c.name, r.valid_frac_tail);
         CHECKF(r.state_at_end == LedPhaseLoop::kTrack, "[%s] ended in %d", c.name, r.state_at_end);
-        CHECKF(r.centre_err_us < (c.exp_us + 75) / 2, "[%s] centre error %.0f us", c.name, r.centre_err_us);
+        CHECKF(r.centre_err_us < std::max(std::fabs(c.exp_us - 75) / 2, 2.0), "[%s] centre error %.0f us", c.name,
+               r.centre_err_us);
+        if (c.seed_every_s > 0 && c.seed_err_us < 300)
+            CHECKF(std::fabs(r.seed_offset_us + c.seed_err_us) < 25, "[%s] seed offset %+.0f us, truth %+.0f", c.name,
+                   r.seed_offset_us, -c.seed_err_us);
+    }
+    // Random clocks within what crystals allow (camera ±25 ppm vs the host, dongle ±30 ppm).
+    if (!g_only) {
+        std::mt19937 rng(7);
+        std::uniform_real_distribution<double> cam(-25, 25), dongle(-30, 30), theta(0, 1e6 / 30);
+        int bad = 0;
+        double worst_valid = 1, worst_track = 0;
+        for (int i = 0; i < 12; i++) {
+            PhaseSim sim;
+            sim.cam_ppm = cam(rng), sim.dongle_ppm = dongle(rng), sim.theta_us = theta(rng);
+            sim.seed = 100 + i;
+            PhaseSim::Result r = sim.Run(LedPhaseLoop::Options(), 420, 120);
+            worst_valid = std::min(worst_valid, r.valid_frac_tail);
+            worst_track = std::max(worst_track, r.first_track_s < 0 ? 1e9 : r.first_track_s);
+            if (r.valid_frac_tail <= 0.9 || r.first_track_s < 0 || r.first_track_s > 240) {
+                bad++;
+                printf("     random clocks #%d: camera %+.1f ppm, dongle %+.1f ppm, theta %.0f: track at %.0f s, tail valid %.3f\n",
+                       i, sim.cam_ppm, sim.dongle_ppm, sim.theta_us, r.first_track_s, r.valid_frac_tail);
+            }
+        }
+        printf("     phase loop [12 random clocks]: worst tail valid %.3f, slowest first track %.0f s\n", worst_valid,
+               worst_track);
+        CHECKF(bad == 0, "%d of 12 random-clock runs failed", bad);
     }
     // The command the dongle gets: period ≥ 800 µs while searching, P (±drift) when tracking,
     // centre phase on the dongle clock.
@@ -364,11 +413,17 @@ static void TestPhaseLoop() {
     CHECK(loop.Update(1004.0));
     Led l = LedCommandFor(loop.schedule(1004.0), ts, 3);
     CHECK(l.slot == 3 && l.mode == LED_STROBE && l.on_us == 75 && l.period_us >= 800 && l.period_us < 33334);
-    CHECK(!loop.Update(1004.1));  // nothing new, refresh not due
-    CHECK(loop.Update(1004.3));   // refresh
+    CHECK(!loop.Update(1004.01));  // nothing new, refresh not due
+    CHECK(loop.Update(1004.07));   // refresh: P/16 rounds badly, so ≤ 10 µs smear needs 16 Hz
 }
 
-int main() {
+int main(int argc, char** argv) {
+    if (argc > 2 && !strcmp(argv[1], "phase")) {
+        g_trace = true;
+        g_only = argv[2];
+        TestPhaseLoop();
+        return g_fail ? 1 : 0;
+    }
     TestCobsAndHid();
     TestTimeSync();
     TestDecode();

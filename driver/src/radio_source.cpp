@@ -418,6 +418,25 @@ void RadioSource::HandleFrame(const uint8_t* f, size_t n, int64_t now) {
             if (changed) SaveIdentity();
             Logf("radio: dongle flash: netaddr 0x%08x, %u pairing(s), %u writes left", ps.netaddr, ps.count,
                  ps.writes_left);
+            // A connected controller the dongle now places on the other hand moves there (unless
+            // that hand is taken: then the identity file's choice stands until it disconnects).
+            for (int hd = 0; hd < 2; hd++) {
+                if (!hands_[hd].connected) continue;
+                auto it = id_.hand.find(hands_[hd].device_id);
+                if (it == id_.hand.end() || it->second == hd) continue;
+                if (hands_[1 - hd].connected) {
+                    Logf("radio: controller %016" PRIx64 " reports %s hand, but that hand is in use; keeping it %s",
+                         hands_[hd].device_id, kHandName[1 - hd], kHandName[hd]);
+                    continue;
+                }
+                ConnEvt c{};
+                c.slot = uint8_t(hands_[hd].slot);
+                c.state = SLOT_CONNECTED;
+                c.device_id = hands_[hd].device_id;
+                Disconnected(hd, ("the controller reports the " + std::string(kHandName[1 - hd]) + " hand").c_str());
+                OnConn(c);
+                break;  // one move per listing; hands_ changed under the loop
+            }
             if (state_ == kListing) StartHost(now);
             return;
         }
@@ -740,6 +759,9 @@ void RadioSource::OnConn(const ConnEvt& c) {
         rc.reg = kRegImuConfig;
         rc.len = 16;
         Send(CMD_REG_READ, &rc, sizeof(rc));
+        // The dongle learns the controller's hand from cmd 1 after connecting (REVIEW-RE R11):
+        // read the pairings again once it has, so the hand can be corrected.
+        if (stored_) pairlist_due_s_ = HostNowNs() * 1e-9 + 2.5;
         if (cb_.connection) cb_.connection(hand, true);
         return;
     }
@@ -812,6 +834,12 @@ void RadioSource::ServiceHands(int64_t now) {
         std::vector<uint8_t> body;
     };
     std::vector<Out> out;
+    if (pairlist_due_s_ > 0 && now_s >= pairlist_due_s_ && state_ == kRunning) {
+        pairlist_due_s_ = 0;
+        Pending lp;
+        lp.cmd = CMD_PAIR_LIST;
+        out.push_back(Out{CMD_PAIR_LIST, std::vector<uint8_t>(1, Tag(lp))});
+    }
     {
         std::lock_guard<std::mutex> lk(mu_);
         if (pair_.pending && state_ == kRunning) {
@@ -852,6 +880,21 @@ void RadioSource::ServiceHands(int64_t now) {
                 Logf("radio: %s LED phase loop started (frame period %.1f us, k %d, dwell %.1f s)", kHandName[hi],
                      h.led->options().frame_period_us, h.led->options().coarse_divisor, h.led->options().dwell_s);
             }
+            // The exposure phase is the camera's, not the controller's: start from the other hand's
+            // live track, or this hand's last one (extrapolated with its drift), before sweeping.
+            const Hand& other = hands_[1 - hi];
+            if (h.led->state() == LedPhaseLoop::kSearch) {
+                if (other.led && other.led->fine_track())
+                    h.led->SeedPhase(now_s, other.led->centre_at(now_s), other.led->drift_us_per_s());
+                else if (h.have_phase && now_s - h.phase_t < 600)
+                    h.led->SeedPhase(now_s, h.phase_us + h.phase_rate * (now_s - h.phase_t), h.phase_rate);
+            }
+            if (h.led->fine_track()) {
+                h.have_phase = true;
+                h.phase_us = h.led->centre_at(now_s);
+                h.phase_t = now_s;
+                h.phase_rate = h.led->drift_us_per_s();
+            }
             if (h.led->Update(now_s)) {
                 Led l = LedCommandFor(h.led->schedule(now_s), sync_, uint8_t(h.slot));
                 l.tag = Tag(Pending{CMD_LED, hi, 0, 0});
@@ -860,11 +903,18 @@ void RadioSource::ServiceHands(int64_t now) {
                 out.push_back(std::move(o));
             }
             int st = h.led->state();
-            if (st != h.led_logged_state) {
+            bool fine = h.led->fine_track();
+            if (st != h.led_logged_state || fine != h.led_logged_fine) {
                 h.led_logged_state = st;
-                Logf("radio: %s LED loop -> %s (centre %.0f us, width %.0f us, drift %+.2f us/s, %d probes, %d sweeps)",
-                     kHandName[hi], LedPhaseLoop::StateName(LedPhaseLoop::State(st)), h.led->centre_us(),
-                     h.led->width_us(), h.led->drift_us_per_s(), h.led->probes(), h.led->sweeps());
+                h.led_logged_fine = fine;
+                std::string seed;
+                if (fine && h.led->seed_offset_us(now_s) != 0)
+                    seed = ", centre - logged frame stamp " + std::to_string(int(std::lround(h.led->seed_offset_us(now_s)))) +
+                           " us";
+                Logf("radio: %s LED loop -> %s%s (centre %.0f us, drift %+.2f us/s, %d probes, %d sweeps%s)",
+                     kHandName[hi], LedPhaseLoop::StateName(LedPhaseLoop::State(st)),
+                     st == LedPhaseLoop::kTrack && !fine ? " (coarse)" : "", h.led->centre_at(now_s),
+                     h.led->drift_us_per_s(), h.led->probes(), h.led->sweeps(), seed.c_str());
             }
         }
     }
@@ -893,6 +943,12 @@ void RadioSource::ObservePose(int hand, double t, bool valid) {
     if (hand < 0 || hand > 1) return;
     std::lock_guard<std::mutex> lk(mu_);
     if (hands_[hand].led) hands_[hand].led->Observe(t, valid);
+}
+
+void RadioSource::FrameTimestamp(double read_t, double frame_t) {
+    std::lock_guard<std::mutex> lk(mu_);
+    for (auto& h : hands_)
+        if (h.led) h.led->Seed(read_t, frame_t);
 }
 
 void RadioSource::LedStatsHit(int hand, double t) {
