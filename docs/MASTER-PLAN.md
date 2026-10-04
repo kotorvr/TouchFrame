@@ -204,9 +204,10 @@ decides.
 |---|---|---|
 | RE-1, BUILD-1 | the plan was written | **running (started 2026-10-04)**; BUILD-1 committed link v3 at e430b12 on `claude/exciting-bun-66e32e` |
 | AUDIT-1 | the plan was written | **done, merged 82e938e**: [re/AUDIT.md](re/AUDIT.md), folded into the docs |
-| RE-3 | the plan was written | **blocked 2026-10-04**: stopped by a safety check while writing up; nothing committed. Waiting on the user's decision about a replacement scope. Touch-only is covered live by DEV-1. |
+| RE-3 | the plan was written | **ended, blocked**: stopped by a safety check, nothing committed. Touch-only was answered live by DEV-1. The exposure-timing hook is dropped; BUILD-2's closed-loop LED phase sweep replaces it. |
+| RE-3b Frame tracker vs Touch Plus model | DEV-1's error flood ("Couldn't find any neighbor", ~300/s) | **chipped 2026-10-04**: model compatibility + exposure settings, static, no hooking |
 | RE-2 | the plan was written | **done, merged 31f35fd**: [re/PERIPHERALS.md](re/PERIPHERALS.md) |
-| BUILD-2 Driver radio backend | BUILD-1 reports link v3 committed | **chipped 2026-10-04** (base e430b12; hidraw transport) |
+| BUILD-2 Driver radio backend | BUILD-1 reports link v3 committed | **running (started 2026-10-04)** (base e430b12; hidraw transport) |
 | REVIEW-RE | RE-1 and RE-2 are merged | waiting |
 | DEV-1 on-device bench | the Echo session releases the Quest + Frame | **done, merged 5a0b33d**: [re/DEV-1.md](re/DEV-1.md); devices handed back to Echo |
 | HW-1 Sniff & validate | the dongles arrive (the user says so) | waiting |
